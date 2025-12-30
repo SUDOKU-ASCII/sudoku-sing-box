@@ -311,14 +311,18 @@ jobs:
         run: |
           set -xeuo pipefail
           sudo gem install fpm
-          sudo apt-get update
-          sudo apt-get install -y debsigs
           cp .fpm_systemd .fpm
           fpm -t deb \
             -v "$PKG_VERSION" \
             -p "dist/sing-box_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.debian }}.deb" \
             --architecture ${{ matrix.debian }} \
             dist/sing-box=/usr/bin/sing-box
+      - name: Sign DEB
+        if: matrix.debian != '' && secrets.GPG_KEY != '' && secrets.GPG_KEY_ID != '' && secrets.GPG_PASSPHRASE != ''
+        run: |
+          set -xeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y debsigs
           curl -Lo '/tmp/debsigs.diff' 'https://gitlab.com/debsigs/debsigs/-/commit/160138f5de1ec110376d3c807b60a37388bc7c90.diff'
           sudo patch /usr/bin/debsigs < '/tmp/debsigs.diff'
           rm -rf $HOME/.gnupg
@@ -337,6 +341,10 @@ jobs:
             -p "dist/sing-box_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.rpm }}.rpm" \
             --architecture ${{ matrix.rpm }} \
             dist/sing-box=/usr/bin/sing-box
+      - name: Sign RPM
+        if: matrix.rpm != '' && secrets.GPG_KEY != '' && secrets.GPG_KEY_ID != '' && secrets.GPG_PASSPHRASE != ''
+        run: |-
+          set -xeuo pipefail
           cat > $HOME/.rpmmacros <<EOF
           %_gpg_name ${{ secrets.GPG_KEY_ID }}
           %_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase ${{ secrets.GPG_PASSPHRASE }}
