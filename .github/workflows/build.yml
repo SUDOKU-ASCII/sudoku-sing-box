@@ -37,6 +37,8 @@ on:
     branches:
       - main-next
       - dev-next
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -65,8 +67,13 @@ jobs:
         run: |-
           echo "version=${{ inputs.version }}"
           echo "version=${{ inputs.version }}" >> "$GITHUB_ENV"
+      - name: Read version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |-
+          echo "version=${GITHUB_REF_NAME#v}"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Calculate version
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/v')
         run: |-
           go run -v ./cmd/internal/read_tag --ci --nightly
       - name: Set outputs
@@ -1084,7 +1091,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   upload_all:
     name: Upload builds
-    if: "!failure() && github.event_name == 'workflow_dispatch' && inputs.build == 'All'"
+    if: "!failure() && ((github.event_name == 'workflow_dispatch' && inputs.build == 'All') || startsWith(github.ref, 'refs/tags/v'))"
     runs-on: ubuntu-latest
     needs:
       - calculate_version
@@ -1126,8 +1133,12 @@ jobs:
           set -xeuo pipefail
           export PATH="$PATH:$HOME/go/bin"
           FLAGS="--replace -p 5"
-          if [[ "${{ inputs.draft }}" == "true" ]]; then FLAGS="${FLAGS} --draft"; fi
-          if [[ "${{ inputs.prerelease }}" == "true" ]]; then FLAGS="${FLAGS} --prerelease"; fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.draft }}" == "true" ]]; then FLAGS="${FLAGS} --draft"; fi
+            if [[ "${{ inputs.prerelease }}" == "true" ]]; then FLAGS="${FLAGS} --prerelease"; fi
+          else
+            if [[ "${GITHUB_REF_NAME}" == *-* ]]; then FLAGS="${FLAGS} --prerelease"; fi
+          fi
           ghr ${FLAGS} "v${VERSION}" dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
