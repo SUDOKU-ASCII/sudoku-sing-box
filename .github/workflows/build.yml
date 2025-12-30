@@ -701,7 +701,7 @@ jobs:
           go run -v ./cmd/internal/update_android_version --ci --nightly
       - name: Build
         run: |-
-          mkdir clients/android/app/libs
+          mkdir -p clients/android/app/libs
           cp *.aar clients/android/app/libs
           cd clients/android
           ./gradlew :app:assembleOtherRelease :app:assembleOtherLegacyRelease
@@ -819,7 +819,7 @@ jobs:
       - name: Build
         run: |-
           go run -v ./cmd/internal/update_android_version --ci
-          mkdir clients/android/app/libs
+          mkdir -p clients/android/app/libs
           cp *.aar clients/android/app/libs
           cd clients/android
           echo -n "$SERVICE_ACCOUNT_CREDENTIALS" | base64 --decode > service-account-credentials.json
