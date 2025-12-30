@@ -606,16 +606,40 @@ jobs:
         run: |-
           sudo apt update && sudo apt install -y openjdk-17-jdk-headless
           /usr/lib/jvm/java-17-openjdk-amd64/bin/java --version
-      - name: Setup Android signing (optional)
-        if: secrets.ANDROID_KEYSTORE_BASE64 != ''
+      - name: Setup Android signing (keystore)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |-
           set -xeuo pipefail
           mkdir -p clients/android/app
-          echo -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > clients/android/app/release.keystore
+          STORE_PASS="${ANDROID_KEYSTORE_PASS:-}"
+          KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
+          KEY_PASS="${ANDROID_KEY_PASSWORD:-}"
+          if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
+          if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
+          if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+            echo -n "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > clients/android/app/release.keystore
+            echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
+          else
+            echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (signatures will differ between runs)." >&2
+            keytool -genkeypair -v \
+              -keystore clients/android/app/release.keystore \
+              -storepass "${STORE_PASS}" \
+              -keypass "${KEY_PASS}" \
+              -alias "${KEY_ALIAS}" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=GitHub CI, OU=CI, O=GitHub, L=Internet, S=Internet, C=US"
+          fi
           cat > clients/android/local.properties <<EOF
-          KEYSTORE_PASS=${{ secrets.ANDROID_KEYSTORE_PASS }}
-          ALIAS_NAME=${{ secrets.ANDROID_KEY_ALIAS }}
-          ALIAS_PASS=${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEYSTORE_PASS=${STORE_PASS}
+          ALIAS_NAME=${KEY_ALIAS}
+          ALIAS_PASS=${KEY_PASS}
           EOF
       - name: Set tag
         run: |-
@@ -707,16 +731,40 @@ jobs:
         run: |-
           sudo apt update && sudo apt install -y openjdk-17-jdk-headless
           /usr/lib/jvm/java-17-openjdk-amd64/bin/java --version
-      - name: Setup Android signing (optional)
-        if: secrets.ANDROID_KEYSTORE_BASE64 != ''
+      - name: Setup Android signing (keystore)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |-
           set -xeuo pipefail
           mkdir -p clients/android/app
-          echo -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > clients/android/app/release.keystore
+          STORE_PASS="${ANDROID_KEYSTORE_PASS:-}"
+          KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
+          KEY_PASS="${ANDROID_KEY_PASSWORD:-}"
+          if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
+          if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
+          if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+            echo -n "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > clients/android/app/release.keystore
+            echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
+          else
+            echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (Play upload will not be stable)." >&2
+            keytool -genkeypair -v \
+              -keystore clients/android/app/release.keystore \
+              -storepass "${STORE_PASS}" \
+              -keypass "${KEY_PASS}" \
+              -alias "${KEY_ALIAS}" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=GitHub CI, OU=CI, O=GitHub, L=Internet, S=Internet, C=US"
+          fi
           cat > clients/android/local.properties <<EOF
-          KEYSTORE_PASS=${{ secrets.ANDROID_KEYSTORE_PASS }}
-          ALIAS_NAME=${{ secrets.ANDROID_KEY_ALIAS }}
-          ALIAS_PASS=${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEYSTORE_PASS=${STORE_PASS}
+          ALIAS_NAME=${KEY_ALIAS}
+          ALIAS_PASS=${KEY_PASS}
           EOF
       - name: Set tag
         run: |-
