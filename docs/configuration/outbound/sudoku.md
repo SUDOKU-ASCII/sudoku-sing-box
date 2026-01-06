@@ -17,6 +17,7 @@
   "enable_pure_downlink": true,
   "disable_http_mask": false,
   "http_mask_mode": "legacy",
+  "http_mask_multiplex": "off",
   "http_mask_tls": false,
   "http_mask_host": "",
   "http_mask_strategy": "random",
@@ -110,6 +111,16 @@ Available values:
 * `stream` (real HTTP streaming tunnel, CDN compatible)
 * `poll` (real HTTP polling tunnel)
 * `auto` (try stream then fall back to poll)
+
+#### http_mask_multiplex
+
+Multiplex behavior when `http_mask_mode` is `stream`/`poll`/`auto`.
+
+Available values:
+
+* `off` (disable transport reuse and mux)
+* `auto` (reuse underlying HTTP connections across tunnel dials; HTTP/2 can multiplex them)
+* `on` (single tunnel, multi-target mux inside one HTTPMask tunnel; reduces per-connection RTT)
 
 #### http_mask_tls
 

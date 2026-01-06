@@ -17,7 +17,8 @@
   "enable_pure_downlink": true,
   "handshake_timeout": 5,
   "disable_http_mask": false,
-  "http_mask_mode": "legacy"
+  "http_mask_mode": "legacy",
+  "http_mask_multiplex": "off"
 }
 ```
 
@@ -102,3 +103,13 @@ HTTP 伪装模式。
 * `stream`（真实 HTTP 流式隧道，可通过 CDN）
 * `poll`（真实 HTTP 轮询隧道）
 * `auto`（同时接受 stream 与 poll）
+
+#### http_mask_multiplex
+
+客户端在 `http_mask_mode` 为 `stream`/`poll`/`auto` 时的复用行为。
+
+可选值：
+
+* `off`
+* `auto`
+* `on`

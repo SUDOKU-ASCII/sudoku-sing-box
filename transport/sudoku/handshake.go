@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -20,12 +21,14 @@ type SessionType int
 const (
 	SessionTypeTCP SessionType = iota
 	SessionTypeUoT
+	SessionTypeMux
 )
 
 type ServerSession struct {
-	Conn   net.Conn
-	Type   SessionType
-	Target string
+	Conn     net.Conn
+	Type     SessionType
+	Target   string
+	UserHash string
 }
 
 type bufferedConn struct {
@@ -141,12 +144,35 @@ func buildServerObfsConn(raw net.Conn, cfg *ProtocolConfig, table *sudoku.Table,
 	}
 }
 
-func buildHandshakePayload(key string) [16]byte {
+func buildHandshakePayload(key string, tableID byte) ([16]byte, error) {
 	var payload [16]byte
 	binary.BigEndian.PutUint64(payload[:8], uint64(time.Now().Unix()))
-	hash := sha256.Sum256([]byte(key))
-	copy(payload[8:], hash[:8])
-	return payload
+
+	// If the client uses ED25519 keypair mode, use the raw private key bytes to generate a stable
+	// per-user handshake nonce (compatible with upstream Sudoku's multi-user identifier behavior).
+	//
+	// Otherwise, use a random nonce to avoid leaking a stable identifier for shared-key mode.
+	if keyBytes, ok := crypto.DecodePrivateKeyBytes(key); ok {
+		hash := sha256.Sum256(keyBytes)
+		copy(payload[8:], hash[:8])
+	} else {
+		if _, err := rand.Read(payload[8:]); err != nil {
+			// Extremely unlikely; fall back to deterministic nonce.
+			hash := sha256.Sum256([]byte(key))
+			copy(payload[8:], hash[:8])
+		}
+	}
+	// Byte 8 is reserved as a table ID hint (0 for single-table configs).
+	payload[8] = tableID
+	return payload, nil
+}
+
+func userHashFromHandshake(handshakeBuf []byte) string {
+	if len(handshakeBuf) < 16 {
+		return ""
+	}
+	// handshake[8] may be a table ID in some clients; use [9:16] as "hash[1:8]".
+	return hex.EncodeToString(handshakeBuf[9:16])
 }
 
 type ClientHandshakeOptions struct {
@@ -182,9 +208,10 @@ func ClientHandshakeWithOptions(rawConn net.Conn, cfg *ProtocolConfig, opt Clien
 		return nil, fmt.Errorf("setup crypto failed: %w", err)
 	}
 
-	handshake := buildHandshakePayload(cfg.Key)
-	if len(cfg.tableCandidates()) > 1 {
-		handshake[15] = tableID
+	handshake, err := buildHandshakePayload(cfg.Key, tableID)
+	if err != nil {
+		cConn.Close()
+		return nil, fmt.Errorf("build handshake failed: %w", err)
 	}
 	if _, err := cConn.Write(handshake[:]); err != nil {
 		cConn.Close()
@@ -245,6 +272,7 @@ func ServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (*ServerSession, err
 		cConn.Close()
 		return nil, fmt.Errorf("timestamp skew detected")
 	}
+	userHash := userHashFromHandshake(handshakeBuf[:])
 
 	sConn.StopRecording()
 
@@ -264,6 +292,20 @@ func ServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (*ServerSession, err
 		return nil, fmt.Errorf("read first byte failed: %w", err)
 	}
 
+	if firstByte[0] == MuxMagicByte {
+		version := make([]byte, 1)
+		if _, err := io.ReadFull(cConn, version); err != nil {
+			cConn.Close()
+			return nil, fmt.Errorf("read mux version failed: %w", err)
+		}
+		if version[0] != muxVersion {
+			cConn.Close()
+			return nil, fmt.Errorf("unsupported mux version: %d", version[0])
+		}
+		_ = rawConn.SetReadDeadline(time.Time{})
+		return &ServerSession{Conn: cConn, Type: SessionTypeMux, UserHash: userHash}, nil
+	}
+
 	if firstByte[0] == UoTMagicByte {
 		version := make([]byte, 1)
 		if _, err := io.ReadFull(cConn, version); err != nil {
@@ -275,7 +317,7 @@ func ServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (*ServerSession, err
 			return nil, fmt.Errorf("unsupported uot version: %d", version[0])
 		}
 		_ = rawConn.SetReadDeadline(time.Time{})
-		return &ServerSession{Conn: cConn, Type: SessionTypeUoT}, nil
+		return &ServerSession{Conn: cConn, Type: SessionTypeUoT, UserHash: userHash}, nil
 	}
 
 	prefixed := &preBufferedConn{Conn: cConn, buf: firstByte}
@@ -286,9 +328,10 @@ func ServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (*ServerSession, err
 	}
 	_ = rawConn.SetReadDeadline(time.Time{})
 	return &ServerSession{
-		Conn:   prefixed,
-		Type:   SessionTypeTCP,
-		Target: target,
+		Conn:     prefixed,
+		Type:     SessionTypeTCP,
+		Target:   target,
+		UserHash: userHash,
 	}, nil
 }
 
@@ -299,4 +342,3 @@ func randomByte() byte {
 	}
 	return byte(time.Now().UnixNano())
 }
-

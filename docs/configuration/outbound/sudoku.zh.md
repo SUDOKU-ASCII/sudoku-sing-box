@@ -17,6 +17,7 @@
   "enable_pure_downlink": true,
   "disable_http_mask": false,
   "http_mask_mode": "legacy",
+  "http_mask_multiplex": "off",
   "http_mask_tls": false,
   "http_mask_host": "",
   "http_mask_strategy": "random",
@@ -110,6 +111,16 @@ HTTP 伪装模式。
 * `stream`（真实 HTTP 流式隧道，可通过 CDN）
 * `poll`（真实 HTTP 轮询隧道）
 * `auto`（先尝试 stream，失败后回退到 poll）
+
+#### http_mask_multiplex
+
+当 `http_mask_mode` 为 `stream`/`poll`/`auto` 时的复用行为。
+
+可选值：
+
+* `off`（禁用传输复用与 mux）
+* `auto`（复用底层 HTTP 连接；在 HTTP/2 下可多路复用多个隧道）
+* `on`（单隧道多目标 mux：在一个 HTTPMask 隧道中复用多个目标连接，降低每连接 RTT）
 
 #### http_mask_tls
 

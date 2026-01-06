@@ -47,6 +47,15 @@ func normalizeTunnelMode(mode string) TunnelMode {
 	}
 }
 
+func multiplexEnabled(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "auto", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 type HandleResult int
 
 const (
@@ -59,6 +68,12 @@ type TunnelDialOptions struct {
 	Mode         string
 	TLSEnabled   bool   // when true, use HTTPS; otherwise, use HTTP (no port-based inference)
 	HostOverride string // optional Host header / SNI host (without scheme); accepts "example.com" or "example.com:443"
+	// Multiplex controls whether DialTunnel reuses underlying HTTP transports (keep-alive / h2).
+	// Values: "off" disables reuse; "auto"/"on" enables it. Empty defaults to "auto".
+	Multiplex string
+	// TransportPool isolates HTTP transport reuse for a single dialer/outbound instance.
+	// When nil, DialTunnel uses a fresh transport per dial even if Multiplex is enabled.
+	TransportPool *TransportPool
 	// DialContext overrides how the HTTP tunnel dials raw TCP/TLS connections.
 	// It must not be nil; passing nil is a programming error.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -157,10 +172,10 @@ func parseTunnelToken(body []byte) (string, error) {
 }
 
 type httpStreamConn struct {
-	client *http.Client
 	reader io.ReadCloser
 	writer *io.PipeWriter
 	cancel context.CancelFunc
+	closeIdle func()
 
 	localAddr  net.Addr
 	remoteAddr net.Addr
@@ -180,8 +195,8 @@ func (c *httpStreamConn) Close() error {
 	if c.reader != nil {
 		err = c.reader.Close()
 	}
-	if c.client != nil {
-		c.client.CloseIdleConnections()
+	if c.closeIdle != nil {
+		c.closeIdle()
 	}
 	return err
 }
@@ -199,39 +214,107 @@ type httpClientTarget struct {
 	headerHost string
 }
 
-func newHTTPClient(serverAddress string, opts TunnelDialOptions, maxIdleConns int) (*http.Client, httpClientTarget, error) {
+type transportKey struct {
+	scheme     string
+	urlHost    string
+	dialAddr   string
+	serverName string
+}
+
+type TransportPool struct {
+	mu         sync.Mutex
+	transports map[transportKey]*http.Transport
+}
+
+func (p *TransportPool) getOrCreateTransport(key transportKey, build func() *http.Transport) *http.Transport {
+	if p == nil {
+		return build()
+	}
+	p.mu.Lock()
+	if p.transports == nil {
+		p.transports = make(map[transportKey]*http.Transport)
+	}
+	transport := p.transports[key]
+	if transport == nil {
+		transport = build()
+		p.transports[key] = transport
+	}
+	p.mu.Unlock()
+	return transport
+}
+
+func (p *TransportPool) CloseIdleConnections() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	transports := make([]*http.Transport, 0, len(p.transports))
+	for _, t := range p.transports {
+		transports = append(transports, t)
+	}
+	p.mu.Unlock()
+	for _, t := range transports {
+		t.CloseIdleConnections()
+	}
+}
+
+func (p *TransportPool) Close() error {
+	p.CloseIdleConnections()
+	return nil
+}
+
+func newHTTPClient(serverAddress string, opts TunnelDialOptions, maxIdleConns int) (*http.Client, httpClientTarget, func(), error) {
 	if opts.DialContext == nil {
 		panic("httpmask: DialContext is nil")
 	}
 
 	scheme, urlHost, dialAddr, serverName, err := normalizeHTTPDialTarget(serverAddress, opts.TLSEnabled, opts.HostOverride)
 	if err != nil {
-		return nil, httpClientTarget{}, err
+		return nil, httpClientTarget{}, nil, err
 	}
 
-	transport := &http.Transport{
-		ForceAttemptHTTP2:     true,
-		DisableCompression:    true,
-		MaxIdleConns:          maxIdleConns,
-		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
-			return opts.DialContext(dialCtx, network, dialAddr)
-		},
-	}
-	if scheme == "https" {
-		transport.TLSClientConfig = &tls.Config{
-			ServerName: serverName,
-			MinVersion: tls.VersionTLS12,
-		}
-	}
-
-	return &http.Client{Transport: transport}, httpClientTarget{
+	target := httpClientTarget{
 		scheme:     scheme,
 		urlHost:    urlHost,
 		headerHost: canonicalHeaderHost(urlHost, scheme),
-	}, nil
+	}
+
+	build := func() *http.Transport {
+		transport := &http.Transport{
+			ForceAttemptHTTP2:     scheme == "https",
+			DisableCompression:    true,
+			MaxIdleConns:          maxIdleConns,
+			MaxIdleConnsPerHost:   maxIdleConns,
+			IdleConnTimeout:       30 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+				return opts.DialContext(dialCtx, network, dialAddr)
+			},
+		}
+		if scheme == "https" {
+			transport.TLSClientConfig = &tls.Config{
+				ServerName: serverName,
+				MinVersion: tls.VersionTLS12,
+			}
+		}
+		return transport
+	}
+
+	reuseTransport := multiplexEnabled(opts.Multiplex) && opts.TransportPool != nil
+	if reuseTransport {
+		key := transportKey{
+			scheme:     scheme,
+			urlHost:    urlHost,
+			dialAddr:   dialAddr,
+			serverName: serverName,
+		}
+		transport := opts.TransportPool.getOrCreateTransport(key, build)
+		return &http.Client{Transport: transport}, target, nil, nil
+	}
+
+	client := &http.Client{Transport: build()}
+	return client, target, client.CloseIdleConnections, nil
 }
 
 func dialStream(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
@@ -248,7 +331,7 @@ func dialStream(ctx context.Context, serverAddress string, opts TunnelDialOption
 }
 
 func dialStreamOne(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
-	client, target, err := newHTTPClient(serverAddress, opts, 16)
+	client, target, closeIdle, err := newHTTPClient(serverAddress, opts, 16)
 	if err != nil {
 		return nil, err
 	}
@@ -266,12 +349,14 @@ func dialStreamOne(ctx context.Context, serverAddress string, opts TunnelDialOpt
 
 	reqBodyR, reqBodyW := io.Pipe()
 
-	ctx, cancel := context.WithCancel(ctx)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), reqBodyR)
+	connCtx, connCancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(connCtx, http.MethodPost, u.String(), reqBodyR)
 	if err != nil {
-		cancel()
+		connCancel()
 		_ = reqBodyW.Close()
-		client.CloseIdleConnections()
+		if closeIdle != nil {
+			closeIdle()
+		}
 		return nil, err
 	}
 	req.Host = target.headerHost
@@ -279,42 +364,150 @@ func dialStreamOne(ctx context.Context, serverAddress string, opts TunnelDialOpt
 	applyTunnelHeaders(req.Header, target.headerHost, TunnelModeStream)
 	req.Header.Set("Content-Type", ctype)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		cancel()
-		_ = reqBodyW.Close()
-		client.CloseIdleConnections()
-		return nil, err
+	type doResult struct {
+		resp *http.Response
+		err  error
 	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
-		_ = resp.Body.Close()
-		cancel()
-		_ = reqBodyW.Close()
-		client.CloseIdleConnections()
-		return nil, fmt.Errorf("stream bad status: %s (%s)", resp.Status, strings.TrimSpace(string(body)))
-	}
+	doCh := make(chan doResult, 1)
+	go func() {
+		resp, doErr := client.Do(req)
+		doCh <- doResult{resp: resp, err: doErr}
+	}()
 
-	return &httpStreamConn{
-		client:     client,
-		reader:     resp.Body,
-		writer:     reqBodyW,
-		cancel:     cancel,
-		localAddr:  &net.TCPAddr{},
-		remoteAddr: &net.TCPAddr{},
-	}, nil
+	select {
+	case <-ctx.Done():
+		connCancel()
+		_ = reqBodyW.Close()
+		if closeIdle != nil {
+			closeIdle()
+		}
+		return nil, ctx.Err()
+	case r := <-doCh:
+		if r.err != nil {
+			connCancel()
+			_ = reqBodyW.Close()
+			if closeIdle != nil {
+				closeIdle()
+			}
+			return nil, r.err
+		}
+		if r.resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(r.resp.Body, 4*1024))
+			_ = r.resp.Body.Close()
+			connCancel()
+			_ = reqBodyW.Close()
+			if closeIdle != nil {
+				closeIdle()
+			}
+			return nil, fmt.Errorf("stream bad status: %s (%s)", r.resp.Status, strings.TrimSpace(string(body)))
+		}
+
+		return &httpStreamConn{
+			reader:     r.resp.Body,
+			writer:     reqBodyW,
+			cancel:     connCancel,
+			closeIdle:  closeIdle,
+			localAddr:  &net.TCPAddr{},
+			remoteAddr: &net.TCPAddr{},
+		}, nil
+	}
 }
 
-type streamSplitConn struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+type sessionDialInfo struct {
+	client    *http.Client
+	closeIdle func()
 
-	client     *http.Client
 	pushURL    string
 	pullURL    string
 	closeURL   string
 	headerHost string
+}
 
+func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptions, mode TunnelMode) (*sessionDialInfo, error) {
+	client, target, closeIdle, err := newHTTPClient(serverAddress, opts, 32)
+	if err != nil {
+		return nil, err
+	}
+
+	cleanup := func() {
+		if closeIdle != nil {
+			closeIdle()
+		}
+	}
+
+	authorizeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/session"}).String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authorizeURL, nil)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	req.Host = target.headerHost
+	applyTunnelHeaders(req.Header, target.headerHost, mode)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+	_ = resp.Body.Close()
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		cleanup()
+		return nil, fmt.Errorf("%s authorize bad status: %s (%s)", mode, resp.Status, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	token, err := parseTunnelToken(bodyBytes)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("%s authorize failed: %q", mode, strings.TrimSpace(string(bodyBytes)))
+	}
+	if token == "" {
+		cleanup()
+		return nil, fmt.Errorf("%s authorize empty token", mode)
+	}
+
+	pushURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token)}).String()
+	pullURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/stream", RawQuery: "token=" + url.QueryEscape(token)}).String()
+	closeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token) + "&close=1"}).String()
+
+	return &sessionDialInfo{
+		client:     client,
+		closeIdle:  closeIdle,
+		pushURL:    pushURL,
+		pullURL:    pullURL,
+		closeURL:   closeURL,
+		headerHost: target.headerHost,
+	}, nil
+}
+
+func bestEffortCloseSession(client *http.Client, closeURL, headerHost string, mode TunnelMode) {
+	if client == nil || closeURL == "" || headerHost == "" {
+		return
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(closeCtx, http.MethodPost, closeURL, nil)
+	if err != nil {
+		return
+	}
+	req.Host = headerHost
+	applyTunnelHeaders(req.Header, headerHost, mode)
+
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+	_ = resp.Body.Close()
+}
+
+type queuedConn struct {
 	rxc    chan []byte
 	closed chan struct{}
 
@@ -322,16 +515,46 @@ type streamSplitConn struct {
 
 	mu         sync.Mutex
 	readBuf    []byte
+	closeErr   error
 	localAddr  net.Addr
 	remoteAddr net.Addr
 }
 
-func (c *streamSplitConn) Read(b []byte) (n int, err error) {
+func (c *queuedConn) closeWithError(err error) error {
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return nil
+	default:
+		if err == nil {
+			err = io.ErrClosedPipe
+		}
+		if c.closeErr == nil {
+			c.closeErr = err
+		}
+		close(c.closed)
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *queuedConn) closedErr() error {
+	c.mu.Lock()
+	err := c.closeErr
+	c.mu.Unlock()
+	if err == nil {
+		return io.ErrClosedPipe
+	}
+	return err
+}
+
+func (c *queuedConn) Read(b []byte) (n int, err error) {
 	if len(c.readBuf) == 0 {
 		select {
 		case c.readBuf = <-c.rxc:
 		case <-c.closed:
-			return 0, io.ErrClosedPipe
+			return 0, c.closedErr()
 		}
 	}
 	n = copy(b, c.readBuf)
@@ -339,7 +562,7 @@ func (c *streamSplitConn) Read(b []byte) (n int, err error) {
 	return n, nil
 }
 
-func (c *streamSplitConn) Write(b []byte) (n int, err error) {
+func (c *queuedConn) Write(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -347,7 +570,7 @@ func (c *streamSplitConn) Write(b []byte) (n int, err error) {
 	select {
 	case <-c.closed:
 		c.mu.Unlock()
-		return 0, io.ErrClosedPipe
+		return 0, c.closedErr()
 	default:
 	}
 	c.mu.Unlock()
@@ -358,112 +581,70 @@ func (c *streamSplitConn) Write(b []byte) (n int, err error) {
 	case c.writeCh <- payload:
 		return len(b), nil
 	case <-c.closed:
-		return 0, io.ErrClosedPipe
+		return 0, c.closedErr()
 	}
 }
 
+func (c *queuedConn) LocalAddr() net.Addr  { return c.localAddr }
+func (c *queuedConn) RemoteAddr() net.Addr { return c.remoteAddr }
+
+func (c *queuedConn) SetDeadline(time.Time) error      { return nil }
+func (c *queuedConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *queuedConn) SetWriteDeadline(time.Time) error { return nil }
+
+type streamSplitConn struct {
+	queuedConn
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	client    *http.Client
+	closeIdle func()
+
+	pushURL    string
+	pullURL    string
+	closeURL   string
+	headerHost string
+}
+
 func (c *streamSplitConn) Close() error {
-	c.mu.Lock()
-	select {
-	case <-c.closed:
-		c.mu.Unlock()
-		return nil
-	default:
-		close(c.closed)
-	}
-	c.mu.Unlock()
+	_ = c.closeWithError(io.ErrClosedPipe)
 
 	if c.cancel != nil {
 		c.cancel()
 	}
 
-	// Best-effort session close signal (avoid leaking server-side sessions).
-	closeCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	req, err := http.NewRequestWithContext(closeCtx, http.MethodPost, c.closeURL, nil)
-	if err == nil && c.client != nil {
-		req.Close = true
-		req.Host = c.headerHost
-		applyTunnelHeaders(req.Header, c.headerHost, TunnelModeStream)
-		req.Header.Set("Connection", "close")
-		if resp, doErr := c.client.Do(req); doErr == nil && resp != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
-			_ = resp.Body.Close()
-		}
+	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModeStream)
+	if c.closeIdle != nil {
+		c.closeIdle()
 	}
 
-	if c.client != nil {
-		c.client.CloseIdleConnections()
-	}
 	return nil
 }
 
-func (c *streamSplitConn) LocalAddr() net.Addr  { return c.localAddr }
-func (c *streamSplitConn) RemoteAddr() net.Addr { return c.remoteAddr }
-
-func (c *streamSplitConn) SetDeadline(time.Time) error      { return nil }
-func (c *streamSplitConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *streamSplitConn) SetWriteDeadline(time.Time) error { return nil }
-
 func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
-	client, target, err := newHTTPClient(serverAddress, opts, 32)
+	info, err := dialSession(ctx, serverAddress, opts, TunnelModeStream)
 	if err != nil {
 		return nil, err
 	}
-
-	authorizeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/session"}).String()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authorizeURL, nil)
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, err
-	}
-	req.Host = target.headerHost
-	applyTunnelHeaders(req.Header, target.headerHost, TunnelModeStream)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, err
-	}
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
-	_ = resp.Body.Close()
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		client.CloseIdleConnections()
-		return nil, fmt.Errorf("stream authorize bad status: %s (%s)", resp.Status, strings.TrimSpace(string(bodyBytes)))
-	}
-
-	token, err := parseTunnelToken(bodyBytes)
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, fmt.Errorf("stream authorize failed: %q", strings.TrimSpace(string(bodyBytes)))
-	}
-	if token == "" {
-		client.CloseIdleConnections()
-		return nil, fmt.Errorf("stream authorize empty token")
-	}
-
-	pushURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token)}).String()
-	pullURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/stream", RawQuery: "token=" + url.QueryEscape(token)}).String()
-	closeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token) + "&close=1"}).String()
 
 	connCtx, cancel := context.WithCancel(context.Background())
 	c := &streamSplitConn{
 		ctx:        connCtx,
 		cancel:     cancel,
-		client:     client,
-		pushURL:    pushURL,
-		pullURL:    pullURL,
-		closeURL:   closeURL,
-		headerHost: target.headerHost,
-		rxc:        make(chan []byte, 256),
-		closed:     make(chan struct{}),
-		writeCh:    make(chan []byte, 256),
-		localAddr:  &net.TCPAddr{},
-		remoteAddr: &net.TCPAddr{},
+		client:     info.client,
+		closeIdle:  info.closeIdle,
+		pushURL:    info.pushURL,
+		pullURL:    info.pullURL,
+		closeURL:   info.closeURL,
+		headerHost: info.headerHost,
+		queuedConn: queuedConn{
+			rxc:        make(chan []byte, 256),
+			closed:     make(chan struct{}),
+			writeCh:    make(chan []byte, 256),
+			localAddr:  &net.TCPAddr{},
+			remoteAddr: &net.TCPAddr{},
+		},
 	}
 
 	go c.pullLoop()
@@ -473,10 +654,20 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 
 func (c *streamSplitConn) pullLoop() {
 	const (
-		readChunkSize = 32 * 1024
-		idleBackoff   = 25 * time.Millisecond
+		// requestTimeout must be long enough for continuous high-throughput streams (e.g. mux + large downloads).
+		// If it is too short, the client cancels the response mid-body and corrupts the byte stream.
+		requestTimeout = 2 * time.Minute
+		readChunkSize  = 32 * 1024
+		idleBackoff    = 25 * time.Millisecond
+		maxDialRetry   = 12
+		minBackoff     = 10 * time.Millisecond
+		maxBackoff     = 250 * time.Millisecond
 	)
 
+	var (
+		dialRetry int
+		backoff   = minBackoff
+	)
 	buf := make([]byte, readChunkSize)
 	for {
 		select {
@@ -485,8 +676,10 @@ func (c *streamSplitConn) pullLoop() {
 		default:
 		}
 
-		req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.pullURL, nil)
+		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.pullURL, nil)
 		if err != nil {
+			cancel()
 			_ = c.Close()
 			return
 		}
@@ -495,12 +688,29 @@ func (c *streamSplitConn) pullLoop() {
 
 		resp, err := c.client.Do(req)
 		if err != nil {
+			cancel()
+			if isDialError(err) && dialRetry < maxDialRetry {
+				dialRetry++
+				select {
+				case <-time.After(backoff):
+				case <-c.closed:
+					return
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
 			_ = c.Close()
 			return
 		}
+		dialRetry = 0
+		backoff = minBackoff
 
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
+			cancel()
 			_ = c.Close()
 			return
 		}
@@ -516,11 +726,13 @@ func (c *streamSplitConn) pullLoop() {
 				case c.rxc <- payload:
 				case <-c.closed:
 					_ = resp.Body.Close()
+					cancel()
 					return
 				}
 			}
 			if rerr != nil {
 				_ = resp.Body.Close()
+				cancel()
 				if errors.Is(rerr, io.EOF) {
 					// Long-poll ended; retry.
 					break
@@ -529,6 +741,7 @@ func (c *streamSplitConn) pullLoop() {
 				return
 			}
 		}
+		cancel()
 		if !readAny {
 			// Avoid tight loop if the server replied quickly with an empty body.
 			select {
@@ -545,6 +758,9 @@ func (c *streamSplitConn) pushLoop() {
 		maxBatchBytes  = 256 * 1024
 		flushInterval  = 5 * time.Millisecond
 		requestTimeout = 20 * time.Second
+		maxDialRetry   = 12
+		minBackoff     = 10 * time.Millisecond
+		maxBackoff     = 250 * time.Millisecond
 	)
 
 	var (
@@ -553,16 +769,16 @@ func (c *streamSplitConn) pushLoop() {
 	)
 	defer timer.Stop()
 
-	flush := func() bool {
+	flush := func() error {
 		if buf.Len() == 0 {
-			return true
+			return nil
 		}
 
 		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.pushURL, bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			cancel()
-			return false
+			return err
 		}
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModeStream)
@@ -571,17 +787,41 @@ func (c *streamSplitConn) pushLoop() {
 		resp, err := c.client.Do(req)
 		if err != nil {
 			cancel()
-			return false
+			return err
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
 		_ = resp.Body.Close()
 		cancel()
 		if resp.StatusCode != http.StatusOK {
-			return false
+			return fmt.Errorf("bad status: %s", resp.Status)
 		}
 
 		buf.Reset()
-		return true
+		return nil
+	}
+
+	flushWithRetry := func() error {
+		dialRetry := 0
+		backoff := minBackoff
+		for {
+			if err := flush(); err == nil {
+				return nil
+			} else if isDialError(err) && dialRetry < maxDialRetry {
+				dialRetry++
+				select {
+				case <-time.After(backoff):
+				case <-c.closed:
+					return io.ErrClosedPipe
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			} else {
+				return err
+			}
+		}
 	}
 
 	resetTimer := func() {
@@ -600,14 +840,14 @@ func (c *streamSplitConn) pushLoop() {
 		select {
 		case b, ok := <-c.writeCh:
 			if !ok {
-				_ = flush()
+				_ = flushWithRetry()
 				return
 			}
 			if len(b) == 0 {
 				continue
 			}
 			if buf.Len()+len(b) > maxBatchBytes {
-				if !flush() {
+				if err := flushWithRetry(); err != nil {
 					_ = c.Close()
 					return
 				}
@@ -615,185 +855,93 @@ func (c *streamSplitConn) pushLoop() {
 			}
 			_, _ = buf.Write(b)
 			if buf.Len() >= maxBatchBytes {
-				if !flush() {
+				if err := flushWithRetry(); err != nil {
 					_ = c.Close()
 					return
 				}
 				resetTimer()
 			}
 		case <-timer.C:
-			if !flush() {
+			if err := flushWithRetry(); err != nil {
 				_ = c.Close()
 				return
 			}
 			resetTimer()
 		case <-c.closed:
-			_ = flush()
+			_ = flushWithRetry()
 			return
 		}
 	}
 }
 
 type pollConn struct {
+	queuedConn
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client     *http.Client
+	client    *http.Client
+	closeIdle func()
+
 	pushURL    string
 	pullURL    string
 	closeURL   string
 	headerHost string
-
-	rxc    chan []byte
-	closed chan struct{}
-
-	writeCh chan []byte
-
-	mu         sync.Mutex
-	readBuf    []byte
-	localAddr  net.Addr
-	remoteAddr net.Addr
 }
 
-func (c *pollConn) Read(b []byte) (n int, err error) {
-	if len(c.readBuf) == 0 {
-		select {
-		case c.readBuf = <-c.rxc:
-		case <-c.closed:
-			return 0, io.ErrClosedPipe
+func isDialError(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return isDialError(urlErr.Err)
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if opErr.Op == "dial" || opErr.Op == "connect" {
+			return true
 		}
 	}
-	n = copy(b, c.readBuf)
-	c.readBuf = c.readBuf[n:]
-	return n, nil
+	return false
 }
 
-func (c *pollConn) Write(b []byte) (n int, err error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-	c.mu.Lock()
-	select {
-	case <-c.closed:
-		c.mu.Unlock()
-		return 0, io.ErrClosedPipe
-	default:
-	}
-	c.mu.Unlock()
-
-	payload := make([]byte, len(b))
-	copy(payload, b)
-	select {
-	case c.writeCh <- payload:
-		return len(b), nil
-	case <-c.closed:
-		return 0, io.ErrClosedPipe
-	}
-}
-
-func (c *pollConn) Close() error {
-	c.mu.Lock()
-	select {
-	case <-c.closed:
-		c.mu.Unlock()
-		return nil
-	default:
-		close(c.closed)
-	}
-	c.mu.Unlock()
-
+func (c *pollConn) closeWithError(err error) error {
+	_ = c.queuedConn.closeWithError(err)
 	if c.cancel != nil {
 		c.cancel()
 	}
-
-	// Best-effort session close signal (avoid leaking server-side sessions).
-	closeCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	req, err := http.NewRequestWithContext(closeCtx, http.MethodPost, c.closeURL, nil)
-	if err == nil && c.client != nil {
-		req.Close = true
-		req.Host = c.headerHost
-		applyTunnelHeaders(req.Header, c.headerHost, TunnelModePoll)
-		req.Header.Set("Connection", "close")
-		if resp, doErr := c.client.Do(req); doErr == nil && resp != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
-			_ = resp.Body.Close()
-		}
+	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModePoll)
+	if c.closeIdle != nil {
+		c.closeIdle()
 	}
-
-	if c.client != nil {
-		c.client.CloseIdleConnections()
-	}
-
 	return nil
 }
 
-func (c *pollConn) LocalAddr() net.Addr  { return c.localAddr }
-func (c *pollConn) RemoteAddr() net.Addr { return c.remoteAddr }
-
-func (c *pollConn) SetDeadline(time.Time) error      { return nil }
-func (c *pollConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *pollConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *pollConn) Close() error {
+	return c.closeWithError(io.ErrClosedPipe)
+}
 
 func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
-	client, target, err := newHTTPClient(serverAddress, opts, 32)
+	info, err := dialSession(ctx, serverAddress, opts, TunnelModePoll)
 	if err != nil {
 		return nil, err
 	}
-
-	authorizeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/session"}).String()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authorizeURL, nil)
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, err
-	}
-	req.Host = target.headerHost
-	applyTunnelHeaders(req.Header, target.headerHost, TunnelModePoll)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, err
-	}
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
-	_ = resp.Body.Close()
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		client.CloseIdleConnections()
-		return nil, fmt.Errorf("poll authorize bad status: %s (%s)", resp.Status, strings.TrimSpace(string(bodyBytes)))
-	}
-
-	token, err := parseTunnelToken(bodyBytes)
-	if err != nil {
-		client.CloseIdleConnections()
-		return nil, fmt.Errorf("poll authorize failed: %q", strings.TrimSpace(string(bodyBytes)))
-	}
-	if token == "" {
-		client.CloseIdleConnections()
-		return nil, fmt.Errorf("poll authorize empty token")
-	}
-
-	pushURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token)}).String()
-	pullURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/stream", RawQuery: "token=" + url.QueryEscape(token)}).String()
-	closeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token) + "&close=1"}).String()
 
 	connCtx, cancel := context.WithCancel(context.Background())
 	c := &pollConn{
 		ctx:        connCtx,
 		cancel:     cancel,
-		client:     client,
-		pushURL:    pushURL,
-		pullURL:    pullURL,
-		closeURL:   closeURL,
-		headerHost: target.headerHost,
-		rxc:        make(chan []byte, 128),
-		closed:     make(chan struct{}),
-		writeCh:    make(chan []byte, 256),
-		localAddr:  &net.TCPAddr{},
-		remoteAddr: &net.TCPAddr{},
+		client:     info.client,
+		closeIdle:  info.closeIdle,
+		pushURL:    info.pushURL,
+		pullURL:    info.pullURL,
+		closeURL:   info.closeURL,
+		headerHost: info.headerHost,
+		queuedConn: queuedConn{
+			rxc:        make(chan []byte, 128),
+			closed:     make(chan struct{}),
+			writeCh:    make(chan []byte, 256),
+			localAddr:  &net.TCPAddr{},
+			remoteAddr: &net.TCPAddr{},
+		},
 	}
 
 	go c.pullLoop()
@@ -802,6 +950,16 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 }
 
 func (c *pollConn) pullLoop() {
+	const (
+		maxDialRetry = 12
+		minBackoff   = 10 * time.Millisecond
+		maxBackoff   = 250 * time.Millisecond
+	)
+
+	var (
+		dialRetry int
+		backoff   = minBackoff
+	)
 	for {
 		select {
 		case <-c.closed:
@@ -811,7 +969,7 @@ func (c *pollConn) pullLoop() {
 
 		req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.pullURL, nil)
 		if err != nil {
-			_ = c.Close()
+			_ = c.closeWithError(err)
 			return
 		}
 		req.Host = c.headerHost
@@ -819,13 +977,28 @@ func (c *pollConn) pullLoop() {
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			_ = c.Close()
+			if isDialError(err) && dialRetry < maxDialRetry {
+				dialRetry++
+				select {
+				case <-time.After(backoff):
+				case <-c.closed:
+					return
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
+			_ = c.closeWithError(fmt.Errorf("poll pull request failed: %w", err))
 			return
 		}
+		dialRetry = 0
+		backoff = minBackoff
 
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
-			_ = c.Close()
+			_ = c.closeWithError(fmt.Errorf("poll pull bad status: %s", resp.Status))
 			return
 		}
 
@@ -838,7 +1011,7 @@ func (c *pollConn) pullLoop() {
 			payload, err := base64.StdEncoding.DecodeString(line)
 			if err != nil {
 				_ = resp.Body.Close()
-				_ = c.Close()
+				_ = c.closeWithError(fmt.Errorf("poll pull decode failed: %w", err))
 				return
 			}
 			select {
@@ -850,7 +1023,7 @@ func (c *pollConn) pullLoop() {
 		}
 		_ = resp.Body.Close()
 		if err := scanner.Err(); err != nil {
-			_ = c.Close()
+			_ = c.closeWithError(fmt.Errorf("poll pull scan failed: %w", err))
 			return
 		}
 	}
@@ -861,7 +1034,9 @@ func (c *pollConn) pushLoop() {
 		maxBatchBytes   = 64 * 1024
 		flushInterval   = 5 * time.Millisecond
 		maxLineRawBytes = 16 * 1024
-		requestTimeout  = 20 * time.Second
+		maxDialRetry    = 12
+		minBackoff      = 10 * time.Millisecond
+		maxBackoff      = 250 * time.Millisecond
 	)
 
 	var (
@@ -871,16 +1046,16 @@ func (c *pollConn) pushLoop() {
 	)
 	defer timer.Stop()
 
-	flush := func() bool {
+	flush := func() error {
 		if buf.Len() == 0 {
-			return true
+			return nil
 		}
 
-		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
+		reqCtx, cancel := context.WithTimeout(c.ctx, 20*time.Second)
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.pushURL, bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			cancel()
-			return false
+			return err
 		}
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModePoll)
@@ -889,18 +1064,42 @@ func (c *pollConn) pushLoop() {
 		resp, err := c.client.Do(req)
 		if err != nil {
 			cancel()
-			return false
+			return err
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
 		_ = resp.Body.Close()
 		cancel()
 		if resp.StatusCode != http.StatusOK {
-			return false
+			return fmt.Errorf("bad status: %s", resp.Status)
 		}
 
 		buf.Reset()
 		pendingRaw = 0
-		return true
+		return nil
+	}
+
+	flushWithRetry := func() error {
+		dialRetry := 0
+		backoff := minBackoff
+		for {
+			if err := flush(); err == nil {
+				return nil
+			} else if isDialError(err) && dialRetry < maxDialRetry {
+				dialRetry++
+				select {
+				case <-time.After(backoff):
+				case <-c.closed:
+					return c.closedErr()
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			} else {
+				return err
+			}
+		}
 	}
 
 	resetTimer := func() {
@@ -919,7 +1118,7 @@ func (c *pollConn) pushLoop() {
 		select {
 		case b, ok := <-c.writeCh:
 			if !ok {
-				_ = flush()
+				_ = flushWithRetry()
 				return
 			}
 			if len(b) == 0 {
@@ -936,8 +1135,8 @@ func (c *pollConn) pushLoop() {
 
 				encLen := base64.StdEncoding.EncodedLen(len(chunk))
 				if pendingRaw+len(chunk) > maxBatchBytes || buf.Len()+encLen+1 > maxBatchBytes*2 {
-					if !flush() {
-						_ = c.Close()
+					if err := flushWithRetry(); err != nil {
+						_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
 						return
 					}
 				}
@@ -950,20 +1149,20 @@ func (c *pollConn) pushLoop() {
 			}
 
 			if pendingRaw >= maxBatchBytes {
-				if !flush() {
-					_ = c.Close()
+				if err := flushWithRetry(); err != nil {
+					_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
 					return
 				}
 				resetTimer()
 			}
 		case <-timer.C:
-			if !flush() {
-				_ = c.Close()
+			if err := flushWithRetry(); err != nil {
+				_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
 				return
 			}
 			resetTimer()
 		case <-c.closed:
-			_ = flush()
+			_ = flushWithRetry()
 			return
 		}
 	}

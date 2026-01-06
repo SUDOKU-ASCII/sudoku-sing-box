@@ -55,6 +55,12 @@ type ProtocolConfig struct {
 	// If false, the tunnel uses HTTP (no port-based inference).
 	HTTPMaskTLSEnabled bool
 
+	// HTTPMaskMultiplex controls multiplex behavior when HTTPMask tunnel modes are enabled:
+	//   - "off": disable all multiplexing (default)
+	//   - "auto": reuse underlying HTTP connections across DialTunnel calls (keep-alive / h2)
+	//   - "on": single tunnel, multi-target mux inside one HTTPMask tunnel (requires HTTPMaskMode=stream/poll/auto)
+	HTTPMaskMultiplex string
+
 	// HTTPMaskHost optionally overrides the HTTP Host header / SNI host for HTTP tunnel modes (client-side).
 	HTTPMaskHost string
 }
@@ -103,6 +109,12 @@ func (c *ProtocolConfig) Validate() error {
 		return fmt.Errorf("invalid http_mask_mode: %s, must be one of: legacy, stream, poll, auto", c.HTTPMaskMode)
 	}
 
+	switch strings.ToLower(strings.TrimSpace(c.HTTPMaskMultiplex)) {
+	case "", "off", "auto", "on":
+	default:
+		return fmt.Errorf("invalid http_mask_multiplex: %s, must be one of: off, auto, on", c.HTTPMaskMultiplex)
+	}
+
 	return nil
 }
 
@@ -127,6 +139,7 @@ func DefaultConfig() *ProtocolConfig {
 		EnablePureDownlink:      true,
 		HandshakeTimeoutSeconds: 5,
 		HTTPMaskMode:            "legacy",
+		HTTPMaskMultiplex:       "off",
 	}
 }
 
@@ -142,4 +155,3 @@ func (c *ProtocolConfig) tableCandidates() []*sudoku.Table {
 	}
 	return nil
 }
-

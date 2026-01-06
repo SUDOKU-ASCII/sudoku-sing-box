@@ -73,10 +73,20 @@ func (s *HTTPMaskTunnelServer) WrapConn(rawConn net.Conn) (handshakeConn net.Con
 
 type TunnelDialer func(ctx context.Context, network, addr string) (net.Conn, error)
 
+type HTTPMaskTransportPool = httpmask.TransportPool
+
+type HTTPMaskTunnelDialOptions struct {
+	Dial          TunnelDialer
+	TransportPool *HTTPMaskTransportPool
+}
+
 // DialHTTPMaskTunnel dials a CDN-capable HTTP tunnel (stream/poll/auto) and returns a stream carrying raw Sudoku bytes.
-func DialHTTPMaskTunnel(ctx context.Context, serverAddress string, cfg *ProtocolConfig, dial TunnelDialer) (net.Conn, error) {
+func DialHTTPMaskTunnel(ctx context.Context, serverAddress string, cfg *ProtocolConfig, opts HTTPMaskTunnelDialOptions) (net.Conn, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config is required")
+	}
+	if opts.Dial == nil {
+		return nil, fmt.Errorf("dialer is required")
 	}
 	if cfg.DisableHTTPMask {
 		return nil, fmt.Errorf("http mask is disabled")
@@ -87,9 +97,11 @@ func DialHTTPMaskTunnel(ctx context.Context, serverAddress string, cfg *Protocol
 		return nil, fmt.Errorf("http_mask_mode=%q does not use http tunnel", cfg.HTTPMaskMode)
 	}
 	return httpmask.DialTunnel(ctx, serverAddress, httpmask.TunnelDialOptions{
-		Mode:         cfg.HTTPMaskMode,
-		TLSEnabled:   cfg.HTTPMaskTLSEnabled,
-		HostOverride: cfg.HTTPMaskHost,
-		DialContext:  dial,
+		Mode:          cfg.HTTPMaskMode,
+		TLSEnabled:    cfg.HTTPMaskTLSEnabled,
+		HostOverride:  cfg.HTTPMaskHost,
+		Multiplex:     cfg.HTTPMaskMultiplex,
+		TransportPool: opts.TransportPool,
+		DialContext:   opts.Dial,
 	})
 }

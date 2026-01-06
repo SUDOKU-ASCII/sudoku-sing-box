@@ -82,12 +82,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		HandshakeTimeoutSeconds: handshakeTimeout,
 		DisableHTTPMask:         options.DisableHTTPMask,
 		HTTPMaskMode:            defaultConf.HTTPMaskMode,
+		HTTPMaskMultiplex:       defaultConf.HTTPMaskMultiplex,
 	}
 	if options.AEADMethod != "" {
 		protoConf.AEADMethod = options.AEADMethod
 	}
 	if options.HTTPMaskMode != "" {
 		protoConf.HTTPMaskMode = options.HTTPMaskMode
+	}
+	if options.HTTPMaskMultiplex != "" {
+		protoConf.HTTPMaskMultiplex = options.HTTPMaskMultiplex
 	}
 
 	tables, err := sudokut.NewTablesWithCustomPatterns(protoConf.Key, tableType, options.CustomTable, options.CustomTables)
@@ -172,6 +176,23 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		metadata.Destination = M.Socksaddr{}
 		packetConn := bufio.NewPacketConn(sudokut.NewUoTPacketConn(session.Conn))
 		h.router.RoutePacketConnectionEx(ctx, packetConn, metadata, onClose)
+	case sudokut.SessionTypeMux:
+		h.logger.InfoContext(ctx, "inbound Sudoku mux session from ", metadata.Source)
+		err = sudokut.HandleMuxServer(session.Conn, func(stream net.Conn, targetAddr string) {
+			streamCtx := log.ContextWithNewID(ctx)
+			target := M.ParseSocksaddr(targetAddr)
+			if !target.IsValid() {
+				_ = stream.Close()
+				return
+			}
+			streamMetadata := metadata
+			streamMetadata.Destination = target
+			h.logger.InfoContext(streamCtx, "inbound connection to ", streamMetadata.Destination)
+			h.router.RouteConnectionEx(streamCtx, stream, streamMetadata, nil)
+		})
+		if err != nil {
+			h.logger.ErrorContext(ctx, E.Cause(err, "process mux session from ", metadata.Source))
+		}
 	default:
 		target := M.ParseSocksaddr(session.Target)
 		if !target.IsValid() {

@@ -17,7 +17,8 @@
   "enable_pure_downlink": true,
   "handshake_timeout": 5,
   "disable_http_mask": false,
-  "http_mask_mode": "legacy"
+  "http_mask_mode": "legacy",
+  "http_mask_multiplex": "off"
 }
 ```
 
@@ -102,3 +103,13 @@ Available values:
 * `stream` (real HTTP streaming tunnel, CDN compatible)
 * `poll` (real HTTP polling tunnel)
 * `auto` (accept stream and poll)
+
+#### http_mask_multiplex
+
+Client-side multiplex behavior for `http_mask_mode` `stream`/`poll`/`auto`.
+
+Available values:
+
+* `off`
+* `auto`
+* `on`

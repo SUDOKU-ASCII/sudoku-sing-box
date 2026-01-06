@@ -79,7 +79,36 @@ func RecoverPublicKey(keyHex string) (*edwards25519.Point, error) {
 	}
 }
 
+// DecodePrivateKeyBytes parses a master/split private key hex string and returns its raw bytes.
+// It returns ok=false when keyHex is not a valid ED25519 scalar encoding used by Sudoku.
+func DecodePrivateKeyBytes(keyHex string) (keyBytes []byte, ok bool) {
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil {
+		return nil, false
+	}
+
+	switch len(keyBytes) {
+	case 32:
+		if _, err := edwards25519.NewScalar().SetCanonicalBytes(keyBytes); err != nil {
+			return nil, false
+		}
+		return keyBytes, true
+	case 64:
+		rBytes := keyBytes[:32]
+		kBytes := keyBytes[32:]
+
+		if _, err := edwards25519.NewScalar().SetCanonicalBytes(rBytes); err != nil {
+			return nil, false
+		}
+		if _, err := edwards25519.NewScalar().SetCanonicalBytes(kBytes); err != nil {
+			return nil, false
+		}
+		return keyBytes, true
+	default:
+		return nil, false
+	}
+}
+
 func EncodePoint(p *edwards25519.Point) string {
 	return hex.EncodeToString(p.Bytes())
 }
-
