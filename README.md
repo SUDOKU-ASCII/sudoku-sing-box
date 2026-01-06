@@ -1,12 +1,4 @@
-> Sponsored by [Warp](https://go.warp.dev/sing-box), built for coding with multiple AI agents
-
-<a href="https://go.warp.dev/sing-box">
-<img alt="Warp sponsorship" width="400" src="https://github.com/warpdotdev/brand-assets/raw/refs/heads/main/Github/Sponsor/Warp-Github-LG-02.png">
-</a>
-
----
-
-# sing-box
+# sing-box( sudoku feat.)
 
 The universal proxy platform.
 
