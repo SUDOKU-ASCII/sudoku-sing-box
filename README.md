@@ -1,4 +1,4 @@
-# sing-box( sudoku feat.)
+# sing-box( sudoku feat. )
 
 The universal proxy platform.
 
