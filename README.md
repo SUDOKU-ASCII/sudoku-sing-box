@@ -6,6 +6,13 @@ The universal proxy platform.
 
 https://sing-box.sagernet.org
 
+## Sudoku interop testing
+
+- Official repo: https://github.com/SUDOKU-ASCII/sudoku
+- Run: `SUDOKU_OFFICIAL_BIN=/path/to/sudoku SUDOKU_OFFICIAL_INTEROP=1 go test ./protocol/sudoku -run TestSudoku_OfficialInterop -count=1`
+- Or: `bash scripts/sudoku_official_interop.sh`
+- UDP quick check (via outbound): `./sing-box tools dnsquery 8.8.8.8:53 example.com -c <config.json> -o <outbound-tag>`
+
 ## License
 
 ```
