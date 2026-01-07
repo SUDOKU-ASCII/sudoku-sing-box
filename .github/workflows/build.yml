@@ -91,6 +91,7 @@ jobs:
         include:
           - { os: linux, arch: amd64, variant: purego, naive: false }
           - { os: linux, arch: arm64, variant: purego, naive: false }
+          - { os: windows, arch: amd64, variant: purego, naive: false }
           - { os: freebsd, arch: amd64, variant: purego, naive: false }
           - { os: android, arch: arm64, ndk: "aarch64-linux-android23", naive: false }
     steps:
@@ -478,89 +479,6 @@ jobs:
         with:
           name: binary-darwin_${{ matrix.arch }}${{ matrix.legacy_name && format('-legacy-{0}', matrix.legacy_name) }}
           path: "dist"
-  build_windows:
-    name: Build Windows binaries
-    if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
-    runs-on: windows-latest
-    needs:
-      - calculate_version
-    strategy:
-      matrix:
-        include:
-          - { arch: amd64 }
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
-        with:
-          fetch-depth: 0
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ^1.25.4
-      - name: Set tag
-        run: |-
-          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$env:GITHUB_ENV"
-          git tag v${{ needs.calculate_version.outputs.version }} -f
-      - name: Build
-        if: matrix.naive
-        run: |
-          mkdir -p dist
-          go build -v -trimpath -o dist/sing-box.exe -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_naive_outbound,with_purego,badlinkname,tfogo_checklinkname0" `
-          -ldflags "-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0" `
-          ./cmd/sing-box
-        env:
-          CGO_ENABLED: "0"
-          GOOS: windows
-          GOARCH: ${{ matrix.arch }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build
-        if: ${{ !matrix.naive }}
-        run: |
-          mkdir -p dist
-          go build -v -trimpath -o dist/sing-box.exe -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_purego,badlinkname,tfogo_checklinkname0" `
-          -ldflags "-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0" `
-          ./cmd/sing-box
-        env:
-          CGO_ENABLED: "0"
-          GOOS: windows
-          GOARCH: ${{ matrix.arch }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract libcronet.dll
-        if: matrix.naive
-        run: |
-          $CRONET_GO_VERSION = Get-Content .github/CRONET_GO_VERSION
-          $env:CGO_ENABLED = "0"
-          go run -v "github.com/sagernet/cronet-go/cmd/build-naive@$CRONET_GO_VERSION" extract-lib --target windows/${{ matrix.arch }} -o dist
-      - name: Archive
-        if: matrix.naive
-        run: |
-          $DIR_NAME = "sing-box-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
-          mkdir "dist/$DIR_NAME"
-          Copy-Item LICENSE "dist/$DIR_NAME"
-          Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
-          Copy-Item "dist/libcronet.dll" "dist/$DIR_NAME"
-          Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
-          Remove-Item -Recurse "dist/$DIR_NAME"
-      - name: Archive
-        if: ${{ !matrix.naive }}
-        run: |
-          $DIR_NAME = "sing-box-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
-          mkdir "dist/$DIR_NAME"
-          Copy-Item LICENSE "dist/$DIR_NAME"
-          Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
-          Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
-          Remove-Item -Recurse "dist/$DIR_NAME"
-      - name: Cleanup
-        if: matrix.naive
-        run: Remove-Item dist/sing-box.exe, dist/libcronet.dll
-      - name: Cleanup
-        if: ${{ !matrix.naive }}
-        run: Remove-Item dist/sing-box.exe
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: binary-windows_${{ matrix.arch }}
-          path: "dist"
   build_android:
     name: Build Android
     if: (github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Android')) || github.event_name == 'push'
@@ -598,14 +516,18 @@ jobs:
           STORE_PASS="${ANDROID_KEYSTORE_PASS:-}"
           KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
           KEY_PASS="${ANDROID_KEY_PASSWORD:-}"
-          if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
-          if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
-          if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
-          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "$STORE_PASS" && -n "$KEY_ALIAS" && -n "$KEY_PASS" ]]; then
             echo -n "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > clients/android/app/release.keystore
             echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
           else
-            echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (signatures will differ between runs)." >&2
+            if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+              echo "WARNING: ANDROID_KEYSTORE_BASE64 is set but signing secrets are incomplete; generating ephemeral keystore instead." >&2
+            else
+              echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (signatures will differ between runs)." >&2
+            fi
+            if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
+            if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
+            if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
             keytool -genkeypair -v \
               -keystore clients/android/app/release.keystore \
               -storepass "${STORE_PASS}" \
@@ -635,7 +557,7 @@ jobs:
         run: |-
           make lib_install
           export PATH="$PATH:$(go env GOPATH)/bin"
-          make lib_android_legacy
+          make lib_android_main
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -666,7 +588,7 @@ jobs:
         run: |-
           mkdir -p clients/android/app/libs
           rm -f clients/android/app/libs/*.aar
-          cp libbox-legacy.aar clients/android/app/libs/
+          cp libbox.aar clients/android/app/libs/
           shopt -s nullglob
           aars=(clients/android/app/libs/*.aar)
           echo "Android AARs: ${aars[*]}"
@@ -680,7 +602,6 @@ jobs:
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
       - name: Prepare upload
         run: |-
           mkdir -p dist
@@ -737,14 +658,18 @@ jobs:
           STORE_PASS="${ANDROID_KEYSTORE_PASS:-}"
           KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
           KEY_PASS="${ANDROID_KEY_PASSWORD:-}"
-          if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
-          if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
-          if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
-          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "$STORE_PASS" && -n "$KEY_ALIAS" && -n "$KEY_PASS" ]]; then
             echo -n "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > clients/android/app/release.keystore
             echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
           else
-            echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (Play upload will not be stable)." >&2
+            if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+              echo "WARNING: ANDROID_KEYSTORE_BASE64 is set but signing secrets are incomplete; generating ephemeral keystore (Play upload will not be stable)." >&2
+            else
+              echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (Play upload will not be stable)." >&2
+            fi
+            if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
+            if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
+            if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
             keytool -genkeypair -v \
               -keystore clients/android/app/release.keystore \
               -storepass "${STORE_PASS}" \
@@ -774,7 +699,7 @@ jobs:
         run: |-
           make lib_install
           export PATH="$PATH:$(go env GOPATH)/bin"
-          make lib_android_legacy
+          make lib_android_main
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -798,7 +723,7 @@ jobs:
           go run -v ./cmd/internal/update_android_version --ci
           mkdir -p clients/android/app/libs
           rm -f clients/android/app/libs/*.aar
-          cp libbox-legacy.aar clients/android/app/libs/
+          cp libbox.aar clients/android/app/libs/
           shopt -s nullglob
           aars=(clients/android/app/libs/*.aar)
           echo "Android AARs: ${aars[*]}"
@@ -813,7 +738,6 @@ jobs:
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
           SERVICE_ACCOUNT_CREDENTIALS: ${{ secrets.SERVICE_ACCOUNT_CREDENTIALS }}
   build_apple:
     name: Build Apple clients
@@ -1005,7 +929,6 @@ jobs:
       - calculate_version
       - build
       - build_darwin
-      - build_windows
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
@@ -1099,7 +1022,6 @@ jobs:
       - calculate_version
       - build
       - build_darwin
-      - build_windows
       - build_android
     steps:
       - name: Checkout
@@ -1152,7 +1074,6 @@ jobs:
       - calculate_version
       - build
       - build_darwin
-      - build_windows
       - build_android
     steps:
       - name: Checkout
