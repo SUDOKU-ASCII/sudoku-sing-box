@@ -225,7 +225,7 @@ jobs:
         run: |-
           make lib_install
           export PATH="$PATH:$(go env GOPATH)/bin"
-          make lib_android_main
+          make lib_android_legacy
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -236,7 +236,7 @@ jobs:
         run: |-
           mkdir -p clients/android/app/libs
           rm -f clients/android/app/libs/*.aar
-          cp libbox.aar clients/android/app/libs/
+          cp libbox-legacy.aar clients/android/app/libs/libbox.aar
           cd clients/android
           ./gradlew --no-daemon --stacktrace :app:assembleOtherRelease
         env:
