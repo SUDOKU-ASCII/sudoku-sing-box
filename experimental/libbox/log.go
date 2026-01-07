@@ -5,10 +5,11 @@ package libbox
 import (
 	"os"
 	"runtime"
-	"runtime/debug"
+
+	"golang.org/x/sys/unix"
 )
 
-var crashOutputFile *os.File
+var stderrFile *os.File
 
 func RedirectStderr(path string) error {
 	if stats, err := os.Stat(path); err == nil && stats.Size() > 0 {
@@ -26,12 +27,12 @@ func RedirectStderr(path string) error {
 			return err
 		}
 	}
-	err = debug.SetCrashOutput(outputFile, debug.CrashOptions{})
+	err = unix.Dup2(int(outputFile.Fd()), int(os.Stderr.Fd()))
 	if err != nil {
 		outputFile.Close()
 		os.Remove(outputFile.Name())
 		return err
 	}
-	crashOutputFile = outputFile
+	stderrFile = outputFile
 	return nil
 }

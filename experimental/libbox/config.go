@@ -3,16 +3,18 @@ package libbox
 import (
 	"bytes"
 	"context"
+	"net/netip"
 	"os"
 
-	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
+	"github.com/sagernet/sing-box/experimental/libbox/platform"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	tun "github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -52,7 +54,7 @@ func CheckConfig(configContent string) error {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ctx = service.ContextWith[adapter.PlatformInterface](ctx, (*platformInterfaceStub)(nil))
+	ctx = service.ContextWith[platform.Interface](ctx, (*platformInterfaceStub)(nil))
 	instance, err := box.New(box.Options{
 		Context: ctx,
 		Options: options,
@@ -77,11 +79,7 @@ func (s *platformInterfaceStub) AutoDetectInterfaceControl(fd int) error {
 	return nil
 }
 
-func (s *platformInterfaceStub) UsePlatformInterface() bool {
-	return false
-}
-
-func (s *platformInterfaceStub) OpenInterface(options *tun.Options, platformOptions option.TunPlatformOptions) (tun.Tun, error) {
+func (s *platformInterfaceStub) OpenTun(options *tun.Options, platformOptions option.TunPlatformOptions) (tun.Tun, error) {
 	return nil, os.ErrInvalid
 }
 
@@ -93,11 +91,7 @@ func (s *platformInterfaceStub) CreateDefaultInterfaceMonitor(logger logger.Logg
 	return (*interfaceMonitorStub)(nil)
 }
 
-func (s *platformInterfaceStub) UsePlatformNetworkInterfaces() bool {
-	return false
-}
-
-func (s *platformInterfaceStub) NetworkInterfaces() ([]adapter.NetworkInterface, error) {
+func (s *platformInterfaceStub) Interfaces() ([]adapter.NetworkInterface, error) {
 	return nil, os.ErrInvalid
 }
 
@@ -105,19 +99,11 @@ func (s *platformInterfaceStub) UnderNetworkExtension() bool {
 	return false
 }
 
-func (s *platformInterfaceStub) NetworkExtensionIncludeAllNetworks() bool {
+func (s *platformInterfaceStub) IncludeAllNetworks() bool {
 	return false
 }
 
 func (s *platformInterfaceStub) ClearDNSCache() {
-}
-
-func (s *platformInterfaceStub) RequestPermissionForWIFIState() error {
-	return nil
-}
-
-func (s *platformInterfaceStub) UsePlatformWIFIMonitor() bool {
-	return false
 }
 
 func (s *platformInterfaceStub) ReadWIFIState() adapter.WIFIState {
@@ -128,27 +114,11 @@ func (s *platformInterfaceStub) SystemCertificates() []string {
 	return nil
 }
 
-func (s *platformInterfaceStub) UsePlatformConnectionOwnerFinder() bool {
-	return false
-}
-
-func (s *platformInterfaceStub) FindConnectionOwner(request *adapter.FindConnectionOwnerRequest) (*adapter.ConnectionOwner, error) {
+func (s *platformInterfaceStub) FindProcessInfo(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*adapter.ConnectionOwner, error) {
 	return nil, os.ErrInvalid
 }
 
-func (s *platformInterfaceStub) UsePlatformNotification() bool {
-	return false
-}
-
-func (s *platformInterfaceStub) SendNotification(notification *adapter.Notification) error {
-	return nil
-}
-
-func (s *platformInterfaceStub) UsePlatformLocalDNSTransport() bool {
-	return false
-}
-
-func (s *platformInterfaceStub) LocalDNSTransport() dns.TransportConstructorFunc[option.LocalDNSServerOptions] {
+func (s *platformInterfaceStub) SendNotification(notification *platform.Notification) error {
 	return nil
 }
 
