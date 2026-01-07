@@ -266,6 +266,10 @@ jobs:
       - build_darwin
       - build_android_sfa
     steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
       - name: Cache ghr
         uses: actions/cache@v4
         id: cache-ghr
