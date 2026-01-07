@@ -516,18 +516,29 @@ jobs:
           STORE_PASS="${ANDROID_KEYSTORE_PASS:-}"
           KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
           KEY_PASS="${ANDROID_KEY_PASSWORD:-}"
-          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "$STORE_PASS" && -n "$KEY_ALIAS" && -n "$KEY_PASS" ]]; then
+          if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
+          if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
+          if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
             echo -n "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > clients/android/app/release.keystore
-            echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
-          else
-            if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
-              echo "WARNING: ANDROID_KEYSTORE_BASE64 is set but signing secrets are incomplete; generating ephemeral keystore instead." >&2
+            if keytool -list -keystore clients/android/app/release.keystore -storepass "${STORE_PASS}" -alias "${KEY_ALIAS}" > /dev/null 2>&1 && \
+              keytool -keypasswd -keystore clients/android/app/release.keystore -storepass "${STORE_PASS}" -alias "${KEY_ALIAS}" -keypass "${KEY_PASS}" -new "${KEY_PASS}" -noprompt > /dev/null 2>&1; then
+              echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
             else
-              echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (signatures will differ between runs)." >&2
+              echo "WARNING: Provided keystore is invalid or credentials mismatch; generating ephemeral keystore instead." >&2
+              rm -f clients/android/app/release.keystore
+              keytool -genkeypair -v \
+                -keystore clients/android/app/release.keystore \
+                -storepass "${STORE_PASS}" \
+                -keypass "${KEY_PASS}" \
+                -alias "${KEY_ALIAS}" \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=GitHub CI, OU=CI, O=GitHub, L=Internet, S=Internet, C=US"
             fi
-            if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
-            if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
-            if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
+          else
+            echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (signatures will differ between runs)." >&2
             keytool -genkeypair -v \
               -keystore clients/android/app/release.keystore \
               -storepass "${STORE_PASS}" \
@@ -579,7 +590,7 @@ jobs:
       - name: Update version
         if: github.event_name == 'workflow_dispatch'
         run: |-
-          go run -v ./cmd/internal/update_android_version --ci
+          go run -v ./cmd/internal/update_android_version --ci --nightly
       - name: Update nightly version
         if: github.event_name != 'workflow_dispatch'
         run: |-
@@ -606,7 +617,9 @@ jobs:
         run: |-
           mkdir -p dist
           #cp clients/android/app/build/outputs/apk/play/release/*.apk dist
-          cp clients/android/app/build/outputs/apk/other/release/*.apk dist
+          cp clients/android/app/build/outputs/apk/other/release/*universal.apk dist
+          cp clients/android/app/build/outputs/apk/other/release/*arm64-v8a.apk dist
+          cp clients/android/app/build/outputs/apk/other/release/*armeabi-v7a.apk dist
           VERSION_CODE=$(grep VERSION_CODE clients/android/version.properties | cut -d= -f2)
           VERSION_NAME=$(grep VERSION_NAME clients/android/version.properties | cut -d= -f2)
           cat > dist/SFA-version-metadata.json << EOF
@@ -658,18 +671,29 @@ jobs:
           STORE_PASS="${ANDROID_KEYSTORE_PASS:-}"
           KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
           KEY_PASS="${ANDROID_KEY_PASSWORD:-}"
-          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "$STORE_PASS" && -n "$KEY_ALIAS" && -n "$KEY_PASS" ]]; then
+          if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
+          if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
+          if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
             echo -n "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > clients/android/app/release.keystore
-            echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
-          else
-            if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
-              echo "WARNING: ANDROID_KEYSTORE_BASE64 is set but signing secrets are incomplete; generating ephemeral keystore (Play upload will not be stable)." >&2
+            if keytool -list -keystore clients/android/app/release.keystore -storepass "${STORE_PASS}" -alias "${KEY_ALIAS}" > /dev/null 2>&1 && \
+              keytool -keypasswd -keystore clients/android/app/release.keystore -storepass "${STORE_PASS}" -alias "${KEY_ALIAS}" -keypass "${KEY_PASS}" -new "${KEY_PASS}" -noprompt > /dev/null 2>&1; then
+              echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
             else
-              echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (Play upload will not be stable)." >&2
+              echo "WARNING: Provided keystore is invalid or credentials mismatch; generating ephemeral keystore (Play upload will not be stable)." >&2
+              rm -f clients/android/app/release.keystore
+              keytool -genkeypair -v \
+                -keystore clients/android/app/release.keystore \
+                -storepass "${STORE_PASS}" \
+                -keypass "${KEY_PASS}" \
+                -alias "${KEY_ALIAS}" \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=GitHub CI, OU=CI, O=GitHub, L=Internet, S=Internet, C=US"
             fi
-            if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
-            if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
-            if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
+          else
+            echo "WARNING: ANDROID_KEYSTORE_BASE64 not set; generating ephemeral keystore (Play upload will not be stable)." >&2
             keytool -genkeypair -v \
               -keystore clients/android/app/release.keystore \
               -storepass "${STORE_PASS}" \
@@ -720,7 +744,7 @@ jobs:
           key: gradle-${{ hashFiles('**/*.gradle') }}
       - name: Build
         run: |-
-          go run -v ./cmd/internal/update_android_version --ci
+          go run -v ./cmd/internal/update_android_version --ci --nightly
           mkdir -p clients/android/app/libs
           rm -f clients/android/app/libs/*.aar
           cp libbox.aar clients/android/app/libs/

@@ -1,0 +1,293 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TAGS: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0
+
+jobs:
+  calculate_version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.outputs.outputs.version }}
+    steps:
+      - name: Set outputs
+        id: outputs
+        run: |-
+          set -euo pipefail
+          ref="${{ github.ref_name }}"
+          if [[ "${ref}" != v* ]]; then
+            echo "Unexpected tag: ${ref}" >&2
+            exit 1
+          fi
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+  build_binaries:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: freebsd, arch: amd64 }
+          - { os: windows, arch: amd64 }
+          - { os: android, arch: arm64, ndk: "aarch64-linux-android23" }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Setup Android NDK
+        if: matrix.os == 'android'
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+          local-cache: true
+      - name: Build
+        run: |-
+          set -xeuo pipefail
+          mkdir -p dist
+          if [[ "${{ matrix.os }}" == "android" ]]; then
+            go install -v ./cmd/internal/build
+            export CC='${{ matrix.ndk }}-clang'
+            export CXX="${CC}++"
+            CGO_ENABLED=1 BUILD_GOOS=android BUILD_GOARCH=${{ matrix.arch }} GOOS=android GOARCH=${{ matrix.arch }} build go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+              -ldflags '-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0' \
+              ./cmd/sing-box
+          else
+            CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+              -ldflags '-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0' \
+              ./cmd/sing-box
+          fi
+      - name: Archive
+        run: |-
+          set -xeuo pipefail
+          cd dist
+          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}"
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            mv sing-box "${DIR_NAME}/sing-box.exe"
+            zip -r "${DIR_NAME}.zip" "${DIR_NAME}"
+          else
+            mv sing-box "${DIR_NAME}/sing-box"
+            tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          fi
+          rm -r "${DIR_NAME}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}_${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
+  build_darwin:
+    name: Build darwin binaries
+    runs-on: macos-latest
+    needs:
+      - calculate_version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64 }
+          - { arch: arm64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |-
+          set -xeuo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.arch }} go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            -ldflags '-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0' \
+            ./cmd/sing-box
+      - name: Archive
+        run: |-
+          set -xeuo pipefail
+          cd dist
+          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-darwin-${{ matrix.arch }}"
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}"
+          mv sing-box "${DIR_NAME}/sing-box"
+          tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -r "${DIR_NAME}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-darwin_${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
+  build_android_sfa:
+    name: Build Android SFA
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+          submodules: "recursive"
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+          local-cache: true
+      - name: Setup OpenJDK
+        run: |-
+          sudo apt update && sudo apt install -y openjdk-17-jdk-headless
+          /usr/lib/jvm/java-17-openjdk-amd64/bin/java --version
+      - name: Setup Android signing (keystore)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |-
+          set -xeuo pipefail
+          mkdir -p clients/android/app
+          STORE_PASS="${ANDROID_KEYSTORE_PASS:-}"
+          KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
+          KEY_PASS="${ANDROID_KEY_PASSWORD:-}"
+          if [[ -z "$STORE_PASS" ]]; then STORE_PASS="github"; fi
+          if [[ -z "$KEY_ALIAS" ]]; then KEY_ALIAS="github"; fi
+          if [[ -z "$KEY_PASS" ]]; then KEY_PASS="github"; fi
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+            echo -n "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > clients/android/app/release.keystore
+            if keytool -list -keystore clients/android/app/release.keystore -storepass "${STORE_PASS}" -alias "${KEY_ALIAS}" > /dev/null 2>&1 && \
+              keytool -keypasswd -keystore clients/android/app/release.keystore -storepass "${STORE_PASS}" -alias "${KEY_ALIAS}" -keypass "${KEY_PASS}" -new "${KEY_PASS}" -noprompt > /dev/null 2>&1; then
+              echo "Using persistent keystore from ANDROID_KEYSTORE_BASE64 secret."
+            else
+              echo "WARNING: Provided keystore is invalid or credentials mismatch; generating ephemeral keystore instead." >&2
+              rm -f clients/android/app/release.keystore
+              keytool -genkeypair -v \
+                -keystore clients/android/app/release.keystore \
+                -storepass "${STORE_PASS}" \
+                -keypass "${KEY_PASS}" \
+                -alias "${KEY_ALIAS}" \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=GitHub CI, OU=CI, O=GitHub, L=Internet, S=Internet, C=US"
+            fi
+          else
+            keytool -genkeypair -v \
+              -keystore clients/android/app/release.keystore \
+              -storepass "${STORE_PASS}" \
+              -keypass "${KEY_PASS}" \
+              -alias "${KEY_ALIAS}" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=GitHub CI, OU=CI, O=GitHub, L=Internet, S=Internet, C=US"
+          fi
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$SDK_DIR" && -d /usr/local/lib/android/sdk ]]; then
+            SDK_DIR="/usr/local/lib/android/sdk"
+          fi
+          cat > clients/android/local.properties <<EOF
+          KEYSTORE_PASS=${STORE_PASS}
+          ALIAS_NAME=${KEY_ALIAS}
+          ALIAS_PASS=${KEY_PASS}
+          EOF
+          if [[ -n "$SDK_DIR" ]]; then echo "sdk.dir=$SDK_DIR" >> clients/android/local.properties; fi
+          echo "ndk.dir=${{ steps.setup-ndk.outputs.ndk-path }}" >> clients/android/local.properties
+      - name: Build library
+        run: |-
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make lib_android_main
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Update version
+        run: |-
+          go run -v ./cmd/internal/update_android_version --ci --nightly
+      - name: Build
+        run: |-
+          mkdir -p clients/android/app/libs
+          rm -f clients/android/app/libs/*.aar
+          cp libbox.aar clients/android/app/libs/
+          cd clients/android
+          ./gradlew --no-daemon --stacktrace :app:assembleOtherRelease
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Prepare upload
+        run: |-
+          mkdir -p dist
+          cp clients/android/app/build/outputs/apk/other/release/*universal.apk dist
+          cp clients/android/app/build/outputs/apk/other/release/*arm64-v8a.apk dist
+          cp clients/android/app/build/outputs/apk/other/release/*armeabi-v7a.apk dist
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-android-sfa
+          path: dist
+          if-no-files-found: error
+
+  upload:
+    name: Upload builds
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+      - build_binaries
+      - build_darwin
+      - build_android_sfa
+    steps:
+      - name: Cache ghr
+        uses: actions/cache@v4
+        id: cache-ghr
+        with:
+          path: |
+            ~/go/bin/ghr
+          key: ghr
+      - name: Setup ghr
+        if: steps.cache-ghr.outputs.cache-hit != 'true'
+        run: |-
+          cd $HOME
+          git clone https://github.com/nekohasekai/ghr ghr
+          cd ghr
+          go install -v .
+      - name: Download builds
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload builds
+        run: |-
+          set -xeuo pipefail
+          export PATH="$PATH:$HOME/go/bin"
+          VERSION="${{ needs.calculate_version.outputs.version }}"
+          ghr --replace --draft --prerelease -p 5 "v${VERSION}" dist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
