@@ -13,25 +13,32 @@ func TestMuxSessionEcho(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
+	serverErr := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		if err := readMuxPreface(serverConn); err != nil {
+			serverErr <- err
+			return
+		}
+		serverSession := newMuxSession(serverConn, func(stream *muxStream, payload []byte) {
+			addr, err := DecodeAddress(bytes.NewReader(payload))
+			if err != nil {
+				stream.closeNoSend(err)
+				return
+			}
+			if addr != "example.com:80" {
+				stream.closeNoSend(io.ErrUnexpectedEOF)
+				return
+			}
+			go io.Copy(stream, stream)
+		})
+		<-serverSession.closed
+	}()
+
 	if err := WriteMuxPreface(clientConn); err != nil {
 		t.Fatalf("WriteMuxPreface: %v", err)
 	}
-	if err := readMuxPreface(serverConn); err != nil {
-		t.Fatalf("readMuxPreface: %v", err)
-	}
-
-	serverSession := newMuxSession(serverConn, func(stream *muxStream, payload []byte) {
-		addr, err := DecodeAddress(bytes.NewReader(payload))
-		if err != nil {
-			stream.closeNoSend(err)
-			return
-		}
-		if addr != "example.com:80" {
-			stream.closeNoSend(io.ErrUnexpectedEOF)
-			return
-		}
-		go io.Copy(stream, stream)
-	})
 
 	clientSession := newMuxSession(clientConn, nil)
 	stream, err := dialMuxStream(clientSession, "example.com:80")
@@ -55,9 +62,13 @@ func TestMuxSessionEcho(t *testing.T) {
 	_ = clientConn.Close()
 
 	select {
-	case <-serverSession.closed:
+	case <-serverDone:
+		select {
+		case err := <-serverErr:
+			t.Fatalf("server error: %v", err)
+		default:
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("server session did not close")
 	}
 }
-
