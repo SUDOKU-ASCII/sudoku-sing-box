@@ -62,6 +62,10 @@ and only through a separate legacy build (with `-legacy-android-5` suffix).
 For standalone binaries, the minimum Android version has been raised to Android 6.0,
 since Termux requires Android 7.0 or later.
 
+#### 1.12.15
+
+* Fixes and improvements
+
 #### 1.12.14
 
 * Fixes and improvements
