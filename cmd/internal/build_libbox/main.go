@@ -17,10 +17,11 @@ import (
 )
 
 var (
-	debugEnabled  bool
-	target        string
-	platform      string
-	withTailscale bool
+	debugEnabled   bool
+	target         string
+	platform       string
+	withTailscale  bool
+	androidVariant string
 )
 
 func init() {
@@ -28,6 +29,7 @@ func init() {
 	flag.StringVar(&target, "target", "android", "target platform")
 	flag.StringVar(&platform, "platform", "", "specify platform")
 	flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
+	flag.StringVar(&androidVariant, "android-variant", "both", "android variant to build: both, main, legacy")
 }
 
 func main() {
@@ -162,6 +164,20 @@ func buildAndroid() {
 
 	bindTarget := getAndroidBindTarget()
 
+	switch androidVariant {
+	case "both":
+		buildAndroidMainVariant(bindTarget)
+		buildAndroidLegacyVariant(bindTarget)
+	case "main":
+		buildAndroidMainVariant(bindTarget)
+	case "legacy":
+		buildAndroidLegacyVariant(bindTarget)
+	default:
+		log.Fatal("unknown android-variant: ", androidVariant)
+	}
+}
+
+func buildAndroidMainVariant(bindTarget string) {
 	// Build main variant (SDK 23)
 	mainTags := append([]string{}, sharedTags...)
 	mainTags = append(mainTags, memcTags...)
@@ -173,7 +189,9 @@ func buildAndroid() {
 		OutputName: "libbox.aar",
 		Tags:       mainTags,
 	}, bindTarget)
+}
 
+func buildAndroidLegacyVariant(bindTarget string) {
 	// Build legacy variant (SDK 21, no naive outbound)
 	legacyTags := filterTags(sharedTags, "with_naive_outbound")
 	legacyTags = append(legacyTags, memcTags...)

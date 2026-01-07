@@ -238,8 +238,20 @@ test_stdio:
 lib_android:
 	go run ./cmd/internal/build_libbox -target android
 
+lib_android_main:
+	go run ./cmd/internal/build_libbox -target android -android-variant main
+
+lib_android_legacy:
+	go run ./cmd/internal/build_libbox -target android -android-variant legacy
+
 lib_android_debug:
 	go run ./cmd/internal/build_libbox -target android -debug
+
+lib_android_debug_main:
+	go run ./cmd/internal/build_libbox -target android -android-variant main -debug
+
+lib_android_debug_legacy:
+	go run ./cmd/internal/build_libbox -target android -android-variant legacy -debug
 
 lib_apple:
 	go run ./cmd/internal/build_libbox -target apple

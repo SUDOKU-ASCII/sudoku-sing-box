@@ -635,7 +635,7 @@ jobs:
         run: |-
           make lib_install
           export PATH="$PATH:$(go env GOPATH)/bin"
-          make lib_android
+          make lib_android_legacy
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -665,7 +665,16 @@ jobs:
       - name: Build
         run: |-
           mkdir -p clients/android/app/libs
-          cp *.aar clients/android/app/libs
+          rm -f clients/android/app/libs/*.aar
+          cp libbox-legacy.aar clients/android/app/libs/
+          shopt -s nullglob
+          aars=(clients/android/app/libs/*.aar)
+          echo "Android AARs: ${aars[*]}"
+          if [[ ${#aars[@]} -ne 1 ]]; then
+            echo "Expected exactly 1 AAR in clients/android/app/libs, got ${#aars[@]}"
+            ls -la clients/android/app/libs || true
+            exit 1
+          fi
           cd clients/android
           ./gradlew --no-daemon --stacktrace :app:assembleOtherRelease
         env:
@@ -765,7 +774,7 @@ jobs:
         run: |-
           make lib_install
           export PATH="$PATH:$(go env GOPATH)/bin"
-          make lib_android
+          make lib_android_legacy
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -788,7 +797,16 @@ jobs:
         run: |-
           go run -v ./cmd/internal/update_android_version --ci
           mkdir -p clients/android/app/libs
-          cp *.aar clients/android/app/libs
+          rm -f clients/android/app/libs/*.aar
+          cp libbox-legacy.aar clients/android/app/libs/
+          shopt -s nullglob
+          aars=(clients/android/app/libs/*.aar)
+          echo "Android AARs: ${aars[*]}"
+          if [[ ${#aars[@]} -ne 1 ]]; then
+            echo "Expected exactly 1 AAR in clients/android/app/libs, got ${#aars[@]}"
+            ls -la clients/android/app/libs || true
+            exit 1
+          fi
           cd clients/android
           echo -n "$SERVICE_ACCOUNT_CREDENTIALS" | base64 --decode > service-account-credentials.json
           ./gradlew --no-daemon --stacktrace :app:publishPlayReleaseBundle
