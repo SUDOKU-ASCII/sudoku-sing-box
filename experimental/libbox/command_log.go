@@ -16,7 +16,10 @@ func (s *CommandServer) ResetLog() {
 	s.access.Lock()
 	defer s.access.Unlock()
 	s.savedLines.Init()
-	s.logResetSubscriber.Emit(struct{}{})
+	select {
+	case s.logReset <- struct{}{}:
+	default:
+	}
 }
 
 func (s *CommandServer) WriteMessage(message string) {
@@ -54,14 +57,9 @@ func (s *CommandServer) handleLogConn(conn net.Conn) error {
 		return err
 	}
 	defer s.observer.UnSubscribe(subscription)
-	resetSubscription, resetDone, err := s.logResetObserver.Subscribe()
-	if err != nil {
-		return err
-	}
-	defer s.logResetObserver.UnSubscribe(resetSubscription)
 	writer := bufio.NewWriter(conn)
 	select {
-	case <-resetSubscription:
+	case <-s.logReset:
 		err = writer.WriteByte(1)
 		if err != nil {
 			return err
@@ -92,13 +90,11 @@ func (s *CommandServer) handleLogConn(conn net.Conn) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-resetSubscription:
+		case <-s.logReset:
 			err = writer.WriteByte(1)
 			if err != nil {
 				return err
 			}
-		case <-resetDone:
-			return nil
 		case <-done:
 			return nil
 		case logLine := <-subscription:

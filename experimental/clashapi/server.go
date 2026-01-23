@@ -24,7 +24,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 	"github.com/sagernet/ws"
@@ -54,7 +53,7 @@ type Server struct {
 
 	mode           string
 	modeList       []string
-	modeUpdateHook *observable.Subscriber[struct{}]
+	modeUpdateHook chan<- struct{}
 
 	externalController       bool
 	externalUI               string
@@ -204,7 +203,7 @@ func (s *Server) ModeList() []string {
 	return s.modeList
 }
 
-func (s *Server) SetModeUpdateHook(hook *observable.Subscriber[struct{}]) {
+func (s *Server) SetModeUpdateHook(hook chan<- struct{}) {
 	s.modeUpdateHook = hook
 }
 
@@ -222,7 +221,10 @@ func (s *Server) SetMode(newMode string) {
 	}
 	s.mode = newMode
 	if s.modeUpdateHook != nil {
-		s.modeUpdateHook.Emit(struct{}{})
+		select {
+		case s.modeUpdateHook <- struct{}{}:
+		default:
+		}
 	}
 	s.dnsRouter.ClearCache()
 	cacheFile := service.FromContext[adapter.CacheFile](s.ctx)

@@ -3,7 +3,6 @@ package transport
 import (
 	"context"
 	"sync"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -29,9 +28,9 @@ func RegisterTLS(registry *dns.TransportRegistry) {
 }
 
 type TLSTransport struct {
-	*BaseTransport
-
-	dialer      tls.Dialer
+	dns.TransportAdapter
+	logger      logger.ContextLogger
+	dialer      N.Dialer
 	serverAddr  M.Socksaddr
 	tlsConfig   tls.Config
 	access      sync.Mutex
@@ -50,7 +49,7 @@ func NewTLS(ctx context.Context, logger log.ContextLogger, tag string, options o
 	}
 	tlsOptions := common.PtrValueOrDefault(options.TLS)
 	tlsOptions.Enabled = true
-	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, tlsOptions)
+	tlsConfig, err := tls.NewClient(ctx, options.Server, tlsOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -66,10 +65,11 @@ func NewTLS(ctx context.Context, logger log.ContextLogger, tag string, options o
 
 func NewTLSRaw(logger logger.ContextLogger, adapter dns.TransportAdapter, dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.Config) *TLSTransport {
 	return &TLSTransport{
-		BaseTransport: NewBaseTransport(adapter, logger),
-		dialer:        tls.NewDialer(dialer, tlsConfig),
-		serverAddr:    serverAddr,
-		tlsConfig:     tlsConfig,
+		TransportAdapter: adapter,
+		logger:           logger,
+		dialer:           dialer,
+		serverAddr:       serverAddr,
+		tlsConfig:        tlsConfig,
 	}
 }
 
@@ -77,59 +77,42 @@ func (t *TLSTransport) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
-	err := t.SetStarted()
-	if err != nil {
-		return err
-	}
 	return dialer.InitializeDetour(t.dialer)
 }
 
 func (t *TLSTransport) Close() error {
-	t.access.Lock()
-	for connection := t.connections.Front(); connection != nil; connection = connection.Next() {
-		connection.Value.Close()
-	}
-	t.connections.Init()
-	t.access.Unlock()
-	return t.BaseTransport.Close()
-}
-
-func (t *TLSTransport) Reset() {
 	t.access.Lock()
 	defer t.access.Unlock()
 	for connection := t.connections.Front(); connection != nil; connection = connection.Next() {
 		connection.Value.Close()
 	}
 	t.connections.Init()
+	return nil
 }
 
 func (t *TLSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	if !t.BeginQuery() {
-		return nil, ErrTransportClosed
-	}
-	defer t.EndQuery()
-
 	t.access.Lock()
 	conn := t.connections.PopFront()
 	t.access.Unlock()
 	if conn != nil {
-		response, err := t.exchange(ctx, message, conn)
+		response, err := t.exchange(message, conn)
 		if err == nil {
 			return response, nil
 		}
-		t.Logger.DebugContext(ctx, "discarded pooled connection: ", err)
 	}
-	tlsConn, err := t.dialer.DialTLSContext(ctx, t.serverAddr)
+	tcpConn, err := t.dialer.DialContext(ctx, N.NetworkTCP, t.serverAddr)
 	if err != nil {
-		return nil, E.Cause(err, "dial TLS connection")
+		return nil, err
 	}
-	return t.exchange(ctx, message, &tlsDNSConn{Conn: tlsConn})
+	tlsConn, err := tls.ClientHandshake(ctx, tcpConn, t.tlsConfig)
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	return t.exchange(message, &tlsDNSConn{Conn: tlsConn})
 }
 
-func (t *TLSTransport) exchange(ctx context.Context, message *mDNS.Msg, conn *tlsDNSConn) (*mDNS.Msg, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(deadline)
-	}
+func (t *TLSTransport) exchange(message *mDNS.Msg, conn *tlsDNSConn) (*mDNS.Msg, error) {
 	conn.queryId++
 	err := WriteMessage(conn, conn.queryId, message)
 	if err != nil {
@@ -142,12 +125,6 @@ func (t *TLSTransport) exchange(ctx context.Context, message *mDNS.Msg, conn *tl
 		return nil, E.Cause(err, "read response")
 	}
 	t.access.Lock()
-	if t.State() >= StateClosing {
-		t.access.Unlock()
-		conn.Close()
-		return response, nil
-	}
-	conn.SetDeadline(time.Time{})
 	t.connections.PushBack(conn)
 	t.access.Unlock()
 	return response, nil

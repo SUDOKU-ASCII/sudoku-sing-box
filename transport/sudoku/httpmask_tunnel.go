@@ -23,7 +23,11 @@ func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) *HTTPMaskTunnelServer {
 	if !cfg.DisableHTTPMask {
 		switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
 		case "stream", "poll", "auto":
-			ts = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{Mode: cfg.HTTPMaskMode})
+			ts = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{
+				Mode:     cfg.HTTPMaskMode,
+				PathRoot: cfg.HTTPMaskPathRoot,
+				AuthKey:  cfg.Key,
+			})
 		}
 	}
 	return &HTTPMaskTunnelServer{cfg: cfg, ts: ts}
@@ -100,6 +104,8 @@ func DialHTTPMaskTunnel(ctx context.Context, serverAddress string, cfg *Protocol
 		Mode:          cfg.HTTPMaskMode,
 		TLSEnabled:    cfg.HTTPMaskTLSEnabled,
 		HostOverride:  cfg.HTTPMaskHost,
+		PathRoot:      cfg.HTTPMaskPathRoot,
+		AuthKey:       ClientAEADSeed(cfg.Key),
 		Multiplex:     cfg.HTTPMaskMultiplex,
 		TransportPool: opts.TransportPool,
 		DialContext:   opts.Dial,

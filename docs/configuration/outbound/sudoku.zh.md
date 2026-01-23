@@ -20,6 +20,7 @@
   "http_mask_multiplex": "off",
   "http_mask_tls": false,
   "http_mask_host": "",
+  "http_mask_path_root": "",
   "http_mask_strategy": "random",
 
   ... // 拨号字段
@@ -129,6 +130,12 @@ HTTP 伪装模式。
 #### http_mask_host
 
 为 `http_mask_mode` 为 `stream`/`poll`/`auto` 时覆盖 HTTP Host 头 / SNI Host。
+
+#### http_mask_path_root
+
+为所有 HTTP mask 端点增加一级路径前缀（可选）。
+
+例如：`aabbcc` => `/aabbcc/session`、`/aabbcc/api/v1/upload` ...
 
 #### http_mask_strategy
 

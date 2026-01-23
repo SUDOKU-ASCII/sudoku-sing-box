@@ -22,7 +22,6 @@
 | `socks`        | [SOCKS](./socks/)               |
 | `http`         | [HTTP](./http/)                 |
 | `shadowsocks`  | [Shadowsocks](./shadowsocks/)   |
-| `sudoku`       | [Sudoku](./sudoku/)             |
 | `vmess`        | [VMess](./vmess/)               |
 | `trojan`       | [Trojan](./trojan/)             |
 | `wireguard`    | [Wireguard](./wireguard/)       |
@@ -37,7 +36,6 @@
 | `dns`          | [DNS](./dns/)                   |
 | `selector`     | [Selector](./selector/)         |
 | `urltest`      | [URLTest](./urltest/)           |
-| `naive`        | [NaiveProxy](./naive/)          |
 
 #### tag
 

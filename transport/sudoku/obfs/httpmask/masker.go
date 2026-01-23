@@ -120,10 +120,15 @@ func appendCommonHeaders(buf []byte, host string, r *rand.Rand) []byte {
 }
 
 func WriteRandomRequestHeader(w io.Writer, host string) error {
+	return WriteRandomRequestHeaderWithPathRoot(w, host, "")
+}
+
+func WriteRandomRequestHeaderWithPathRoot(w io.Writer, host string, pathRoot string) error {
 	r := rngPool.Get().(*rand.Rand)
 	defer rngPool.Put(r)
 
-	path := paths[r.Intn(len(paths))]
+	basePath := paths[r.Intn(len(paths))]
+	path := joinPathRoot(pathRoot, basePath)
 	ctype := contentTypes[r.Intn(len(contentTypes))]
 
 	bufPtr := headerBufPool.Get().(*[]byte)
@@ -219,4 +224,3 @@ func ConsumeHeader(r *bufio.Reader) ([]byte, error) {
 		}
 	}
 }
-

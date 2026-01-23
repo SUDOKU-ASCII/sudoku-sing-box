@@ -18,7 +18,8 @@
   "handshake_timeout": 5,
   "disable_http_mask": false,
   "http_mask_mode": "legacy",
-  "http_mask_multiplex": "off"
+  "http_mask_multiplex": "off",
+  "http_mask_path_root": ""
 }
 ```
 
@@ -113,3 +114,11 @@ Available values:
 * `off`
 * `auto`
 * `on`
+
+#### http_mask_path_root
+
+Optional first-level path prefix for all HTTP mask endpoints.
+
+Example: `aabbcc` => `/aabbcc/session`, `/aabbcc/api/v1/upload`, ...
+
+Must match the client when `http_mask_mode` is `stream`/`poll`/`auto`.

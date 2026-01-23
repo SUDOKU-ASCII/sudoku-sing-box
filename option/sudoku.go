@@ -14,6 +14,7 @@ type SudokuInboundOptions struct {
 	DisableHTTPMask    bool     `json:"disable_http_mask,omitempty"`
 	HTTPMaskMode       string   `json:"http_mask_mode,omitempty"`
 	HTTPMaskMultiplex  string   `json:"http_mask_multiplex,omitempty"`
+	HTTPMaskPathRoot   string   `json:"http_mask_path_root,omitempty"`
 }
 
 type SudokuOutboundOptions struct {
@@ -30,6 +31,7 @@ type SudokuOutboundOptions struct {
 	DisableHTTPMask    bool     `json:"disable_http_mask,omitempty"`
 	HTTPMaskMode       string   `json:"http_mask_mode,omitempty"`
 	HTTPMaskMultiplex  string   `json:"http_mask_multiplex,omitempty"`
+	HTTPMaskPathRoot   string   `json:"http_mask_path_root,omitempty"`
 	HTTPMaskTLS        bool     `json:"http_mask_tls,omitempty"`
 	HTTPMaskHost       string   `json:"http_mask_host,omitempty"`
 	HTTPMaskStrategy   string   `json:"http_mask_strategy,omitempty"`

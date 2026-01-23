@@ -22,7 +22,6 @@
 | `socks`       | [SOCKS](./socks/)             | TCP              |
 | `http`        | [HTTP](./http/)               | TCP              |
 | `shadowsocks` | [Shadowsocks](./shadowsocks/) | TCP              |
-| `sudoku`      | [Sudoku](./sudoku/)           | TCP              |
 | `vmess`       | [VMess](./vmess/)             | TCP              |
 | `trojan`      | [Trojan](./trojan/)           | TCP              |
 | `naive`       | [Naive](./naive/)             | :material-close: |

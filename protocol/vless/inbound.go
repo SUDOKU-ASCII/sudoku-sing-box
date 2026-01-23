@@ -68,16 +68,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}))
 	inbound.service = service
 	if options.TLS != nil {
-		inbound.tlsConfig, err = tls.NewServerWithOptions(tls.ServerOptions{
-			Context: ctx,
-			Logger:  logger,
-			Options: common.PtrValueOrDefault(options.TLS),
-			KTLSCompatible: common.PtrValueOrDefault(options.Transport).Type == "" &&
-				!common.PtrValueOrDefault(options.Multiplex).Enabled &&
-				common.All(options.Users, func(it option.VLESSUser) bool {
-					return it.Flow == ""
-				}),
-		})
+		inbound.tlsConfig, err = tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
 		if err != nil {
 			return nil, err
 		}

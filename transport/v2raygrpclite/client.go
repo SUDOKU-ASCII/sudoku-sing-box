@@ -29,6 +29,7 @@ var defaultClientHeader = http.Header{
 
 type Client struct {
 	ctx        context.Context
+	dialer     N.Dialer
 	serverAddr M.Socksaddr
 	transport  *http2.Transport
 	options    option.V2RayGRPCOptions
@@ -45,6 +46,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	client := &Client{
 		ctx:        ctx,
+		dialer:     dialer,
 		serverAddr: serverAddr,
 		options:    options,
 		transport: &http2.Transport{
@@ -60,6 +62,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		},
 		host: host,
 	}
+
 	if tlsConfig == nil {
 		client.transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
@@ -68,9 +71,12 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		if len(tlsConfig.NextProtos()) == 0 {
 			tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
 		}
-		tlsDialer := tls.NewDialer(dialer, tlsConfig)
 		client.transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
-			return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
+			conn, err := dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+			if err != nil {
+				return nil, err
+			}
+			return tls.ClientHandshake(ctx, conn, tlsConfig)
 		}
 	}
 

@@ -46,9 +46,6 @@ func (p *platformTransport) Close() error {
 	return nil
 }
 
-func (p *platformTransport) Reset() {
-}
-
 func (p *platformTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	response := &ExchangeContext{
 		context: ctx,

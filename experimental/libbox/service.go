@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
@@ -110,7 +111,7 @@ func (s *BoxService) Close() error {
 }
 
 func (s *BoxService) NeedWIFIState() bool {
-	return s.instance.Network().NeedWIFIState()
+	return s.instance.Router().NeedWIFIState()
 }
 
 var (
@@ -235,7 +236,7 @@ func (w *platformInterfaceWrapper) SystemCertificates() []string {
 	return iteratorToArray[string](w.iif.SystemCertificates())
 }
 
-func (w *platformInterfaceWrapper) FindProcessInfo(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*adapter.ConnectionOwner, error) {
+func (w *platformInterfaceWrapper) FindProcessInfo(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*process.Info, error) {
 	var uid int32
 	if w.useProcFS {
 		uid = procfs.ResolveSocketByProcSearch(network, source, destination)
@@ -259,7 +260,7 @@ func (w *platformInterfaceWrapper) FindProcessInfo(ctx context.Context, network 
 		}
 	}
 	packageName, _ := w.iif.PackageNameByUid(uid)
-	return &adapter.ConnectionOwner{UserId: uid, AndroidPackageName: packageName}, nil
+	return &process.Info{UserId: uid, PackageName: packageName}, nil
 }
 
 func (w *platformInterfaceWrapper) DisableColors() bool {

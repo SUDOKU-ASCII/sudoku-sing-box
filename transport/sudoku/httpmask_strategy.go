@@ -93,24 +93,35 @@ func appendCommonHeaders(buf []byte, host string, r *rand.Rand) []byte {
 
 // WriteHTTPMaskHeader writes an HTTP/1.x request header as a mask, according to strategy.
 // Supported strategies: ""/"random", "post", "websocket".
-func WriteHTTPMaskHeader(w io.Writer, host string, strategy string) error {
+func WriteHTTPMaskHeader(w io.Writer, host string, pathRoot string, strategy string) error {
 	switch normalizeHTTPMaskStrategy(strategy) {
 	case "random":
-		return httpmask.WriteRandomRequestHeader(w, host)
+		return httpmask.WriteRandomRequestHeaderWithPathRoot(w, host, pathRoot)
 	case "post":
-		return writeHTTPMaskPOST(w, host)
+		return writeHTTPMaskPOST(w, host, pathRoot)
 	case "websocket":
-		return writeHTTPMaskWebSocket(w, host)
+		return writeHTTPMaskWebSocket(w, host, pathRoot)
 	default:
 		return fmt.Errorf("unsupported http_mask_strategy: %s", strategy)
 	}
 }
 
-func writeHTTPMaskPOST(w io.Writer, host string) error {
+func joinHTTPMaskPathRoot(pathRoot, path string) string {
+	pathRoot = strings.Trim(strings.TrimSpace(pathRoot), "/")
+	if pathRoot == "" {
+		return path
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return "/" + pathRoot + path
+}
+
+func writeHTTPMaskPOST(w io.Writer, host string, pathRoot string) error {
 	r := httpMaskRngPool.Get().(*rand.Rand)
 	defer httpMaskRngPool.Put(r)
 
-	path := httpMaskPaths[r.Intn(len(httpMaskPaths))]
+	path := joinHTTPMaskPathRoot(pathRoot, httpMaskPaths[r.Intn(len(httpMaskPaths))])
 	ctype := httpMaskContentTypes[r.Intn(len(httpMaskContentTypes))]
 
 	bufPtr := httpMaskBufPool.Get().(*[]byte)
@@ -141,11 +152,11 @@ func writeHTTPMaskPOST(w io.Writer, host string) error {
 	return err
 }
 
-func writeHTTPMaskWebSocket(w io.Writer, host string) error {
+func writeHTTPMaskWebSocket(w io.Writer, host string, pathRoot string) error {
 	r := httpMaskRngPool.Get().(*rand.Rand)
 	defer httpMaskRngPool.Put(r)
 
-	path := httpMaskPaths[r.Intn(len(httpMaskPaths))]
+	path := joinHTTPMaskPathRoot(pathRoot, httpMaskPaths[r.Intn(len(httpMaskPaths))])
 
 	bufPtr := httpMaskBufPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -190,4 +201,3 @@ func normalizeHTTPMaskStrategy(strategy string) string {
 		return s
 	}
 }
-

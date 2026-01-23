@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/experimental/libbox/platform"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -35,7 +36,7 @@ func NewStore(ctx context.Context, logger logger.Logger, options option.Certific
 	switch options.Store {
 	case C.CertificateStoreSystem, "":
 		systemPool = x509.NewCertPool()
-		platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
+		platformInterface := service.FromContext[platform.Interface](ctx)
 		var systemValid bool
 		if platformInterface != nil {
 			for _, cert := range platformInterface.SystemCertificates() {
@@ -53,8 +54,6 @@ func NewStore(ctx context.Context, logger logger.Logger, options option.Certific
 		}
 	case C.CertificateStoreMozilla:
 		systemPool = mozillaIncluded
-	case C.CertificateStoreChrome:
-		systemPool = chromeIncluded
 	case C.CertificateStoreNone:
 		systemPool = nil
 	default:

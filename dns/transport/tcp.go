@@ -62,24 +62,17 @@ func (t *TCPTransport) Close() error {
 	return nil
 }
 
-func (t *TCPTransport) Reset() {
-}
-
 func (t *TCPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	conn, err := t.dialer.DialContext(ctx, N.NetworkTCP, t.serverAddr)
 	if err != nil {
-		return nil, E.Cause(err, "dial TCP connection")
+		return nil, err
 	}
 	defer conn.Close()
 	err = WriteMessage(conn, 0, message)
 	if err != nil {
-		return nil, E.Cause(err, "write request")
+		return nil, err
 	}
-	response, err := ReadMessage(conn)
-	if err != nil {
-		return nil, E.Cause(err, "read response")
-	}
-	return response, nil
+	return ReadMessage(conn)
 }
 
 func ReadMessage(reader io.Reader) (*mDNS.Msg, error) {

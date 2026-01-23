@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/taskmonitor"
@@ -12,7 +11,6 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
-	F "github.com/sagernet/sing/common/format"
 )
 
 var _ adapter.EndpointManager = (*Manager)(nil)
@@ -48,14 +46,10 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		return nil
 	}
 	for _, endpoint := range m.endpoints {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		m.logger.Trace(stage, " ", name)
-		startTime := time.Now()
 		err := adapter.LegacyStart(endpoint, stage)
 		if err != nil {
-			return E.Cause(err, stage, " ", name)
+			return E.Cause(err, stage, " endpoint/", endpoint.Type(), "[", endpoint.Tag(), "]")
 		}
-		m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 	}
 	return nil
 }
@@ -72,15 +66,11 @@ func (m *Manager) Close() error {
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	var err error
 	for _, endpoint := range endpoints {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		m.logger.Trace("close ", name)
-		startTime := time.Now()
-		monitor.Start("close ", name)
+		monitor.Start("close endpoint/", endpoint.Type(), "[", endpoint.Tag(), "]")
 		err = E.Append(err, endpoint.Close(), func(err error) error {
-			return E.Cause(err, "close ", name)
+			return E.Cause(err, "close endpoint/", endpoint.Type(), "[", endpoint.Tag(), "]")
 		})
 		monitor.Finish()
-		m.logger.Trace("close ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 	}
 	return nil
 }
@@ -129,15 +119,11 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	m.access.Lock()
 	defer m.access.Unlock()
 	if m.started {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
 		for _, stage := range adapter.ListStartStages {
-			m.logger.Trace(stage, " ", name)
-			startTime := time.Now()
 			err = adapter.LegacyStart(endpoint, stage)
 			if err != nil {
-				return E.Cause(err, stage, " ", name)
+				return E.Cause(err, stage, " endpoint/", endpoint.Type(), "[", endpoint.Tag(), "]")
 			}
-			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 		}
 	}
 	if existsEndpoint, loaded := m.endpointByTag[tag]; loaded {

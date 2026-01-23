@@ -18,7 +18,6 @@ type _RuleAction struct {
 	RouteOptions        RouteActionOptions        `json:"-"`
 	RouteOptionsOptions RouteOptionsActionOptions `json:"-"`
 	DirectOptions       DirectActionOptions       `json:"-"`
-	BypassOptions       RouteActionOptions        `json:"-"`
 	RejectOptions       RejectActionOptions       `json:"-"`
 	SniffOptions        RouteActionSniff          `json:"-"`
 	ResolveOptions      RouteActionResolve        `json:"-"`
@@ -39,8 +38,6 @@ func (r RuleAction) MarshalJSON() ([]byte, error) {
 		v = r.RouteOptionsOptions
 	case C.RuleActionTypeDirect:
 		v = r.DirectOptions
-	case C.RuleActionTypeBypass:
-		v = r.BypassOptions
 	case C.RuleActionTypeReject:
 		v = r.RejectOptions
 	case C.RuleActionTypeHijackDNS:
@@ -72,8 +69,6 @@ func (r *RuleAction) UnmarshalJSON(data []byte) error {
 		v = &r.RouteOptionsOptions
 	case C.RuleActionTypeDirect:
 		v = &r.DirectOptions
-	case C.RuleActionTypeBypass:
-		v = &r.BypassOptions
 	case C.RuleActionTypeReject:
 		v = &r.RejectOptions
 	case C.RuleActionTypeHijackDNS:
@@ -89,11 +84,7 @@ func (r *RuleAction) UnmarshalJSON(data []byte) error {
 		// check unknown fields
 		return json.UnmarshalDisallowUnknownFields(data, &_RuleAction{})
 	}
-	err = badjson.UnmarshallExcluded(data, (*_RuleAction)(r), v)
-	if err != nil {
-		return err
-	}
-	return nil
+	return badjson.UnmarshallExcluded(data, (*_RuleAction)(r), v)
 }
 
 type _DNSRuleAction struct {
@@ -291,7 +282,6 @@ func (r *RejectActionOptions) UnmarshalJSON(bytes []byte) error {
 	case "", C.RuleActionRejectMethodDefault:
 		r.Method = C.RuleActionRejectMethodDefault
 	case C.RuleActionRejectMethodDrop:
-	case C.RuleActionRejectMethodReply:
 	default:
 		return E.New("unknown reject method: " + r.Method)
 	}

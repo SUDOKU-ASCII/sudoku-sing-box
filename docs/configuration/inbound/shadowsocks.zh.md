@@ -49,9 +49,9 @@
 }
 ```
 
-### 监听字段
+### Listen Fields
 
-参阅 [监听字段](/zh/configuration/shared/listen/)。
+See [Listen Fields](/configuration/shared/listen/) for details.
 
 ### 字段
 

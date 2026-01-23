@@ -14,16 +14,16 @@ import (
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
-func pickClientTable(cfg *ProtocolConfig) (*sudoku.Table, byte, error) {
+func pickClientTable(cfg *ProtocolConfig) (*sudoku.Table, error) {
 	candidates := cfg.tableCandidates()
 	if len(candidates) == 0 {
-		return nil, 0, fmt.Errorf("no table configured")
+		return nil, fmt.Errorf("no table configured")
 	}
 	if len(candidates) == 1 {
-		return candidates[0], 0, nil
+		return candidates[0], nil
 	}
 	idx := int(randomByte()) % len(candidates)
-	return candidates[idx], byte(idx), nil
+	return candidates[idx], nil
 }
 
 type readOnlyConn struct {
@@ -136,4 +136,3 @@ func selectTableByProbe(r *bufio.Reader, cfg *ProtocolConfig, tables []*sudoku.T
 		}
 	}
 }
-

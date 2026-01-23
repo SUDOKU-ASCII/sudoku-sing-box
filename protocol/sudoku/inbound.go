@@ -83,6 +83,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		DisableHTTPMask:         options.DisableHTTPMask,
 		HTTPMaskMode:            defaultConf.HTTPMaskMode,
 		HTTPMaskMultiplex:       defaultConf.HTTPMaskMultiplex,
+		HTTPMaskPathRoot:        options.HTTPMaskPathRoot,
 	}
 	if options.AEADMethod != "" {
 		protoConf.AEADMethod = options.AEADMethod

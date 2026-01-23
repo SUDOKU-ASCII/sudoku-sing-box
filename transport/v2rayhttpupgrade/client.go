@@ -23,6 +23,7 @@ var _ adapter.V2RayClientTransport = (*Client)(nil)
 
 type Client struct {
 	dialer     N.Dialer
+	tlsConfig  tls.Config
 	serverAddr M.Socksaddr
 	requestURL url.URL
 	headers    http.Header
@@ -34,7 +35,6 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		if len(tlsConfig.NextProtos()) == 0 {
 			tlsConfig.SetNextProtos([]string{"http/1.1"})
 		}
-		dialer = tls.NewDialer(dialer, tlsConfig)
 	}
 	var host string
 	if options.Host != "" {
@@ -65,6 +65,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	return &Client{
 		dialer:     dialer,
+		tlsConfig:  tlsConfig,
 		serverAddr: serverAddr,
 		requestURL: requestURL,
 		headers:    headers,
@@ -76,6 +77,12 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
 	if err != nil {
 		return nil, err
+	}
+	if c.tlsConfig != nil {
+		conn, err = tls.ClientHandshake(ctx, conn, c.tlsConfig)
+		if err != nil {
+			return nil, err
+		}
 	}
 	request := &http.Request{
 		Method: http.MethodGet,

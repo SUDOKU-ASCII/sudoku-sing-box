@@ -68,6 +68,15 @@ type TunnelDialOptions struct {
 	Mode         string
 	TLSEnabled   bool   // when true, use HTTPS; otherwise, use HTTP (no port-based inference)
 	HostOverride string // optional Host header / SNI host (without scheme); accepts "example.com" or "example.com:443"
+	// PathRoot is an optional first-level path prefix for all HTTP tunnel endpoints.
+	// Example: "aabbcc" => "/aabbcc/session", "/aabbcc/api/v1/upload", ...
+	PathRoot string
+	// AuthKey enables short-term HMAC auth for HTTP tunnel requests (anti-probing).
+	// When set (non-empty), each HTTP request carries an Authorization bearer token derived from AuthKey.
+	AuthKey string
+	// Upgrade optionally wraps the raw tunnel conn and/or writes a small prelude before DialTunnel returns.
+	// It is called with the raw tunnel conn; if it returns a non-nil conn, that conn is returned by DialTunnel.
+	Upgrade func(rawConn net.Conn) (net.Conn, error)
 	// Multiplex controls whether DialTunnel reuses underlying HTTP transports (keep-alive / h2).
 	// Values: "off" disables reuse; "auto"/"on" enables it. Empty defaults to "auto".
 	Multiplex string
@@ -93,9 +102,37 @@ func DialTunnel(ctx context.Context, serverAddress string, opts TunnelDialOption
 
 	switch mode {
 	case TunnelModeStream:
-		return dialStreamFn(ctx, serverAddress, opts)
+		c, err := dialStreamFn(ctx, serverAddress, opts)
+		if err != nil {
+			return nil, err
+		}
+		if opts.Upgrade != nil {
+			u, err := opts.Upgrade(c)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			if u != nil {
+				return u, nil
+			}
+		}
+		return c, nil
 	case TunnelModePoll:
-		return dialPollFn(ctx, serverAddress, opts)
+		c, err := dialPollFn(ctx, serverAddress, opts)
+		if err != nil {
+			return nil, err
+		}
+		if opts.Upgrade != nil {
+			u, err := opts.Upgrade(c)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			if u != nil {
+				return u, nil
+			}
+		}
+		return c, nil
 	case TunnelModeAuto:
 		// "stream" can hang on some CDNs that buffer uploads until request body completes.
 		// Keep it on a short leash so we can fall back to poll within the caller's deadline.
@@ -103,15 +140,49 @@ func DialTunnel(ctx context.Context, serverAddress string, opts TunnelDialOption
 		c, errX := dialStreamFn(streamCtx, serverAddress, opts)
 		cancelX()
 		if errX == nil {
+			if opts.Upgrade != nil {
+				u, err := opts.Upgrade(c)
+				if err != nil {
+					_ = c.Close()
+					return nil, err
+				}
+				if u != nil {
+					return u, nil
+				}
+			}
 			return c, nil
 		}
 		c, errP := dialPollFn(ctx, serverAddress, opts)
 		if errP == nil {
+			if opts.Upgrade != nil {
+				u, err := opts.Upgrade(c)
+				if err != nil {
+					_ = c.Close()
+					return nil, err
+				}
+				if u != nil {
+					return u, nil
+				}
+			}
 			return c, nil
 		}
 		return nil, fmt.Errorf("auto tunnel failed: stream: %v; poll: %w", errX, errP)
 	default:
-		return dialStreamFn(ctx, serverAddress, opts)
+		c, err := dialStreamFn(ctx, serverAddress, opts)
+		if err != nil {
+			return nil, err
+		}
+		if opts.Upgrade != nil {
+			u, err := opts.Upgrade(c)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			if u != nil {
+				return u, nil
+			}
+		}
+		return c, nil
 	}
 }
 
@@ -335,9 +406,11 @@ func dialStreamOne(ctx context.Context, serverAddress string, opts TunnelDialOpt
 	if err != nil {
 		return nil, err
 	}
+	auth := newTunnelAuth(opts.AuthKey, 0)
 
 	r := rngPool.Get().(*mrand.Rand)
-	path := paths[r.Intn(len(paths))]
+	basePath := paths[r.Intn(len(paths))]
+	path := joinPathRoot(opts.PathRoot, basePath)
 	ctype := contentTypes[r.Intn(len(contentTypes))]
 	rngPool.Put(r)
 
@@ -362,6 +435,7 @@ func dialStreamOne(ctx context.Context, serverAddress string, opts TunnelDialOpt
 	req.Host = target.headerHost
 
 	applyTunnelHeaders(req.Header, target.headerHost, TunnelModeStream)
+	applyTunnelAuth(req, auth, TunnelModeStream, http.MethodPost, basePath)
 	req.Header.Set("Content-Type", ctype)
 
 	type doResult struct {
@@ -416,9 +490,11 @@ func dialStreamOne(ctx context.Context, serverAddress string, opts TunnelDialOpt
 type sessionDialInfo struct {
 	client    *http.Client
 	closeIdle func()
+	auth      *tunnelAuth
 
 	pushURL    string
 	pullURL    string
+	finURL     string
 	closeURL   string
 	headerHost string
 }
@@ -428,6 +504,7 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	if err != nil {
 		return nil, err
 	}
+	auth := newTunnelAuth(opts.AuthKey, 0)
 
 	cleanup := func() {
 		if closeIdle != nil {
@@ -435,7 +512,7 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 		}
 	}
 
-	authorizeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/session"}).String()
+	authorizeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: joinPathRoot(opts.PathRoot, "/session")}).String()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authorizeURL, nil)
 	if err != nil {
 		cleanup()
@@ -443,6 +520,7 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	}
 	req.Host = target.headerHost
 	applyTunnelHeaders(req.Header, target.headerHost, mode)
+	applyTunnelAuth(req, auth, mode, http.MethodGet, "/session")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -470,21 +548,24 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 		return nil, fmt.Errorf("%s authorize empty token", mode)
 	}
 
-	pushURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token)}).String()
-	pullURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/stream", RawQuery: "token=" + url.QueryEscape(token)}).String()
-	closeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: "/api/v1/upload", RawQuery: "token=" + url.QueryEscape(token) + "&close=1"}).String()
+	pushURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: "token=" + url.QueryEscape(token)}).String()
+	pullURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: joinPathRoot(opts.PathRoot, "/stream"), RawQuery: "token=" + url.QueryEscape(token)}).String()
+	finURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: "token=" + url.QueryEscape(token) + "&fin=1"}).String()
+	closeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: "token=" + url.QueryEscape(token) + "&close=1"}).String()
 
 	return &sessionDialInfo{
 		client:     client,
 		closeIdle:  closeIdle,
+		auth:       auth,
 		pushURL:    pushURL,
 		pullURL:    pullURL,
+		finURL:     finURL,
 		closeURL:   closeURL,
 		headerHost: target.headerHost,
 	}, nil
 }
 
-func bestEffortCloseSession(client *http.Client, closeURL, headerHost string, mode TunnelMode) {
+func bestEffortCloseSession(client *http.Client, closeURL, headerHost string, mode TunnelMode, auth *tunnelAuth) {
 	if client == nil || closeURL == "" || headerHost == "" {
 		return
 	}
@@ -498,6 +579,31 @@ func bestEffortCloseSession(client *http.Client, closeURL, headerHost string, mo
 	}
 	req.Host = headerHost
 	applyTunnelHeaders(req.Header, headerHost, mode)
+	applyTunnelAuth(req, auth, mode, http.MethodPost, "/api/v1/upload")
+
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+	_ = resp.Body.Close()
+}
+
+func bestEffortCloseWriteSession(client *http.Client, finURL, headerHost string, mode TunnelMode, auth *tunnelAuth) {
+	if client == nil || finURL == "" || headerHost == "" {
+		return
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(closeCtx, http.MethodPost, finURL, nil)
+	if err != nil {
+		return
+	}
+	req.Host = headerHost
+	applyTunnelHeaders(req.Header, headerHost, mode)
+	applyTunnelAuth(req, auth, mode, http.MethodPost, "/api/v1/upload")
 
 	resp, err := client.Do(req)
 	if err != nil || resp == nil {
@@ -512,12 +618,29 @@ type queuedConn struct {
 	closed chan struct{}
 
 	writeCh chan []byte
+	// writeClosed is closed by CloseWrite to stop accepting new payloads.
+	// When closed, Write returns io.ErrClosedPipe, but Read is unaffected.
+	writeClosed chan struct{}
 
 	mu         sync.Mutex
 	readBuf    []byte
 	closeErr   error
 	localAddr  net.Addr
 	remoteAddr net.Addr
+}
+
+func (c *queuedConn) CloseWrite() error {
+	if c == nil || c.writeClosed == nil {
+		return nil
+	}
+	c.mu.Lock()
+	select {
+	case <-c.writeClosed:
+	default:
+		close(c.writeClosed)
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *queuedConn) closeWithError(err error) error {
@@ -573,15 +696,33 @@ func (c *queuedConn) Write(b []byte) (n int, err error) {
 		return 0, c.closedErr()
 	default:
 	}
+	if c.writeClosed != nil {
+		select {
+		case <-c.writeClosed:
+			c.mu.Unlock()
+			return 0, io.ErrClosedPipe
+		default:
+		}
+	}
 	c.mu.Unlock()
 
 	payload := make([]byte, len(b))
 	copy(payload, b)
+	if c.writeClosed == nil {
+		select {
+		case c.writeCh <- payload:
+			return len(b), nil
+		case <-c.closed:
+			return 0, c.closedErr()
+		}
+	}
 	select {
 	case c.writeCh <- payload:
 		return len(b), nil
 	case <-c.closed:
 		return 0, c.closedErr()
+	case <-c.writeClosed:
+		return 0, io.ErrClosedPipe
 	}
 }
 
@@ -600,9 +741,11 @@ type streamSplitConn struct {
 
 	client    *http.Client
 	closeIdle func()
+	auth      *tunnelAuth
 
 	pushURL    string
 	pullURL    string
+	finURL     string
 	closeURL   string
 	headerHost string
 }
@@ -614,7 +757,7 @@ func (c *streamSplitConn) Close() error {
 		c.cancel()
 	}
 
-	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModeStream)
+	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModeStream, c.auth)
 	if c.closeIdle != nil {
 		c.closeIdle()
 	}
@@ -634,14 +777,17 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 		cancel:     cancel,
 		client:     info.client,
 		closeIdle:  info.closeIdle,
+		auth:       info.auth,
 		pushURL:    info.pushURL,
 		pullURL:    info.pullURL,
+		finURL:     info.finURL,
 		closeURL:   info.closeURL,
 		headerHost: info.headerHost,
 		queuedConn: queuedConn{
 			rxc:        make(chan []byte, 256),
 			closed:     make(chan struct{}),
 			writeCh:    make(chan []byte, 256),
+			writeClosed: make(chan struct{}),
 			localAddr:  &net.TCPAddr{},
 			remoteAddr: &net.TCPAddr{},
 		},
@@ -685,6 +831,7 @@ func (c *streamSplitConn) pullLoop() {
 		}
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModeStream)
+		applyTunnelAuth(req, c.auth, TunnelModeStream, http.MethodGet, "/stream")
 
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -782,6 +929,7 @@ func (c *streamSplitConn) pushLoop() {
 		}
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModeStream)
+		applyTunnelAuth(req, c.auth, TunnelModeStream, http.MethodPost, "/api/v1/upload")
 		req.Header.Set("Content-Type", "application/octet-stream")
 
 		resp, err := c.client.Do(req)
@@ -867,6 +1015,27 @@ func (c *streamSplitConn) pushLoop() {
 				return
 			}
 			resetTimer()
+		case <-c.writeClosed:
+			// Drain any already-accepted writes so CloseWrite does not lose data.
+			for {
+				select {
+				case b := <-c.writeCh:
+					if len(b) == 0 {
+						continue
+					}
+					if buf.Len()+len(b) > maxBatchBytes {
+						if err := flushWithRetry(); err != nil {
+							_ = c.Close()
+							return
+						}
+					}
+					_, _ = buf.Write(b)
+				default:
+					_ = flushWithRetry()
+					bestEffortCloseWriteSession(c.client, c.finURL, c.headerHost, TunnelModeStream, c.auth)
+					return
+				}
+			}
 		case <-c.closed:
 			_ = flushWithRetry()
 			return
@@ -882,9 +1051,11 @@ type pollConn struct {
 
 	client    *http.Client
 	closeIdle func()
+	auth      *tunnelAuth
 
 	pushURL    string
 	pullURL    string
+	finURL     string
 	closeURL   string
 	headerHost string
 }
@@ -908,7 +1079,7 @@ func (c *pollConn) closeWithError(err error) error {
 	if c.cancel != nil {
 		c.cancel()
 	}
-	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModePoll)
+	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModePoll, c.auth)
 	if c.closeIdle != nil {
 		c.closeIdle()
 	}
@@ -931,14 +1102,17 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 		cancel:     cancel,
 		client:     info.client,
 		closeIdle:  info.closeIdle,
+		auth:       info.auth,
 		pushURL:    info.pushURL,
 		pullURL:    info.pullURL,
+		finURL:     info.finURL,
 		closeURL:   info.closeURL,
 		headerHost: info.headerHost,
 		queuedConn: queuedConn{
 			rxc:        make(chan []byte, 128),
 			closed:     make(chan struct{}),
 			writeCh:    make(chan []byte, 256),
+			writeClosed: make(chan struct{}),
 			localAddr:  &net.TCPAddr{},
 			remoteAddr: &net.TCPAddr{},
 		},
@@ -974,6 +1148,7 @@ func (c *pollConn) pullLoop() {
 		}
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModePoll)
+		applyTunnelAuth(req, c.auth, TunnelModePoll, http.MethodGet, "/stream")
 
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -1059,6 +1234,7 @@ func (c *pollConn) pushLoop() {
 		}
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModePoll)
+		applyTunnelAuth(req, c.auth, TunnelModePoll, http.MethodPost, "/api/v1/upload")
 		req.Header.Set("Content-Type", "text/plain")
 
 		resp, err := c.client.Do(req)
@@ -1161,6 +1337,43 @@ func (c *pollConn) pushLoop() {
 				return
 			}
 			resetTimer()
+		case <-c.writeClosed:
+			// Drain any already-accepted writes so CloseWrite does not lose data.
+			for {
+				select {
+				case b := <-c.writeCh:
+					if len(b) == 0 {
+						continue
+					}
+
+					// Split large writes into multiple base64 lines to cap per-line size.
+					for len(b) > 0 {
+						chunk := b
+						if len(chunk) > maxLineRawBytes {
+							chunk = b[:maxLineRawBytes]
+						}
+						b = b[len(chunk):]
+
+						encLen := base64.StdEncoding.EncodedLen(len(chunk))
+						if pendingRaw+len(chunk) > maxBatchBytes || buf.Len()+encLen+1 > maxBatchBytes*2 {
+							if err := flushWithRetry(); err != nil {
+								_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
+								return
+							}
+						}
+
+						tmp := make([]byte, base64.StdEncoding.EncodedLen(len(chunk)))
+						base64.StdEncoding.Encode(tmp, chunk)
+						buf.Write(tmp)
+						buf.WriteByte('\n')
+						pendingRaw += len(chunk)
+					}
+				default:
+					_ = flushWithRetry()
+					bestEffortCloseWriteSession(c.client, c.finURL, c.headerHost, TunnelModePoll, c.auth)
+					return
+				}
+			}
 		case <-c.closed:
 			_ = flushWithRetry()
 			return
@@ -1223,6 +1436,11 @@ func applyTunnelHeaders(h http.Header, host string, mode TunnelMode) {
 
 type TunnelServerOptions struct {
 	Mode string
+	// PathRoot is an optional first-level path prefix for all HTTP tunnel endpoints.
+	// Example: "aabbcc" => "/aabbcc/session", "/aabbcc/api/v1/upload", ...
+	PathRoot string
+	// AuthKey enables short-term HMAC auth for HTTP tunnel requests (anti-probing).
+	AuthKey string
 	// PullReadTimeout controls how long the server long-poll waits for tunnel downlink data before replying with a keepalive newline.
 	PullReadTimeout time.Duration
 	// SessionTTL is a best-effort TTL to prevent leaked sessions. 0 uses a conservative default.
@@ -1231,6 +1449,8 @@ type TunnelServerOptions struct {
 
 type TunnelServer struct {
 	mode TunnelMode
+	pathRoot string
+	auth     *tunnelAuth
 
 	pullReadTimeout time.Duration
 	sessionTTL      time.Duration
@@ -1262,11 +1482,25 @@ func NewTunnelServer(opts TunnelServerOptions) *TunnelServer {
 	}
 	return &TunnelServer{
 		mode:            mode,
+		pathRoot:        opts.PathRoot,
+		auth:            newTunnelAuth(opts.AuthKey, 0),
 		pullReadTimeout: timeout,
 		sessionTTL:      ttl,
 		closed:          make(chan struct{}),
 		sessions:        make(map[string]*tunnelSession),
 	}
+}
+
+func (s *TunnelServer) isAllowedBasePath(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	for _, p := range paths {
+		if path == p {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *TunnelServer) Close() error {
@@ -1331,6 +1565,30 @@ func (s *TunnelServer) HandleConn(rawConn net.Conn) (HandleResult, net.Conn, err
 
 	tunnelHeader := strings.ToLower(strings.TrimSpace(req.headers["x-sudoku-tunnel"]))
 	if tunnelHeader == "" {
+		// Some CDNs / forward proxies may strip unknown headers. When AuthKey is enabled, we can
+		// safely infer the intended tunnel mode by verifying the Authorization token against
+		// both stream/poll modes and picking the one that matches.
+		if s.auth != nil {
+			u, err := url.ParseRequestURI(req.target)
+			if err == nil {
+				path, ok := stripPathRoot(s.pathRoot, u.Path)
+				if ok && s.isAllowedBasePath(path) {
+					authVal := req.headers["authorization"]
+					if authVal == "" {
+						authVal = u.Query().Get(tunnelAuthQueryKey)
+					}
+					streamOK := s.auth.verifyValue(authVal, TunnelModeStream, req.method, path, time.Now())
+					pollOK := s.auth.verifyValue(authVal, TunnelModePoll, req.method, path, time.Now())
+					switch {
+					case streamOK && !pollOK:
+						tunnelHeader = string(TunnelModeStream)
+					case pollOK && !streamOK:
+						tunnelHeader = string(TunnelModePoll)
+					}
+				}
+			}
+		}
+
 		// Not our tunnel; replay full bytes to legacy handler.
 		prefix := make([]byte, 0, len(headerBytes)+len(buffered))
 		prefix = append(prefix, headerBytes...)
@@ -1514,7 +1772,17 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, bu
 	}
 
 	// Only accept plausible paths to reduce accidental exposure.
-	if !isAllowedPath(req.target) {
+	path, ok := stripPathRoot(s.pathRoot, u.Path)
+	if !ok || !s.isAllowedBasePath(path) {
+		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
+		_ = rawConn.Close()
+		return HandleDone, nil, nil
+	}
+	authVal := req.headers["authorization"]
+	if authVal == "" {
+		authVal = u.Query().Get(tunnelAuthQueryKey)
+	}
+	if !s.auth.verifyValue(authVal, TunnelModeStream, req.method, path, time.Now()) {
 		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
@@ -1522,15 +1790,16 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, bu
 
 	token := u.Query().Get("token")
 	closeFlag := u.Query().Get("close") == "1"
+	finFlag := u.Query().Get("fin") == "1"
 
 	switch strings.ToUpper(req.method) {
 	case http.MethodGet:
 		// Stream split-session: GET /session (no token) => token + start tunnel on a server-side pipe.
-		if token == "" && u.Path == "/session" {
+		if token == "" && path == "/session" {
 			return s.authorizeSession(rawConn)
 		}
 		// Stream split-session: GET /stream?token=... => downlink poll.
-		if token != "" && u.Path == "/stream" {
+		if token != "" && path == "/stream" {
 			return s.streamPull(rawConn, token)
 		}
 		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
@@ -1539,9 +1808,15 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, bu
 
 	case http.MethodPost:
 		// Stream split-session: POST /api/v1/upload?token=... => uplink push.
-		if token != "" && u.Path == "/api/v1/upload" {
+		if token != "" && path == "/api/v1/upload" {
 			if closeFlag {
 				s.closeSession(token)
+				_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
+				_ = rawConn.Close()
+				return HandleDone, nil, nil
+			}
+			if finFlag {
+				s.closeWriteSession(token)
 				_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
 				_ = rawConn.Close()
 				return HandleDone, nil, nil
@@ -1583,19 +1858,6 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, bu
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
 	}
-}
-
-func isAllowedPath(target string) bool {
-	u, err := url.ParseRequestURI(target)
-	if err != nil {
-		return false
-	}
-	for _, p := range paths {
-		if u.Path == p {
-			return true
-		}
-	}
-	return false
 }
 
 func newRequestBodyReader(conn net.Conn, headers map[string]string) (io.Reader, error) {
@@ -1656,7 +1918,17 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, buff
 		return HandleDone, nil, nil
 	}
 
-	if !isAllowedPath(req.target) {
+	path, ok := stripPathRoot(s.pathRoot, u.Path)
+	if !ok || !s.isAllowedBasePath(path) {
+		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
+		_ = rawConn.Close()
+		return HandleDone, nil, nil
+	}
+	authVal := req.headers["authorization"]
+	if authVal == "" {
+		authVal = u.Query().Get(tunnelAuthQueryKey)
+	}
+	if !s.auth.verifyValue(authVal, TunnelModePoll, req.method, path, time.Now()) {
 		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
@@ -1664,13 +1936,24 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, buff
 
 	token := u.Query().Get("token")
 	closeFlag := u.Query().Get("close") == "1"
+	finFlag := u.Query().Get("fin") == "1"
 	switch strings.ToUpper(req.method) {
 	case http.MethodGet:
-		if token == "" {
+		if token == "" && path == "/session" {
 			return s.authorizeSession(rawConn)
 		}
-		return s.pollPull(rawConn, token)
+		if path == "/stream" {
+			return s.pollPull(rawConn, token)
+		}
+		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
+		_ = rawConn.Close()
+		return HandleDone, nil, nil
 	case http.MethodPost:
+		if path != "/api/v1/upload" {
+			_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
+			_ = rawConn.Close()
+			return HandleDone, nil, nil
+		}
 		if token == "" {
 			_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "missing token")
 			_ = rawConn.Close()
@@ -1678,6 +1961,12 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, buff
 		}
 		if closeFlag {
 			s.closeSession(token)
+			_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
+			_ = rawConn.Close()
+			return HandleDone, nil, nil
+		}
+		if finFlag {
+			s.closeWriteSession(token)
 			_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
 			_ = rawConn.Close()
 			return HandleDone, nil, nil
@@ -1704,7 +1993,7 @@ func (s *TunnelServer) authorizeSession(rawConn net.Conn) (HandleResult, net.Con
 		return HandleDone, nil, nil
 	}
 
-	c1, c2 := net.Pipe()
+	c1, c2 := newHalfPipe()
 
 	s.mu.Lock()
 	s.sessions[token] = &tunnelSession{conn: c2, lastActive: time.Now()}
@@ -1773,6 +2062,16 @@ func (s *TunnelServer) closeSession(token string) {
 	s.mu.Unlock()
 	if ok {
 		_ = sess.conn.Close()
+	}
+}
+
+func (s *TunnelServer) closeWriteSession(token string) {
+	sess, ok := s.getSession(token)
+	if !ok {
+		return
+	}
+	if cw, ok := sess.conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
 	}
 }
 

@@ -3,11 +3,10 @@ package quic
 import (
 	"context"
 	"errors"
-	"os"
+	"sync"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
@@ -18,6 +17,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -31,14 +31,14 @@ func RegisterTransport(registry *dns.TransportRegistry) {
 }
 
 type Transport struct {
-	*transport.BaseTransport
-
+	dns.TransportAdapter
 	ctx        context.Context
+	logger     logger.ContextLogger
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
 	tlsConfig  tls.Config
-
-	connector *transport.Connector[*quic.Conn]
+	access     sync.Mutex
+	connection quic.EarlyConnection
 }
 
 func NewQUIC(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteTLSDNSServerOptions) (adapter.DNSTransport, error) {
@@ -48,7 +48,7 @@ func NewQUIC(ctx context.Context, logger log.ContextLogger, tag string, options 
 	}
 	tlsOptions := common.PtrValueOrDefault(options.TLS)
 	tlsOptions.Enabled = true
-	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, tlsOptions)
+	tlsConfig, err := tls.NewClient(ctx, options.Server, tlsOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -62,84 +62,38 @@ func NewQUIC(ctx context.Context, logger log.ContextLogger, tag string, options 
 	if !serverAddr.IsValid() {
 		return nil, E.New("invalid server address: ", serverAddr)
 	}
-
-	t := &Transport{
-		BaseTransport: transport.NewBaseTransport(
-			dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeQUIC, tag, options.RemoteDNSServerOptions),
-			logger,
-		),
-		ctx:        ctx,
-		dialer:     transportDialer,
-		serverAddr: serverAddr,
-		tlsConfig:  tlsConfig,
-	}
-
-	t.connector = transport.NewConnector(t.CloseContext(), t.dial, transport.ConnectorCallbacks[*quic.Conn]{
-		IsClosed: func(connection *quic.Conn) bool {
-			return common.Done(connection.Context())
-		},
-		Close: func(connection *quic.Conn) {
-			connection.CloseWithError(0, "")
-		},
-		Reset: func(connection *quic.Conn) {
-			connection.CloseWithError(0, "")
-		},
-	})
-
-	return t, nil
-}
-
-func (t *Transport) dial(ctx context.Context) (*quic.Conn, error) {
-	conn, err := t.dialer.DialContext(ctx, N.NetworkUDP, t.serverAddr)
-	if err != nil {
-		return nil, E.Cause(err, "dial UDP connection")
-	}
-	earlyConnection, err := sQUIC.DialEarly(
-		ctx,
-		bufio.NewUnbindPacketConn(conn),
-		t.serverAddr.UDPAddr(),
-		t.tlsConfig,
-		nil,
-	)
-	if err != nil {
-		conn.Close()
-		return nil, E.Cause(err, "establish QUIC connection")
-	}
-	return earlyConnection, nil
+	return &Transport{
+		TransportAdapter: dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeQUIC, tag, options.RemoteDNSServerOptions),
+		ctx:              ctx,
+		logger:           logger,
+		dialer:           transportDialer,
+		serverAddr:       serverAddr,
+		tlsConfig:        tlsConfig,
+	}, nil
 }
 
 func (t *Transport) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
-		return nil
-	}
-	err := t.SetStarted()
-	if err != nil {
-		return err
-	}
-	return dialer.InitializeDetour(t.dialer)
+	return nil
 }
 
 func (t *Transport) Close() error {
-	return E.Errors(t.BaseTransport.Close(), t.connector.Close())
-}
-
-func (t *Transport) Reset() {
-	t.connector.Reset()
+	t.access.Lock()
+	defer t.access.Unlock()
+	connection := t.connection
+	if connection != nil {
+		connection.CloseWithError(0, "")
+	}
+	return nil
 }
 
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	if !t.BeginQuery() {
-		return nil, transport.ErrTransportClosed
-	}
-	defer t.EndQuery()
-
 	var (
-		conn     *quic.Conn
+		conn     quic.Connection
 		err      error
 		response *mDNS.Msg
 	)
 	for i := 0; i < 2; i++ {
-		conn, err = t.connector.Get(ctx)
+		conn, err = t.openConnection()
 		if err != nil {
 			return nil, err
 		}
@@ -149,38 +103,58 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 		} else if !isQUICRetryError(err) {
 			return nil, err
 		} else {
-			t.connector.Reset()
+			conn.CloseWithError(quic.ApplicationErrorCode(0), "")
 			continue
 		}
 	}
 	return nil, err
 }
 
-func (t *Transport) exchange(ctx context.Context, message *mDNS.Msg, conn *quic.Conn) (*mDNS.Msg, error) {
+func (t *Transport) openConnection() (quic.EarlyConnection, error) {
+	connection := t.connection
+	if connection != nil && !common.Done(connection.Context()) {
+		return connection, nil
+	}
+	t.access.Lock()
+	defer t.access.Unlock()
+	connection = t.connection
+	if connection != nil && !common.Done(connection.Context()) {
+		return connection, nil
+	}
+	conn, err := t.dialer.DialContext(t.ctx, N.NetworkUDP, t.serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	earlyConnection, err := sQUIC.DialEarly(
+		t.ctx,
+		bufio.NewUnbindPacketConn(conn),
+		t.serverAddr.UDPAddr(),
+		t.tlsConfig,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	t.connection = earlyConnection
+	return earlyConnection, nil
+}
+
+func (t *Transport) exchange(ctx context.Context, message *mDNS.Msg, conn quic.Connection) (*mDNS.Msg, error) {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, E.Cause(err, "open stream")
+		return nil, err
 	}
-	defer stream.CancelRead(0)
 	err = transport.WriteMessage(stream, 0, message)
 	if err != nil {
 		stream.Close()
-		return nil, E.Cause(err, "write request")
+		return nil, err
 	}
 	stream.Close()
-	response, err := transport.ReadMessage(stream)
-	if err != nil {
-		return nil, E.Cause(err, "read response")
-	}
-	return response, nil
+	return transport.ReadMessage(stream)
 }
 
 // https://github.com/AdguardTeam/dnsproxy/blob/fd1868577652c639cce3da00e12ca548f421baf1/upstream/upstream_quic.go#L394
 func isQUICRetryError(err error) (ok bool) {
-	if errors.Is(err, os.ErrClosed) {
-		return true
-	}
-
 	var qAppErr *quic.ApplicationError
 	if errors.As(err, &qAppErr) && qAppErr.ErrorCode == 0 {
 		return true

@@ -36,11 +36,6 @@ func (s *CommandServer) handleGroupConn(conn net.Conn) error {
 	}
 	ticker := time.NewTicker(time.Duration(interval))
 	defer ticker.Stop()
-	subscription, done, err := s.urlTestUpdateObserver.Subscribe()
-	if err != nil {
-		return err
-	}
-	defer s.urlTestUpdateObserver.UnSubscribe(subscription)
 	ctx := connKeepAlive(conn)
 	writer := bufio.NewWriter(conn)
 	for {
@@ -63,10 +58,12 @@ func (s *CommandServer) handleGroupConn(conn net.Conn) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-done:
-			return nil
 		case <-ticker.C:
-		case <-subscription:
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.urlTestUpdate:
 		}
 	}
 }

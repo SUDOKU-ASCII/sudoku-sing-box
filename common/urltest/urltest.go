@@ -11,10 +11,10 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
-	"github.com/sagernet/sing/common/observable"
 )
 
 var _ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
@@ -22,7 +22,7 @@ var _ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
 type HistoryStorage struct {
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
-	updateHook   *observable.Subscriber[struct{}]
+	updateHook   chan<- struct{}
 }
 
 func NewHistoryStorage() *HistoryStorage {
@@ -31,7 +31,7 @@ func NewHistoryStorage() *HistoryStorage {
 	}
 }
 
-func (s *HistoryStorage) SetHook(hook *observable.Subscriber[struct{}]) {
+func (s *HistoryStorage) SetHook(hook chan<- struct{}) {
 	s.updateHook = hook
 }
 
@@ -61,7 +61,10 @@ func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTes
 func (s *HistoryStorage) notifyUpdated() {
 	updateHook := s.updateHook
 	if updateHook != nil {
-		updateHook.Emit(struct{}{})
+		select {
+		case updateHook <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -97,7 +100,7 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		return
 	}
 	defer instance.Close()
-	if N.NeedHandshakeForWrite(instance) {
+	if earlyConn, isEarlyConn := common.Cast[N.EarlyConn](instance); isEarlyConn && earlyConn.NeedHandshake() {
 		start = time.Now()
 	}
 	req, err := http.NewRequest(http.MethodHead, link, nil)

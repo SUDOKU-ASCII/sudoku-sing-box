@@ -28,12 +28,10 @@ import (
 	"unsafe"
 
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/debug"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 
@@ -51,12 +49,12 @@ type RealityClientConfig struct {
 	shortID   [8]byte
 }
 
-func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
+func NewRealityClient(ctx context.Context, serverAddress string, options option.OutboundTLSOptions) (*RealityClientConfig, error) {
 	if options.UTLS == nil || !options.UTLS.Enabled {
 		return nil, E.New("uTLS is required by reality client")
 	}
 
-	uClient, err := NewUTLSClient(ctx, logger, serverAddress, options)
+	uClient, err := NewUTLSClient(ctx, serverAddress, options)
 	if err != nil {
 		return nil, err
 	}
@@ -76,20 +74,7 @@ func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 	if decodedLen > 8 {
 		return nil, E.New("invalid short_id")
 	}
-
-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
-	if options.KernelRx || options.KernelTx {
-		if !C.IsLinux {
-			return nil, E.New("kTLS is only supported on Linux")
-		}
-		config = &KTLSClientConfig{
-			Config:   config,
-			logger:   logger,
-			kernelTx: options.KernelTx,
-			kernelRx: options.KernelRx,
-		}
-	}
-	return config, nil
+	return &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}, nil
 }
 
 func (e *RealityClientConfig) ServerName() string {
@@ -108,7 +93,7 @@ func (e *RealityClientConfig) SetNextProtos(nextProto []string) {
 	e.uClient.SetNextProtos(nextProto)
 }
 
-func (e *RealityClientConfig) STDConfig() (*STDConfig, error) {
+func (e *RealityClientConfig) Config() (*STDConfig, error) {
 	return nil, E.New("unsupported usage for reality")
 }
 

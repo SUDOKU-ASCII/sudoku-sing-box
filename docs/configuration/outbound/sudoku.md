@@ -20,6 +20,7 @@
   "http_mask_multiplex": "off",
   "http_mask_tls": false,
   "http_mask_host": "",
+  "http_mask_path_root": "",
   "http_mask_strategy": "random",
 
   ... // Dial Fields
@@ -129,6 +130,12 @@ Enable HTTPS for `http_mask_mode` `stream`/`poll`/`auto`.
 #### http_mask_host
 
 Override HTTP Host header / SNI host for `http_mask_mode` `stream`/`poll`/`auto`.
+
+#### http_mask_path_root
+
+Optional first-level path prefix for all HTTP mask endpoints.
+
+Example: `aabbcc` => `/aabbcc/session`, `/aabbcc/api/v1/upload`, ...
 
 #### http_mask_strategy
 

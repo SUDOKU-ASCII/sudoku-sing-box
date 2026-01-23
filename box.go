@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/dns/transport/local"
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/cachefile"
+	"github.com/sagernet/sing-box/experimental/libbox/platform"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
@@ -138,7 +139,7 @@ func New(options Options) (*Box, error) {
 	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
 		needV2RayAPI = true
 	}
-	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
+	platformInterface := service.FromContext[platform.Interface](ctx)
 	var defaultLogWriter io.Writer
 	if platformInterface != nil {
 		defaultLogWriter = io.Discard
@@ -183,7 +184,7 @@ func New(options Options) (*Box, error) {
 	service.MustRegister[adapter.ServiceManager](ctx, serviceManager)
 	dnsRouter := dns.NewRouter(ctx, logFactory, dnsOptions)
 	service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
-	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions, dnsOptions)
+	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions)
 	if err != nil {
 		return nil, E.Cause(err, "initialize network manager")
 	}
@@ -322,14 +323,13 @@ func New(options Options) (*Box, error) {
 			option.DirectOutboundOptions{},
 		)
 	})
-	dnsTransportManager.Initialize(func() (adapter.DNSTransport, error) {
-		return local.NewTransport(
+	dnsTransportManager.Initialize(common.Must1(
+		local.NewTransport(
 			ctx,
 			logFactory.NewLogger("dns/local"),
 			"local",
 			option.LocalDNSServerOptions{},
-		)
-	})
+		)))
 	if platformInterface != nil {
 		err = platformInterface.Initialize(networkManager)
 		if err != nil {
@@ -443,15 +443,15 @@ func (s *Box) preStart() error {
 	if err != nil {
 		return E.Cause(err, "start logger")
 	}
-	err = adapter.StartNamed(s.logger, adapter.StartStateInitialize, s.internalService) // cache-file clash-api v2ray-api
+	err = adapter.StartNamed(adapter.StartStateInitialize, s.internalService) // cache-file clash-api v2ray-api
 	if err != nil {
 		return err
 	}
-	err = adapter.Start(s.logger, adapter.StartStateInitialize, s.network, s.dnsTransport, s.dnsRouter, s.connection, s.router, s.outbound, s.inbound, s.endpoint, s.service)
+	err = adapter.Start(adapter.StartStateInitialize, s.network, s.dnsTransport, s.dnsRouter, s.connection, s.router, s.outbound, s.inbound, s.endpoint, s.service)
 	if err != nil {
 		return err
 	}
-	err = adapter.Start(s.logger, adapter.StartStateStart, s.outbound, s.dnsTransport, s.dnsRouter, s.network, s.connection, s.router)
+	err = adapter.Start(adapter.StartStateStart, s.outbound, s.dnsTransport, s.dnsRouter, s.network, s.connection, s.router)
 	if err != nil {
 		return err
 	}
@@ -463,27 +463,27 @@ func (s *Box) start() error {
 	if err != nil {
 		return err
 	}
-	err = adapter.StartNamed(s.logger, adapter.StartStateStart, s.internalService)
+	err = adapter.StartNamed(adapter.StartStateStart, s.internalService)
 	if err != nil {
 		return err
 	}
-	err = adapter.Start(s.logger, adapter.StartStateStart, s.inbound, s.endpoint, s.service)
+	err = adapter.Start(adapter.StartStateStart, s.inbound, s.endpoint, s.service)
 	if err != nil {
 		return err
 	}
-	err = adapter.Start(s.logger, adapter.StartStatePostStart, s.outbound, s.network, s.dnsTransport, s.dnsRouter, s.connection, s.router, s.inbound, s.endpoint, s.service)
+	err = adapter.Start(adapter.StartStatePostStart, s.outbound, s.network, s.dnsTransport, s.dnsRouter, s.connection, s.router, s.inbound, s.endpoint, s.service)
 	if err != nil {
 		return err
 	}
-	err = adapter.StartNamed(s.logger, adapter.StartStatePostStart, s.internalService)
+	err = adapter.StartNamed(adapter.StartStatePostStart, s.internalService)
 	if err != nil {
 		return err
 	}
-	err = adapter.Start(s.logger, adapter.StartStateStarted, s.network, s.dnsTransport, s.dnsRouter, s.connection, s.router, s.outbound, s.inbound, s.endpoint, s.service)
+	err = adapter.Start(adapter.StartStateStarted, s.network, s.dnsTransport, s.dnsRouter, s.connection, s.router, s.outbound, s.inbound, s.endpoint, s.service)
 	if err != nil {
 		return err
 	}
-	err = adapter.StartNamed(s.logger, adapter.StartStateStarted, s.internalService)
+	err = adapter.StartNamed(adapter.StartStateStarted, s.internalService)
 	if err != nil {
 		return err
 	}
@@ -497,42 +497,17 @@ func (s *Box) Close() error {
 	default:
 		close(s.done)
 	}
-	var err error
-	for _, closeItem := range []struct {
-		name    string
-		service adapter.Lifecycle
-	}{
-		{"service", s.service},
-		{"endpoint", s.endpoint},
-		{"inbound", s.inbound},
-		{"outbound", s.outbound},
-		{"router", s.router},
-		{"connection", s.connection},
-		{"dns-router", s.dnsRouter},
-		{"dns-transport", s.dnsTransport},
-		{"network", s.network},
-	} {
-		s.logger.Trace("close ", closeItem.name)
-		startTime := time.Now()
-		err = E.Append(err, closeItem.service.Close(), func(err error) error {
-			return E.Cause(err, "close ", closeItem.name)
-		})
-		s.logger.Trace("close ", closeItem.name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
-	}
+	err := common.Close(
+		s.service, s.endpoint, s.inbound, s.outbound, s.router, s.connection, s.dnsRouter, s.dnsTransport, s.network,
+	)
 	for _, lifecycleService := range s.internalService {
-		s.logger.Trace("close ", lifecycleService.Name())
-		startTime := time.Now()
 		err = E.Append(err, lifecycleService.Close(), func(err error) error {
 			return E.Cause(err, "close ", lifecycleService.Name())
 		})
-		s.logger.Trace("close ", lifecycleService.Name(), " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 	}
-	s.logger.Trace("close logger")
-	startTime := time.Now()
 	err = E.Append(err, s.logFactory.Close(), func(err error) error {
 		return E.Cause(err, "close logger")
 	})
-	s.logger.Trace("close logger completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 	return err
 }
 
@@ -550,8 +525,4 @@ func (s *Box) Inbound() adapter.InboundManager {
 
 func (s *Box) Outbound() adapter.OutboundManager {
 	return s.outbound
-}
-
-func (s *Box) LogFactory() log.Factory {
-	return s.logFactory
 }

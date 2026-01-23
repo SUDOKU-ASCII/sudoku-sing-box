@@ -63,6 +63,10 @@ type ProtocolConfig struct {
 
 	// HTTPMaskHost optionally overrides the HTTP Host header / SNI host for HTTP tunnel modes (client-side).
 	HTTPMaskHost string
+
+	// HTTPMaskPathRoot optionally prefixes all HTTP mask paths with a first-level segment.
+	// Example: "aabbcc" => "/aabbcc/session", "/aabbcc/api/v1/upload", ...
+	HTTPMaskPathRoot string
 }
 
 func (c *ProtocolConfig) Validate() error {
@@ -113,6 +117,24 @@ func (c *ProtocolConfig) Validate() error {
 	case "", "off", "auto", "on":
 	default:
 		return fmt.Errorf("invalid http_mask_multiplex: %s, must be one of: off, auto, on", c.HTTPMaskMultiplex)
+	}
+
+	if v := strings.TrimSpace(c.HTTPMaskPathRoot); v != "" {
+		v = strings.Trim(v, "/")
+		if v == "" || strings.Contains(v, "/") {
+			return fmt.Errorf("invalid http_mask_path_root: must be a single path segment")
+		}
+		for i := 0; i < len(v); i++ {
+			c := v[i]
+			switch {
+			case c >= 'a' && c <= 'z':
+			case c >= 'A' && c <= 'Z':
+			case c >= '0' && c <= '9':
+			case c == '_' || c == '-':
+			default:
+				return fmt.Errorf("invalid http_mask_path_root: contains invalid character %q", c)
+			}
+		}
 	}
 
 	return nil

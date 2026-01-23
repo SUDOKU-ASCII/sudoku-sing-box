@@ -93,6 +93,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		HTTPMaskTLSEnabled:      options.HTTPMaskTLS,
 		HTTPMaskMultiplex:       defaultConf.HTTPMaskMultiplex,
 		HTTPMaskHost:            options.HTTPMaskHost,
+		HTTPMaskPathRoot:        options.HTTPMaskPathRoot,
 	}
 	if options.AEADMethod != "" {
 		baseConf.AEADMethod = options.AEADMethod

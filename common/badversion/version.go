@@ -5,8 +5,6 @@ import (
 	"strings"
 
 	F "github.com/sagernet/sing/common/format"
-
-	"golang.org/x/mod/semver"
 )
 
 type Version struct {
@@ -18,19 +16,7 @@ type Version struct {
 	PreReleaseVersion    int
 }
 
-func (v Version) LessThan(anotherVersion Version) bool {
-	return !v.GreaterThanOrEqual(anotherVersion)
-}
-
-func (v Version) LessThanOrEqual(anotherVersion Version) bool {
-	return v == anotherVersion || anotherVersion.GreaterThan(v)
-}
-
-func (v Version) GreaterThanOrEqual(anotherVersion Version) bool {
-	return v == anotherVersion || v.GreaterThan(anotherVersion)
-}
-
-func (v Version) GreaterThan(anotherVersion Version) bool {
+func (v Version) After(anotherVersion Version) bool {
 	if v.Major > anotherVersion.Major {
 		return true
 	} else if v.Major < anotherVersion.Major {
@@ -58,27 +44,17 @@ func (v Version) GreaterThan(anotherVersion Version) bool {
 			} else if v.PreReleaseVersion < anotherVersion.PreReleaseVersion {
 				return false
 			}
-		}
-		preReleaseIdentifier := parsePreReleaseIdentifier(v.PreReleaseIdentifier)
-		anotherPreReleaseIdentifier := parsePreReleaseIdentifier(anotherVersion.PreReleaseIdentifier)
-		if preReleaseIdentifier < anotherPreReleaseIdentifier {
+		} else if v.PreReleaseIdentifier == "rc" && anotherVersion.PreReleaseIdentifier == "beta" {
 			return true
-		} else if preReleaseIdentifier > anotherPreReleaseIdentifier {
+		} else if v.PreReleaseIdentifier == "beta" && anotherVersion.PreReleaseIdentifier == "rc" {
+			return false
+		} else if v.PreReleaseIdentifier == "beta" && anotherVersion.PreReleaseIdentifier == "alpha" {
+			return true
+		} else if v.PreReleaseIdentifier == "alpha" && anotherVersion.PreReleaseIdentifier == "beta" {
 			return false
 		}
 	}
 	return false
-}
-
-func parsePreReleaseIdentifier(identifier string) int {
-	if strings.HasPrefix(identifier, "rc") {
-		return 1
-	} else if strings.HasPrefix(identifier, "beta") {
-		return 2
-	} else if strings.HasPrefix(identifier, "alpha") {
-		return 3
-	}
-	return 0
 }
 
 func (v Version) VersionString() string {
@@ -105,10 +81,6 @@ func (v Version) BadString() string {
 		}
 	}
 	return version
-}
-
-func IsValid(versionName string) bool {
-	return semver.IsValid("v" + versionName)
 }
 
 func Parse(versionName string) (version Version) {

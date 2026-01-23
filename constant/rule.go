@@ -22,15 +22,13 @@ const (
 	RuleSetVersion1 = 1 + iota
 	RuleSetVersion2
 	RuleSetVersion3
-	RuleSetVersion4
-	RuleSetVersionCurrent = RuleSetVersion4
+	RuleSetVersionCurrent = RuleSetVersion3
 )
 
 const (
 	RuleActionTypeRoute        = "route"
 	RuleActionTypeRouteOptions = "route-options"
 	RuleActionTypeDirect       = "direct"
-	RuleActionTypeBypass       = "bypass"
 	RuleActionTypeReject       = "reject"
 	RuleActionTypeHijackDNS    = "hijack-dns"
 	RuleActionTypeSniff        = "sniff"
@@ -41,5 +39,4 @@ const (
 const (
 	RuleActionRejectMethodDefault = "default"
 	RuleActionRejectMethodDrop    = "drop"
-	RuleActionRejectMethodReply   = "reply"
 )

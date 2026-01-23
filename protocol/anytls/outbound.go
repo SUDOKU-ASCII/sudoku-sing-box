@@ -27,7 +27,7 @@ func RegisterOutbound(registry *outbound.Registry) {
 
 type Outbound struct {
 	outbound.Adapter
-	dialer    tls.Dialer
+	dialer    N.Dialer
 	server    M.Socksaddr
 	tlsConfig tls.Config
 	client    *anytls.Client
@@ -52,7 +52,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, E.New("tcp_fast_open is not supported with anytls outbound")
 	}
 
-	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
+	tlsConfig, err := tls.NewClient(ctx, options.Server, common.PtrValueOrDefault(options.TLS))
 	if err != nil {
 		return nil, err
 	}
@@ -66,8 +66,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
-
-	outbound.dialer = tls.NewDialer(outboundDialer, tlsConfig)
+	outbound.dialer = outboundDialer
 
 	client, err := anytls.NewClient(ctx, anytls.ClientConfig{
 		Password:                 options.Password,
@@ -100,7 +99,16 @@ func (d anytlsDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 }
 
 func (h *Outbound) dialOut(ctx context.Context) (net.Conn, error) {
-	return h.dialer.DialTLSContext(ctx, h.server)
+	conn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.server)
+	if err != nil {
+		return nil, err
+	}
+	tlsConn, err := tls.ClientHandshake(ctx, conn, h.tlsConfig)
+	if err != nil {
+		common.Close(tlsConn, conn)
+		return nil, err
+	}
+	return tlsConn, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

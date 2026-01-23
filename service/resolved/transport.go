@@ -110,16 +110,6 @@ func (t *Transport) Close() error {
 	return nil
 }
 
-func (t *Transport) Reset() {
-	t.linkAccess.RLock()
-	defer t.linkAccess.RUnlock()
-	for _, servers := range t.linkServers {
-		for _, server := range servers.Servers {
-			server.Reset()
-		}
-	}
-}
-
 func (t *Transport) updateTransports(link *TransportLink) error {
 	t.linkAccess.Lock()
 	defer t.linkAccess.Unlock()
@@ -139,7 +129,7 @@ func (t *Transport) updateTransports(link *TransportLink) error {
 			return os.ErrInvalid
 		}
 		if link.dnsOverTLS {
-			tlsConfig := common.Must1(tls.NewClient(t.ctx, t.logger, serverAddr.String(), option.OutboundTLSOptions{
+			tlsConfig := common.Must1(tls.NewClient(t.ctx, serverAddr.String(), option.OutboundTLSOptions{
 				Enabled:    true,
 				ServerName: serverAddr.String(),
 			}))
@@ -161,7 +151,7 @@ func (t *Transport) updateTransports(link *TransportLink) error {
 			} else {
 				serverName = serverAddr.String()
 			}
-			tlsConfig := common.Must1(tls.NewClient(t.ctx, t.logger, serverAddr.String(), option.OutboundTLSOptions{
+			tlsConfig := common.Must1(tls.NewClient(t.ctx, serverAddr.String(), option.OutboundTLSOptions{
 				Enabled:    true,
 				ServerName: serverName,
 			}))

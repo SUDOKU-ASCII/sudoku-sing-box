@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/common/conntrack"
 	"github.com/sagernet/sing-box/common/listener"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/experimental/libbox/platform"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
@@ -19,8 +20,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
-
-	"github.com/database64128/tfo-go/v2"
 )
 
 var (
@@ -29,8 +28,8 @@ var (
 )
 
 type DefaultDialer struct {
-	dialer4                tfo.Dialer
-	dialer6                tfo.Dialer
+	dialer4                tcpDialer
+	dialer6                tcpDialer
 	udpDialer4             net.Dialer
 	udpDialer6             net.Dialer
 	udpListener            net.ListenConfig
@@ -48,7 +47,7 @@ type DefaultDialer struct {
 
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
-	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
+	platformInterface := service.FromContext[platform.Interface](ctx)
 
 	var (
 		dialer                 net.Dialer
@@ -142,18 +141,9 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	} else {
 		dialer.Timeout = C.TCPConnectTimeout
 	}
-	if !options.DisableTCPKeepAlive {
-		keepIdle := time.Duration(options.TCPKeepAlive)
-		if keepIdle == 0 {
-			keepIdle = C.TCPKeepAliveInitial
-		}
-		keepInterval := time.Duration(options.TCPKeepAliveInterval)
-		if keepInterval == 0 {
-			keepInterval = C.TCPKeepAliveInterval
-		}
-		dialer.KeepAlive = keepIdle
-		dialer.Control = control.Append(dialer.Control, control.SetKeepAlivePeriod(keepIdle, keepInterval))
-	}
+	// TODO: Add an option to customize the keep alive period
+	dialer.KeepAlive = C.TCPKeepAliveInitial
+	dialer.Control = control.Append(dialer.Control, control.SetKeepAlivePeriod(C.TCPKeepAliveInitial, C.TCPKeepAliveInterval))
 	var udpFragment bool
 	if options.UDPFragment != nil {
 		udpFragment = *options.UDPFragment
@@ -187,10 +177,19 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpAddr6 = M.SocksaddrFrom(bindAddr, 0).String()
 	}
 	if options.TCPMultiPath {
-		dialer4.SetMultipathTCP(true)
+		if !go121Available {
+			return nil, E.New("MultiPath TCP requires go1.21, please recompile your binary.")
+		}
+		setMultiPathTCP(&dialer4)
 	}
-	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
-	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
+	tcpDialer4, err := newTCPDialer(dialer4, options.TCPFastOpen)
+	if err != nil {
+		return nil, err
+	}
+	tcpDialer6, err := newTCPDialer(dialer6, options.TCPFastOpen)
+	if err != nil {
+		return nil, err
+	}
 	return &DefaultDialer{
 		dialer4:                tcpDialer4,
 		dialer6:                tcpDialer6,
@@ -270,7 +269,7 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 	}
 	var dialer net.Dialer
 	if N.NetworkName(network) == N.NetworkTCP {
-		dialer = d.dialer4.Dialer
+		dialer = dialerFromTCPDialer(d.dialer4)
 	} else {
 		dialer = d.udpDialer4
 	}
@@ -316,14 +315,6 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 	}
 }
 
-func (d *DefaultDialer) DialerForICMPDestination(destination netip.Addr) net.Dialer {
-	if !destination.Is6() {
-		return d.dialer6.Dialer
-	} else {
-		return d.dialer4.Dialer
-	}
-}
-
 func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destination M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, error) {
 	if strategy == nil {
 		strategy = d.networkStrategy
@@ -357,8 +348,18 @@ func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destina
 	return trackPacketConn(packetConn, nil)
 }
 
-func (d *DefaultDialer) WireGuardControl() control.Func {
-	return d.udpListener.Control
+func (d *DefaultDialer) ListenPacketCompat(network, address string) (net.PacketConn, error) {
+	udpListener := d.udpListener
+	udpListener.Control = control.Append(udpListener.Control, func(network, address string, conn syscall.RawConn) error {
+		for _, wgControlFn := range WgControlFns {
+			err := wgControlFn(network, address, conn)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return udpListener.ListenPacket(context.Background(), network, address)
 }
 
 func trackConn(conn net.Conn, err error) (net.Conn, error) {

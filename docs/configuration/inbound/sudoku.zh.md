@@ -18,7 +18,8 @@
   "handshake_timeout": 5,
   "disable_http_mask": false,
   "http_mask_mode": "legacy",
-  "http_mask_multiplex": "off"
+  "http_mask_multiplex": "off",
+  "http_mask_path_root": ""
 }
 ```
 
@@ -113,3 +114,11 @@ HTTP 伪装模式。
 * `off`
 * `auto`
 * `on`
+
+#### http_mask_path_root
+
+为所有 HTTP mask 端点增加一级路径前缀（可选）。
+
+例如：`aabbcc` => `/aabbcc/session`、`/aabbcc/api/v1/upload` ...
+
+当 `http_mask_mode` 为 `stream`/`poll`/`auto` 时需与客户端一致。

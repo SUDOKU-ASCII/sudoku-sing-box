@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/sagernet/sing-box/adapter"
 	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/sys/unix"
@@ -24,12 +23,12 @@ func NewSearcher(_ Config) (Searcher, error) {
 	return &darwinSearcher{}, nil
 }
 
-func (d *darwinSearcher) FindProcessInfo(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*adapter.ConnectionOwner, error) {
+func (d *darwinSearcher) FindProcessInfo(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*Info, error) {
 	processName, err := findProcessName(network, source.Addr(), int(source.Port()))
 	if err != nil {
 		return nil, err
 	}
-	return &adapter.ConnectionOwner{ProcessPath: processName, UserId: -1}, nil
+	return &Info{ProcessPath: processName, UserId: -1}, nil
 }
 
 var structSize = func() int {

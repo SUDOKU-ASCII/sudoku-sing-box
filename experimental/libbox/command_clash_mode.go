@@ -69,20 +69,13 @@ func (s *CommandServer) handleModeConn(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
-	subscription, done, err := s.modeUpdateObserver.Subscribe()
-	if err != nil {
-		return err
-	}
-	defer s.modeUpdateObserver.UnSubscribe(subscription)
 	for {
 		select {
-		case <-subscription:
+		case <-s.modeUpdate:
 			err = varbin.Write(conn, binary.BigEndian, s.service.clashServer.Mode())
 			if err != nil {
 				return err
 			}
-		case <-done:
-			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		}

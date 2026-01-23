@@ -13,6 +13,97 @@ https://sing-box.sagernet.org
 - Or: `bash scripts/sudoku_official_interop.sh`
 - UDP quick check (via outbound): `./sing-box tools dnsquery 8.8.8.8:53 example.com -c <config.json> -o <outbound-tag>`
 
+## Sudoku 使用说明
+
+### 1) 生成 Key（可选）
+
+- 共享密钥模式：客户端与服务端 `key` 使用同一字符串即可。
+- 公私钥（split-key）模式：客户端用 `PrivateKey`，服务端用 `PublicKey`（兼容官方 Sudoku 行为）。
+
+生成一组公私钥：
+
+`sing-box generate sudoku-keypair`
+
+### 2) Outbound（客户端）配置
+
+`type: "sudoku"`，常用字段：
+
+- `server` / `server_port`
+- `key`
+- `aead`: `"chacha20-poly1305"`（默认）/ `"aes-128-gcm"` / `"none"`（仅测试）
+- `ascii`: `"prefer_ascii"` / `"prefer_entropy"`
+- `custom_table` 或 `custom_tables`: 例如 `"xpxvvpvv"`（2 个 `x`、2 个 `p`、4 个 `v`）
+- `padding_min` / `padding_max`: 0–100
+- `enable_pure_downlink`: `false` 会启用带宽优化下行（要求 `aead != "none"`）
+- `disable_http_mask` / `http_mask_mode`: `"legacy"` / `"stream"` / `"poll"` / `"auto"`
+- `http_mask_tls`: HTTP 隧道是否使用 HTTPS（常用于 CDN 场景）
+- `http_mask_host`: 覆盖 Host/SNI（可选）
+- `http_mask_path_root`: 为所有 HTTP mask 路径增加一级前缀（需与服务端一致）
+- `http_mask_multiplex`: `"off"` / `"auto"` / `"on"`（`"on"` 启用单隧道多目标 mux）
+- `http_mask_strategy`: 仅影响 `http_mask_mode=legacy` 的伪装头生成（`random`/`post`/`websocket`）
+
+示例（CDN/反代场景，HTTPS + auto）：
+
+```json
+{
+  "type": "sudoku",
+  "tag": "sudoku-out",
+  "server": "example.com",
+  "server_port": 443,
+  "key": "YOUR_PRIVATE_KEY_OR_SHARED_KEY",
+  "aead": "chacha20-poly1305",
+  "ascii": "prefer_entropy",
+  "custom_table": "xpxvvpvv",
+  "padding_min": 5,
+  "padding_max": 15,
+  "enable_pure_downlink": true,
+  "disable_http_mask": false,
+  "http_mask_mode": "auto",
+  "http_mask_tls": true,
+  "http_mask_host": "example.com",
+  "http_mask_path_root": "aabbcc",
+  "http_mask_multiplex": "auto"
+}
+```
+
+### 3) Inbound（服务端）配置
+
+`type: "sudoku"`，常用字段：
+
+- `listen` / `listen_port`
+- `key`（公私钥模式下填 `PublicKey`）
+- `handshake_timeout`（秒）
+- 其余字段与 outbound 同名字段含义一致：`aead`/`padding_*`/`ascii`/`custom_table(s)`/`enable_pure_downlink`/`disable_http_mask`/`http_mask_mode`/`http_mask_path_root`/`http_mask_multiplex`
+
+示例（与上面 outbound 对应）：
+
+```json
+{
+  "type": "sudoku",
+  "tag": "sudoku-in",
+  "listen": "0.0.0.0",
+  "listen_port": 8080,
+  "key": "YOUR_PUBLIC_KEY_OR_SHARED_KEY",
+  "aead": "chacha20-poly1305",
+  "ascii": "prefer_entropy",
+  "custom_table": "xpxvvpvv",
+  "padding_min": 5,
+  "padding_max": 15,
+  "enable_pure_downlink": true,
+  "handshake_timeout": 5,
+  "disable_http_mask": false,
+  "http_mask_mode": "auto",
+  "http_mask_path_root": "aabbcc",
+  "http_mask_multiplex": "auto"
+}
+```
+
+### 4) UDP（UoT：UDP over TCP）
+
+Sudoku outbound 的 UDP 通过 `listen_packet`（内部走 UoT）提供；可用命令快速验证：
+
+`sing-box tools dnsquery 8.8.8.8:53 example.com -c <config.json> -o <sudoku-out-tag>`
+
 ## License
 
 ```

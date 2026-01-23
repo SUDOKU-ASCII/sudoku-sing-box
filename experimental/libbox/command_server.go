@@ -29,12 +29,10 @@ type CommandServer struct {
 	observer   *observable.Observer[string]
 	service    *BoxService
 
-	urlTestUpdateSubscriber *observable.Subscriber[struct{}]
-	urlTestUpdateObserver   *observable.Observer[struct{}]
-	modeUpdateSubscriber    *observable.Subscriber[struct{}]
-	modeUpdateObserver      *observable.Observer[struct{}]
-	logResetSubscriber      *observable.Subscriber[struct{}]
-	logResetObserver        *observable.Observer[struct{}]
+	// These channels only work with a single client. if multi-client support is needed, replace with Subscriber/Observer
+	urlTestUpdate chan struct{}
+	modeUpdate    chan struct{}
+	logReset      chan struct{}
 
 	closedConnections []Connection
 }
@@ -48,31 +46,31 @@ type CommandServerHandler interface {
 
 func NewCommandServer(handler CommandServerHandler, maxLines int32) *CommandServer {
 	server := &CommandServer{
-		handler:                handler,
-		maxLines:               int(maxLines),
-		subscriber:             observable.NewSubscriber[string](128),
-		urlTestUpdateSubscriber: observable.NewSubscriber[struct{}](1),
-		modeUpdateSubscriber:    observable.NewSubscriber[struct{}](1),
-		logResetSubscriber:      observable.NewSubscriber[struct{}](1),
+		handler:       handler,
+		maxLines:      int(maxLines),
+		subscriber:    observable.NewSubscriber[string](128),
+		urlTestUpdate: make(chan struct{}, 1),
+		modeUpdate:    make(chan struct{}, 1),
+		logReset:      make(chan struct{}, 1),
 	}
 	server.observer = observable.NewObserver[string](server.subscriber, 64)
-	server.urlTestUpdateObserver = observable.NewObserver[struct{}](server.urlTestUpdateSubscriber, 1)
-	server.modeUpdateObserver = observable.NewObserver[struct{}](server.modeUpdateSubscriber, 1)
-	server.logResetObserver = observable.NewObserver[struct{}](server.logResetSubscriber, 1)
 	return server
 }
 
 func (s *CommandServer) SetService(newService *BoxService) {
 	if newService != nil {
-		service.PtrFromContext[urltest.HistoryStorage](newService.ctx).SetHook(s.urlTestUpdateSubscriber)
-		newService.clashServer.(*clashapi.Server).SetModeUpdateHook(s.modeUpdateSubscriber)
+		service.PtrFromContext[urltest.HistoryStorage](newService.ctx).SetHook(s.urlTestUpdate)
+		newService.clashServer.(*clashapi.Server).SetModeUpdateHook(s.modeUpdate)
 	}
 	s.service = newService
 	s.notifyURLTestUpdate()
 }
 
 func (s *CommandServer) notifyURLTestUpdate() {
-	s.urlTestUpdateSubscriber.Emit(struct{}{})
+	select {
+	case s.urlTestUpdate <- struct{}{}:
+	default:
+	}
 }
 
 func (s *CommandServer) Start() error {
@@ -118,9 +116,6 @@ func (s *CommandServer) Close() error {
 	return common.Close(
 		s.listener,
 		s.observer,
-		s.urlTestUpdateObserver,
-		s.modeUpdateObserver,
-		s.logResetObserver,
 	)
 }
 

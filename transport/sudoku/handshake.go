@@ -144,35 +144,25 @@ func buildServerObfsConn(raw net.Conn, cfg *ProtocolConfig, table *sudoku.Table,
 	}
 }
 
-func buildHandshakePayload(key string, tableID byte) ([16]byte, error) {
+func buildHandshakePayload(key string) [16]byte {
 	var payload [16]byte
 	binary.BigEndian.PutUint64(payload[:8], uint64(time.Now().Unix()))
-
-	// If the client uses ED25519 keypair mode, use the raw private key bytes to generate a stable
-	// per-user handshake nonce (compatible with upstream Sudoku's multi-user identifier behavior).
-	//
-	// Otherwise, use a random nonce to avoid leaking a stable identifier for shared-key mode.
-	if keyBytes, ok := crypto.DecodePrivateKeyBytes(key); ok {
-		hash := sha256.Sum256(keyBytes)
-		copy(payload[8:], hash[:8])
-	} else {
-		if _, err := rand.Read(payload[8:]); err != nil {
-			// Extremely unlikely; fall back to deterministic nonce.
-			hash := sha256.Sum256([]byte(key))
-			copy(payload[8:], hash[:8])
+	src := []byte(key)
+	if _, err := crypto.RecoverPublicKey(key); err == nil {
+		if keyBytes, decErr := hex.DecodeString(key); decErr == nil && len(keyBytes) > 0 {
+			src = keyBytes
 		}
 	}
-	// Byte 8 is reserved as a table ID hint (0 for single-table configs).
-	payload[8] = tableID
-	return payload, nil
+	hash := sha256.Sum256(src)
+	copy(payload[8:], hash[:8])
+	return payload
 }
 
 func userHashFromHandshake(handshakeBuf []byte) string {
 	if len(handshakeBuf) < 16 {
 		return ""
 	}
-	// handshake[8] may be a table ID in some clients; use [9:16] as "hash[1:8]".
-	return hex.EncodeToString(handshakeBuf[9:16])
+	return hex.EncodeToString(handshakeBuf[8:16])
 }
 
 type ClientHandshakeOptions struct {
@@ -192,12 +182,12 @@ func ClientHandshakeWithOptions(rawConn net.Conn, cfg *ProtocolConfig, opt Clien
 	}
 
 	if !cfg.DisableHTTPMask {
-		if err := WriteHTTPMaskHeader(rawConn, cfg.ServerAddress, opt.HTTPMaskStrategy); err != nil {
+		if err := WriteHTTPMaskHeader(rawConn, cfg.ServerAddress, cfg.HTTPMaskPathRoot, opt.HTTPMaskStrategy); err != nil {
 			return nil, fmt.Errorf("write http mask failed: %w", err)
 		}
 	}
 
-	table, tableID, err := pickClientTable(cfg)
+	table, err := pickClientTable(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -208,11 +198,7 @@ func ClientHandshakeWithOptions(rawConn net.Conn, cfg *ProtocolConfig, opt Clien
 		return nil, fmt.Errorf("setup crypto failed: %w", err)
 	}
 
-	handshake, err := buildHandshakePayload(cfg.Key, tableID)
-	if err != nil {
-		cConn.Close()
-		return nil, fmt.Errorf("build handshake failed: %w", err)
-	}
+	handshake := buildHandshakePayload(cfg.Key)
 	if _, err := cConn.Write(handshake[:]); err != nil {
 		cConn.Close()
 		return nil, fmt.Errorf("send handshake failed: %w", err)

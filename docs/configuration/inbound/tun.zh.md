@@ -2,12 +2,6 @@
 icon: material/new-box
 ---
 
-!!! quote "sing-box 1.13.0 中的更改"
-
-    :material-plus: [auto_redirect_reset_mark](#auto_redirect_reset_mark)  
-    :material-plus: [auto_redirect_nfqueue](#auto_redirect_nfqueue)  
-    :material-plus: [exclude_mptcp](#exclude_mptcp)
-
 !!! quote "sing-box 1.12.0 中的更改"
 
     :material-plus: [loopback_address](#loopback_address)
@@ -28,7 +22,7 @@ icon: material/new-box
     :material-delete-clock: [inet6_route_address](#inet6_route_address)  
     :material-plus: [route_exclude_address](#route_address)  
     :material-delete-clock: [inet4_route_exclude_address](#inet4_route_exclude_address)  
-    :material-delete-clock: [inet6_route_exclude_address](#inet6_route_exclude_address)  
+    :material-delete-clock: [inet6_route_exclude_address](#inet6_route_exclude_address)   
     :material-plus: [iproute2_table_index](#iproute2_table_index)  
     :material-plus: [iproute2_rule_index](#iproute2_table_index)  
     :material-plus: [auto_redirect](#auto_redirect)  
@@ -40,7 +34,7 @@ icon: material/new-box
 !!! quote "sing-box 1.9.0 中的更改"
 
     :material-plus: [platform.http_proxy.bypass_domain](#platformhttp_proxybypass_domain)  
-    :material-plus: [platform.http_proxy.match_domain](#platformhttp_proxymatch_domain)
+    :material-plus: [platform.http_proxy.match_domain](#platformhttp_proxymatch_domain)  
 
 !!! quote "sing-box 1.8.0 中的更改"
 
@@ -69,9 +63,6 @@ icon: material/new-box
   "auto_redirect": true,
   "auto_redirect_input_mark": "0x2023",
   "auto_redirect_output_mark": "0x2024",
-  "auto_redirect_reset_mark": "0x2025",
-  "auto_redirect_nfqueue": 100,
-  "exclude_mptcp": false,
   "loopback_address": [
     "10.7.0.1"
   ],
@@ -285,36 +276,6 @@ tun 接口的 IPv6 前缀。
 `auto_redirect` 使用的连接输出标记。
 
 默认使用 `0x2024`。
-
-#### auto_redirect_reset_mark
-
-!!! question "自 sing-box 1.13.0 起"
-
-`auto_redirect` 预匹配使用的连接重置标记。
-
-默认使用 `0x2025`。
-
-#### auto_redirect_nfqueue
-
-!!! question "自 sing-box 1.13.0 起"
-
-`auto_redirect` 预匹配使用的 NFQueue 编号。
-
-默认使用 `100`。
-
-#### exclude_mptcp
-
-!!! question "自 sing-box 1.13.0 起"
-
-!!! quote ""
-
-    仅支持 Linux，且需要 nftables，`auto_route` 和 `auto_redirect` 已启用。 
-
-由于协议限制，MPTCP 无法被透明代理。
-
-此类流量通常由 Apple 系统创建。
-
-启用时，MPTCP 连接将绕过 sing-box 直接连接，否则，将被拒绝以避免错误。
 
 #### loopback_address
 
