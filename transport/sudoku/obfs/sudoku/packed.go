@@ -2,8 +2,6 @@ package sudoku
 
 import (
 	"bufio"
-	crypto_rand "crypto/rand"
-	"encoding/binary"
 	"io"
 	"math/rand"
 	"net"
@@ -28,23 +26,14 @@ type PackedConn struct {
 	readBitBuf uint64
 	readBits   int
 
-	rng         *rand.Rand
-	paddingRate float32
-	padMarker   byte
-	padPool     []byte
+	rng              *rand.Rand
+	paddingThreshold uint64
+	padMarker        byte
+	padPool          []byte
 }
 
 func NewPackedConn(c net.Conn, table *Table, pMin, pMax int) *PackedConn {
-	var seedBytes [8]byte
-	if _, err := crypto_rand.Read(seedBytes[:]); err != nil {
-		binary.BigEndian.PutUint64(seedBytes[:], uint64(rand.Int63()))
-	}
-	seed := int64(binary.BigEndian.Uint64(seedBytes[:]))
-	localRng := rand.New(rand.NewSource(seed))
-
-	min := float32(pMin) / 100.0
-	span := float32(pMax-pMin) / 100.0
-	rate := min + localRng.Float32()*span
+	localRng := newSeededRand()
 
 	pc := &PackedConn{
 		Conn:        c,
@@ -54,8 +43,8 @@ func NewPackedConn(c net.Conn, table *Table, pMin, pMax int) *PackedConn {
 		pendingData: make([]byte, 0, 4096),
 		writeBuf:    make([]byte, 0, 4096),
 		rng:         localRng,
-		paddingRate: rate,
 	}
+	pc.paddingThreshold = pickPaddingThreshold(localRng, pMin, pMax)
 
 	pc.padMarker = table.layout.padMarker
 	for _, b := range table.PaddingPool {
@@ -69,9 +58,29 @@ func NewPackedConn(c net.Conn, table *Table, pMin, pMax int) *PackedConn {
 	return pc
 }
 
+func (pc *PackedConn) CloseWrite() error {
+	if pc == nil {
+		return nil
+	}
+	if cw, ok := pc.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (pc *PackedConn) CloseRead() error {
+	if pc == nil {
+		return nil
+	}
+	if cr, ok := pc.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
 func (pc *PackedConn) maybeAddPadding(out []byte) []byte {
-	if pc.rng.Float32() < pc.paddingRate {
-		out = append(out, pc.padPool[pc.rng.Intn(len(pc.padPool))])
+	if shouldPad(pc.rng, pc.paddingThreshold) {
+		out = append(out, pc.getPaddingByte())
 	}
 	return out
 }
@@ -108,7 +117,7 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 				pc.bitBuf &= (1 << pc.bitCount) - 1
 			}
 			out = pc.maybeAddPadding(out)
-			out = append(out, pc.table.layout.encodeGroup(group&0x3F))
+			out = append(out, pc.encodeGroup(group&0x3F))
 		}
 	}
 
@@ -123,13 +132,13 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 			g4 := b3 & 0x3F
 
 			out = pc.maybeAddPadding(out)
-			out = append(out, pc.table.layout.encodeGroup(g1))
+			out = append(out, pc.encodeGroup(g1))
 			out = pc.maybeAddPadding(out)
-			out = append(out, pc.table.layout.encodeGroup(g2))
+			out = append(out, pc.encodeGroup(g2))
 			out = pc.maybeAddPadding(out)
-			out = append(out, pc.table.layout.encodeGroup(g3))
+			out = append(out, pc.encodeGroup(g3))
 			out = pc.maybeAddPadding(out)
-			out = append(out, pc.table.layout.encodeGroup(g4))
+			out = append(out, pc.encodeGroup(g4))
 		}
 	}
 
@@ -143,13 +152,13 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 		g4 := b3 & 0x3F
 
 		out = pc.maybeAddPadding(out)
-		out = append(out, pc.table.layout.encodeGroup(g1))
+		out = append(out, pc.encodeGroup(g1))
 		out = pc.maybeAddPadding(out)
-		out = append(out, pc.table.layout.encodeGroup(g2))
+		out = append(out, pc.encodeGroup(g2))
 		out = pc.maybeAddPadding(out)
-		out = append(out, pc.table.layout.encodeGroup(g3))
+		out = append(out, pc.encodeGroup(g3))
 		out = pc.maybeAddPadding(out)
-		out = append(out, pc.table.layout.encodeGroup(g4))
+		out = append(out, pc.encodeGroup(g4))
 	}
 
 	for ; i < n; i++ {
@@ -165,7 +174,7 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 				pc.bitBuf &= (1 << pc.bitCount) - 1
 			}
 			out = pc.maybeAddPadding(out)
-			out = append(out, pc.table.layout.encodeGroup(group&0x3F))
+			out = append(out, pc.encodeGroup(group&0x3F))
 		}
 	}
 
@@ -174,7 +183,7 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 		group := byte(pc.bitBuf << (6 - pc.bitCount))
 		pc.bitBuf = 0
 		pc.bitCount = 0
-		out = append(out, pc.table.layout.encodeGroup(group&0x3F))
+		out = append(out, pc.encodeGroup(group&0x3F))
 		out = append(out, pc.padMarker)
 	}
 
@@ -199,7 +208,7 @@ func (pc *PackedConn) Flush() error {
 		pc.bitBuf = 0
 		pc.bitCount = 0
 
-		out = append(out, pc.table.layout.encodeGroup(group&0x3F))
+		out = append(out, pc.encodeGroup(group&0x3F))
 		out = append(out, pc.padMarker)
 	}
 
@@ -214,15 +223,7 @@ func (pc *PackedConn) Flush() error {
 }
 
 func (pc *PackedConn) Read(p []byte) (int, error) {
-	if len(pc.pendingData) > 0 {
-		n := copy(p, pc.pendingData)
-		if n == len(pc.pendingData) {
-			pc.pendingData = pc.pendingData[:0]
-		} else {
-			remaining := len(pc.pendingData) - n
-			copy(pc.pendingData, pc.pendingData[n:])
-			pc.pendingData = pc.pendingData[:remaining]
-		}
+	if n, ok := drainPending(p, &pc.pendingData); ok {
 		return n, nil
 	}
 
@@ -278,14 +279,14 @@ func (pc *PackedConn) Read(p []byte) (int, error) {
 		}
 	}
 
-	n := copy(p, pc.pendingData)
-	if n == len(pc.pendingData) {
-		pc.pendingData = pc.pendingData[:0]
-	} else {
-		remaining := len(pc.pendingData) - n
-		copy(pc.pendingData, pc.pendingData[n:])
-		pc.pendingData = pc.pendingData[:remaining]
-	}
+	n, _ := drainPending(p, &pc.pendingData)
 	return n, nil
 }
 
+func (pc *PackedConn) getPaddingByte() byte {
+	return pc.padPool[pc.rng.Intn(len(pc.padPool))]
+}
+
+func (pc *PackedConn) encodeGroup(group byte) byte {
+	return pc.table.layout.encodeGroup(group)
+}

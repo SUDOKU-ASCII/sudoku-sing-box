@@ -35,12 +35,9 @@ https://sing-box.sagernet.org
 - `custom_table` 或 `custom_tables`: 例如 `"xpxvvpvv"`（2 个 `x`、2 个 `p`、4 个 `v`）
 - `padding_min` / `padding_max`: 0–100
 - `enable_pure_downlink`: `false` 会启用带宽优化下行（要求 `aead != "none"`）
-- `disable_http_mask` / `http_mask_mode`: `"legacy"` / `"stream"` / `"poll"` / `"auto"`
-- `http_mask_tls`: HTTP 隧道是否使用 HTTPS（常用于 CDN 场景）
-- `http_mask_host`: 覆盖 Host/SNI（可选）
-- `http_mask_path_root`: 为所有 HTTP mask 路径增加一级前缀（需与服务端一致）
-- `http_mask_multiplex`: `"off"` / `"auto"` / `"on"`（`"on"` 启用单隧道多目标 mux）
-- `http_mask_strategy`: 仅影响 `http_mask_mode=legacy` 的伪装头生成（`random`/`post`/`websocket`）
+- `httpmask`: 推荐的 HTTPMask 配置对象（见下方示例）
+- 兼容旧字段：`disable_http_mask` / `http_mask_*` 仍可用
+- `http_mask_strategy`: 仅影响 `httpmask.mode=legacy` 的伪装头生成（`random`/`post`/`websocket`）
 
 示例（CDN/反代场景，HTTPS + auto）：
 
@@ -57,12 +54,14 @@ https://sing-box.sagernet.org
   "padding_min": 5,
   "padding_max": 15,
   "enable_pure_downlink": true,
-  "disable_http_mask": false,
-  "http_mask_mode": "auto",
-  "http_mask_tls": true,
-  "http_mask_host": "example.com",
-  "http_mask_path_root": "aabbcc",
-  "http_mask_multiplex": "auto"
+  "httpmask": {
+    "disable": false,
+    "mode": "auto",
+    "tls": true,
+    "host": "example.com",
+    "path_root": "aabbcc",
+    "multiplex": "auto"
+  }
 }
 ```
 
@@ -73,7 +72,8 @@ https://sing-box.sagernet.org
 - `listen` / `listen_port`
 - `key`（公私钥模式下填 `PublicKey`）
 - `handshake_timeout`（秒）
-- 其余字段与 outbound 同名字段含义一致：`aead`/`padding_*`/`ascii`/`custom_table(s)`/`enable_pure_downlink`/`disable_http_mask`/`http_mask_mode`/`http_mask_path_root`/`http_mask_multiplex`
+- `fallback_address` / `suspicious_action`：可疑连接诱饵回落（服务端）
+- 其余字段与 outbound 同名字段含义一致：`aead`/`padding_*`/`ascii`/`custom_table(s)`/`enable_pure_downlink`/`httpmask`（或旧版 `disable_http_mask` / `http_mask_*`）
 
 示例（与上面 outbound 对应）：
 
@@ -91,10 +91,14 @@ https://sing-box.sagernet.org
   "padding_max": 15,
   "enable_pure_downlink": true,
   "handshake_timeout": 5,
-  "disable_http_mask": false,
-  "http_mask_mode": "auto",
-  "http_mask_path_root": "aabbcc",
-  "http_mask_multiplex": "auto"
+  "fallback_address": "127.0.0.1:80",
+  "suspicious_action": "fallback",
+  "httpmask": {
+    "disable": false,
+    "mode": "auto",
+    "path_root": "aabbcc",
+    "multiplex": "auto"
+  }
 }
 ```
 

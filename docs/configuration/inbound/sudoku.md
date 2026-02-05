@@ -16,10 +16,14 @@
   "custom_tables": [],
   "enable_pure_downlink": true,
   "handshake_timeout": 5,
-  "disable_http_mask": false,
-  "http_mask_mode": "legacy",
-  "http_mask_multiplex": "off",
-  "http_mask_path_root": ""
+  "fallback_address": "127.0.0.1:80",
+  "suspicious_action": "fallback",
+  "httpmask": {
+    "disable": false,
+    "mode": "legacy",
+    "path_root": "",
+    "multiplex": "off"
+  }
 }
 ```
 
@@ -90,11 +94,28 @@ Set to `false` to use packed downlink mode (requires AEAD, `aead: none` is not a
 
 Handshake timeout in seconds.
 
-#### disable_http_mask
+#### fallback_address
+
+Decoy address (`host:port`) for suspicious connections.
+
+Used when `suspicious_action` is `fallback`.
+
+#### suspicious_action
+
+Action for suspicious connections (server-side).
+
+Available values:
+
+* `fallback` (default)
+* `silent` (tarpit, drop)
+
+#### httpmask.disable
 
 Disable all HTTP masking layers.
 
-#### http_mask_mode
+Legacy flat fields `disable_http_mask` / `http_mask_*` are still accepted for compatibility, but `httpmask` is recommended.
+
+#### httpmask.mode
 
 HTTP masking mode.
 
@@ -105,9 +126,9 @@ Available values:
 * `poll` (real HTTP polling tunnel)
 * `auto` (accept stream and poll)
 
-#### http_mask_multiplex
+#### httpmask.multiplex
 
-Client-side multiplex behavior for `http_mask_mode` `stream`/`poll`/`auto`.
+Client-side multiplex behavior for `httpmask.mode` `stream`/`poll`/`auto`.
 
 Available values:
 
@@ -115,10 +136,10 @@ Available values:
 * `auto`
 * `on`
 
-#### http_mask_path_root
+#### httpmask.path_root
 
 Optional first-level path prefix for all HTTP mask endpoints.
 
 Example: `aabbcc` => `/aabbcc/session`, `/aabbcc/api/v1/upload`, ...
 
-Must match the client when `http_mask_mode` is `stream`/`poll`/`auto`.
+Must match the client when `httpmask.mode` is `stream`/`poll`/`auto`.

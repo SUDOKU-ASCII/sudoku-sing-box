@@ -54,30 +54,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	defaultConf := sudokut.DefaultConfig()
 
-	tableType := strings.TrimSpace(options.ASCII)
-	if tableType == "" {
-		tableType = "prefer_ascii"
-	}
-
-	paddingMin := defaultConf.PaddingMin
-	paddingMax := defaultConf.PaddingMax
-	if options.PaddingMin != nil {
-		paddingMin = *options.PaddingMin
-	}
-	if options.PaddingMax != nil {
-		paddingMax = *options.PaddingMax
-	}
-	if options.PaddingMin == nil && options.PaddingMax != nil && paddingMax < paddingMin {
-		paddingMin = paddingMax
-	}
-	if options.PaddingMax == nil && options.PaddingMin != nil && paddingMax < paddingMin {
-		paddingMax = paddingMin
-	}
-
-	enablePureDownlink := defaultConf.EnablePureDownlink
-	if options.EnablePureDownlink != nil {
-		enablePureDownlink = *options.EnablePureDownlink
-	}
+	tableType := resolveTableType(options.ASCII)
+	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
+	enablePureDownlink := resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink)
 
 	serverAddress := net.JoinHostPort(options.Server, strconv.Itoa(int(options.ServerPort)))
 	baseConf := sudokut.ProtocolConfig{
@@ -116,7 +95,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 
 	out := &Outbound{
-		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeSudoku, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		Adapter:          outbound.NewAdapterWithDialerOptions(C.TypeSudoku, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
 		ctx:              ctx,
 		dialer:           outboundDialer,
 		server:           options.ServerOptions.Build(),

@@ -15,13 +15,15 @@
   "custom_table": "",
   "custom_tables": [],
   "enable_pure_downlink": true,
-  "disable_http_mask": false,
-  "http_mask_mode": "legacy",
-  "http_mask_multiplex": "off",
-  "http_mask_tls": false,
-  "http_mask_host": "",
-  "http_mask_path_root": "",
   "http_mask_strategy": "random",
+  "httpmask": {
+    "disable": false,
+    "mode": "legacy",
+    "tls": false,
+    "host": "",
+    "path_root": "",
+    "multiplex": "off"
+  },
 
   ... // 拨号字段
 }
@@ -98,11 +100,13 @@ entropy 模式的自定义表 pattern。
 
 设为 `false` 会使用 packed downlink 模式（要求使用 AEAD，不能设置 `aead: none`）。
 
-#### disable_http_mask
+#### httpmask.disable
 
 禁用所有 HTTP 伪装层。
 
-#### http_mask_mode
+仍兼容旧版平铺字段 `disable_http_mask` / `http_mask_*`，但推荐使用 `httpmask`。
+
+#### httpmask.mode
 
 HTTP 伪装模式。
 
@@ -113,9 +117,9 @@ HTTP 伪装模式。
 * `poll`（真实 HTTP 轮询隧道）
 * `auto`（先尝试 stream，失败后回退到 poll）
 
-#### http_mask_multiplex
+#### httpmask.multiplex
 
-当 `http_mask_mode` 为 `stream`/`poll`/`auto` 时的复用行为。
+当 `httpmask.mode` 为 `stream`/`poll`/`auto` 时的复用行为。
 
 可选值：
 
@@ -123,15 +127,15 @@ HTTP 伪装模式。
 * `auto`（复用底层 HTTP 连接；在 HTTP/2 下可多路复用多个隧道）
 * `on`（单隧道多目标 mux：在一个 HTTPMask 隧道中复用多个目标连接，降低每连接 RTT）
 
-#### http_mask_tls
+#### httpmask.tls
 
-为 `http_mask_mode` 为 `stream`/`poll`/`auto` 时启用 HTTPS。
+为 `httpmask.mode` 为 `stream`/`poll`/`auto` 时启用 HTTPS。
 
-#### http_mask_host
+#### httpmask.host
 
-为 `http_mask_mode` 为 `stream`/`poll`/`auto` 时覆盖 HTTP Host 头 / SNI Host。
+为 `httpmask.mode` 为 `stream`/`poll`/`auto` 时覆盖 HTTP Host 头 / SNI Host。
 
-#### http_mask_path_root
+#### httpmask.path_root
 
 为所有 HTTP mask 端点增加一级路径前缀（可选）。
 
@@ -139,7 +143,7 @@ HTTP 伪装模式。
 
 #### http_mask_strategy
 
-`http_mask_mode` 为 `legacy` 时使用的 HTTP 头模板策略。
+`httpmask.mode` 为 `legacy` 时使用的 HTTP 头模板策略。
 
 可选值：
 

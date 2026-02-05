@@ -16,10 +16,14 @@
   "custom_tables": [],
   "enable_pure_downlink": true,
   "handshake_timeout": 5,
-  "disable_http_mask": false,
-  "http_mask_mode": "legacy",
-  "http_mask_multiplex": "off",
-  "http_mask_path_root": ""
+  "fallback_address": "127.0.0.1:80",
+  "suspicious_action": "fallback",
+  "httpmask": {
+    "disable": false,
+    "mode": "legacy",
+    "path_root": "",
+    "multiplex": "off"
+  }
 }
 ```
 
@@ -90,11 +94,28 @@ entropy 模式的自定义表 pattern。
 
 握手超时时间（秒）。
 
-#### disable_http_mask
+#### fallback_address
+
+可疑连接的诱饵地址（`host:port`）。
+
+当 `suspicious_action` 为 `fallback` 时使用。
+
+#### suspicious_action
+
+可疑连接处理方式（仅服务端）。
+
+可选值：
+
+* `fallback`（默认）
+* `silent`（拖延/丢弃）
+
+#### httpmask.disable
 
 禁用所有 HTTP 伪装层。
 
-#### http_mask_mode
+仍兼容旧版平铺字段 `disable_http_mask` / `http_mask_*`，但推荐使用 `httpmask`。
+
+#### httpmask.mode
 
 HTTP 伪装模式。
 
@@ -105,9 +126,9 @@ HTTP 伪装模式。
 * `poll`（真实 HTTP 轮询隧道）
 * `auto`（同时接受 stream 与 poll）
 
-#### http_mask_multiplex
+#### httpmask.multiplex
 
-客户端在 `http_mask_mode` 为 `stream`/`poll`/`auto` 时的复用行为。
+客户端在 `httpmask.mode` 为 `stream`/`poll`/`auto` 时的复用行为。
 
 可选值：
 
@@ -115,10 +136,10 @@ HTTP 伪装模式。
 * `auto`
 * `on`
 
-#### http_mask_path_root
+#### httpmask.path_root
 
 为所有 HTTP mask 端点增加一级路径前缀（可选）。
 
 例如：`aabbcc` => `/aabbcc/session`、`/aabbcc/api/v1/upload` ...
 
-当 `http_mask_mode` 为 `stream`/`poll`/`auto` 时需与客户端一致。
+当 `httpmask.mode` 为 `stream`/`poll`/`auto` 时需与客户端一致。

@@ -23,10 +23,18 @@ func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) *HTTPMaskTunnelServer {
 	if !cfg.DisableHTTPMask {
 		switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
 		case "stream", "poll", "auto":
+			passThroughOnReject := false
+			switch strings.ToLower(strings.TrimSpace(cfg.SuspiciousAction)) {
+			case "silent":
+				passThroughOnReject = true
+			case "", "fallback":
+				passThroughOnReject = strings.TrimSpace(cfg.FallbackAddress) != ""
+			}
 			ts = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{
-				Mode:     cfg.HTTPMaskMode,
-				PathRoot: cfg.HTTPMaskPathRoot,
-				AuthKey:  cfg.Key,
+				Mode:                cfg.HTTPMaskMode,
+				PathRoot:            cfg.HTTPMaskPathRoot,
+				AuthKey:             cfg.Key,
+				PassThroughOnReject: passThroughOnReject,
 			})
 		}
 	}
@@ -45,33 +53,33 @@ func (s *HTTPMaskTunnelServer) Close() error {
 // Returns:
 //   - done=true: this TCP connection has been fully handled (e.g., stream/poll control request), caller should return
 //   - done=false: handshakeConn+cfg are ready for ServerHandshake
-func (s *HTTPMaskTunnelServer) WrapConn(rawConn net.Conn) (handshakeConn net.Conn, cfg *ProtocolConfig, done bool, err error) {
+func (s *HTTPMaskTunnelServer) WrapConn(rawConn net.Conn) (handshakeConn net.Conn, cfg *ProtocolConfig, allowFallback bool, done bool, err error) {
 	if rawConn == nil {
-		return nil, nil, true, fmt.Errorf("nil conn")
+		return nil, nil, false, true, fmt.Errorf("nil conn")
 	}
 	if s == nil {
-		return rawConn, nil, false, nil
+		return rawConn, nil, true, false, nil
 	}
 	if s.ts == nil {
-		return rawConn, s.cfg, false, nil
+		return rawConn, s.cfg, true, false, nil
 	}
 
 	res, c, err := s.ts.HandleConn(rawConn)
 	if err != nil {
-		return nil, nil, true, err
+		return nil, nil, false, true, err
 	}
 
 	switch res {
 	case httpmask.HandleDone:
-		return nil, nil, true, nil
+		return nil, nil, false, true, nil
 	case httpmask.HandlePassThrough:
-		return c, s.cfg, false, nil
+		return c, s.cfg, true, false, nil
 	case httpmask.HandleStartTunnel:
 		inner := *s.cfg
 		inner.DisableHTTPMask = true
-		return c, &inner, false, nil
+		return c, &inner, false, false, nil
 	default:
-		return nil, nil, true, nil
+		return nil, nil, false, true, nil
 	}
 }
 

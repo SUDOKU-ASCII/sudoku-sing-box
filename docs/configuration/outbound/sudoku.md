@@ -15,13 +15,15 @@
   "custom_table": "",
   "custom_tables": [],
   "enable_pure_downlink": true,
-  "disable_http_mask": false,
-  "http_mask_mode": "legacy",
-  "http_mask_multiplex": "off",
-  "http_mask_tls": false,
-  "http_mask_host": "",
-  "http_mask_path_root": "",
   "http_mask_strategy": "random",
+  "httpmask": {
+    "disable": false,
+    "mode": "legacy",
+    "tls": false,
+    "host": "",
+    "path_root": "",
+    "multiplex": "off"
+  },
 
   ... // Dial Fields
 }
@@ -98,11 +100,13 @@ Enable pure downlink mode.
 
 Set to `false` to use packed downlink mode (requires AEAD, `aead: none` is not allowed).
 
-#### disable_http_mask
+#### httpmask.disable
 
 Disable all HTTP masking layers.
 
-#### http_mask_mode
+Legacy flat fields `disable_http_mask` / `http_mask_*` are still accepted for compatibility, but `httpmask` is recommended.
+
+#### httpmask.mode
 
 HTTP masking mode.
 
@@ -113,9 +117,9 @@ Available values:
 * `poll` (real HTTP polling tunnel)
 * `auto` (try stream then fall back to poll)
 
-#### http_mask_multiplex
+#### httpmask.multiplex
 
-Multiplex behavior when `http_mask_mode` is `stream`/`poll`/`auto`.
+Multiplex behavior when `httpmask.mode` is `stream`/`poll`/`auto`.
 
 Available values:
 
@@ -123,15 +127,15 @@ Available values:
 * `auto` (reuse underlying HTTP connections across tunnel dials; HTTP/2 can multiplex them)
 * `on` (single tunnel, multi-target mux inside one HTTPMask tunnel; reduces per-connection RTT)
 
-#### http_mask_tls
+#### httpmask.tls
 
-Enable HTTPS for `http_mask_mode` `stream`/`poll`/`auto`.
+Enable HTTPS for `httpmask.mode` `stream`/`poll`/`auto`.
 
-#### http_mask_host
+#### httpmask.host
 
-Override HTTP Host header / SNI host for `http_mask_mode` `stream`/`poll`/`auto`.
+Override HTTP Host header / SNI host for `httpmask.mode` `stream`/`poll`/`auto`.
 
-#### http_mask_path_root
+#### httpmask.path_root
 
 Optional first-level path prefix for all HTTP mask endpoints.
 
@@ -139,7 +143,7 @@ Example: `aabbcc` => `/aabbcc/session`, `/aabbcc/api/v1/upload`, ...
 
 #### http_mask_strategy
 
-HTTP header template strategy for `http_mask_mode` `legacy`.
+HTTP header template strategy for `httpmask.mode` `legacy`.
 
 Available values:
 

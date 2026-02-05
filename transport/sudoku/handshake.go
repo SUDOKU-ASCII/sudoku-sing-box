@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -31,15 +31,6 @@ type ServerSession struct {
 	UserHash string
 }
 
-type bufferedConn struct {
-	net.Conn
-	r *bufio.Reader
-}
-
-func (bc *bufferedConn) Read(p []byte) (int, error) {
-	return bc.r.Read(p)
-}
-
 type preBufferedConn struct {
 	net.Conn
 	buf []byte
@@ -55,37 +46,6 @@ func (p *preBufferedConn) Read(b []byte) (int, error) {
 		return 0, io.EOF
 	}
 	return p.Conn.Read(b)
-}
-
-type directionalConn struct {
-	net.Conn
-	reader  io.Reader
-	writer  io.Writer
-	closers []func() error
-}
-
-func (c *directionalConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
-}
-
-func (c *directionalConn) Write(p []byte) (int, error) {
-	return c.writer.Write(p)
-}
-
-func (c *directionalConn) Close() error {
-	var firstErr error
-	for _, fn := range c.closers {
-		if fn == nil {
-			continue
-		}
-		if err := fn(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if err := c.Conn.Close(); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	return firstErr
 }
 
 func absInt64(v int64) int64 {
@@ -108,53 +68,34 @@ func downlinkMode(cfg *ProtocolConfig) byte {
 }
 
 func buildClientObfsConn(raw net.Conn, cfg *ProtocolConfig, table *sudoku.Table) net.Conn {
-	baseReader := sudoku.NewConn(raw, table, cfg.PaddingMin, cfg.PaddingMax, false)
-	baseWriter := newSudokuObfsWriter(raw, table, cfg.PaddingMin, cfg.PaddingMax)
+	baseSudoku := sudoku.NewConn(raw, table, cfg.PaddingMin, cfg.PaddingMax, false)
 	if cfg.EnablePureDownlink {
-		return &directionalConn{
-			Conn:   raw,
-			reader: baseReader,
-			writer: baseWriter,
-		}
+		return baseSudoku
 	}
 	packed := sudoku.NewPackedConn(raw, table, cfg.PaddingMin, cfg.PaddingMax)
-	return &directionalConn{
-		Conn:   raw,
-		reader: packed,
-		writer: baseWriter,
-	}
+	return sudoku.NewDirectionalConn(raw, packed, baseSudoku)
 }
 
 func buildServerObfsConn(raw net.Conn, cfg *ProtocolConfig, table *sudoku.Table, record bool) (*sudoku.Conn, net.Conn) {
-	uplink := sudoku.NewConn(raw, table, cfg.PaddingMin, cfg.PaddingMax, record)
+	uplinkSudoku := sudoku.NewConn(raw, table, cfg.PaddingMin, cfg.PaddingMax, record)
 	if cfg.EnablePureDownlink {
-		downlink := &directionalConn{
-			Conn:   raw,
-			reader: uplink,
-			writer: newSudokuObfsWriter(raw, table, cfg.PaddingMin, cfg.PaddingMax),
-		}
-		return uplink, downlink
+		return uplinkSudoku, uplinkSudoku
 	}
 	packed := sudoku.NewPackedConn(raw, table, cfg.PaddingMin, cfg.PaddingMax)
-	return uplink, &directionalConn{
-		Conn:    raw,
-		reader:  uplink,
-		writer:  packed,
-		closers: []func() error{packed.Flush},
-	}
+	return uplinkSudoku, sudoku.NewDirectionalConn(raw, uplinkSudoku, packed, packed.Flush)
 }
 
 func buildHandshakePayload(key string) [16]byte {
 	var payload [16]byte
 	binary.BigEndian.PutUint64(payload[:8], uint64(time.Now().Unix()))
-	src := []byte(key)
-	if _, err := crypto.RecoverPublicKey(key); err == nil {
-		if keyBytes, decErr := hex.DecodeString(key); decErr == nil && len(keyBytes) > 0 {
-			src = keyBytes
-		}
+	if keyBytes, ok := crypto.DecodePrivateKeyBytes(key); ok {
+		hash := sha256.Sum256(keyBytes)
+		copy(payload[8:], hash[:8])
+		return payload
 	}
-	hash := sha256.Sum256(src)
-	copy(payload[8:], hash[:8])
+	if _, err := rand.Read(payload[8:]); err != nil {
+		binary.BigEndian.PutUint64(payload[8:], uint64(time.Now().UnixNano()))
+	}
 	return payload
 }
 
@@ -223,96 +164,108 @@ func ServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (*ServerSession, err
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = 5 * time.Second
 	}
-	_ = rawConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
 	bufReader := bufio.NewReader(rawConn)
+	recordedBytes := func(chunks ...[]byte) []byte {
+		total := 0
+		for _, b := range chunks {
+			total += len(b)
+		}
+		out := make([]byte, 0, total)
+		for _, b := range chunks {
+			out = append(out, b...)
+		}
+		return out
+	}
+	suspicious := func(captured error, chunks ...[]byte) (*ServerSession, error) {
+		return nil, &SuspiciousError{
+			Err:  captured,
+			Conn: &recordedConn{Conn: rawConn, recorded: recordedBytes(chunks...)},
+		}
+	}
+
+	_ = rawConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	var httpHeaderData []byte
 	if !cfg.DisableHTTPMask {
 		if peek, err := bufReader.Peek(4); err == nil && httpmask.LooksLikeHTTPRequestStart(peek) {
-			if _, err := httpmask.ConsumeHeader(bufReader); err != nil {
-				return nil, fmt.Errorf("invalid http header: %w", err)
+			consumed, err := httpmask.ConsumeHeader(bufReader)
+			httpHeaderData = consumed
+			if err != nil {
+				peeked, _ := bufReader.Peek(bufReader.Buffered())
+				_ = rawConn.SetReadDeadline(time.Time{})
+				return suspicious(fmt.Errorf("invalid http header: %w", err), httpHeaderData, peeked)
 			}
 		}
 	}
 
 	selectedTable, preRead, err := selectTableByProbe(bufReader, cfg, cfg.tableCandidates())
+	_ = rawConn.SetReadDeadline(time.Time{})
 	if err != nil {
-		return nil, err
+		return suspicious(err, httpHeaderData, preRead)
 	}
 
 	baseConn := &preBufferedConn{Conn: rawConn, buf: preRead}
-	bConn := &bufferedConn{Conn: baseConn, r: bufio.NewReader(baseConn)}
-	sConn, obfsConn := buildServerObfsConn(bConn, cfg, selectedTable, true)
+	sConn, obfsConn := buildServerObfsConn(baseConn, cfg, selectedTable, true)
+	defer sConn.StopRecording()
 	cConn, err := crypto.NewAEADConn(obfsConn, cfg.Key, cfg.AEADMethod)
 	if err != nil {
 		return nil, fmt.Errorf("crypto setup failed: %w", err)
 	}
 
+	_ = rawConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	defer rawConn.SetReadDeadline(time.Time{})
+
 	var handshakeBuf [16]byte
 	if _, err := io.ReadFull(cConn, handshakeBuf[:]); err != nil {
-		cConn.Close()
-		return nil, fmt.Errorf("read handshake failed: %w", err)
+		return suspicious(fmt.Errorf("read handshake failed: %w", err), httpHeaderData, sConn.GetBufferedAndRecorded())
 	}
 
 	ts := int64(binary.BigEndian.Uint64(handshakeBuf[:8]))
 	if absInt64(time.Now().Unix()-ts) > 60 {
-		cConn.Close()
-		return nil, fmt.Errorf("timestamp skew detected")
+		return suspicious(fmt.Errorf("timestamp skew detected"), httpHeaderData, sConn.GetBufferedAndRecorded())
 	}
 	userHash := userHashFromHandshake(handshakeBuf[:])
 
-	sConn.StopRecording()
-
 	modeBuf := []byte{0}
 	if _, err := io.ReadFull(cConn, modeBuf); err != nil {
-		cConn.Close()
-		return nil, fmt.Errorf("read downlink mode failed: %w", err)
+		return suspicious(fmt.Errorf("read downlink mode failed: %w", err), httpHeaderData, sConn.GetBufferedAndRecorded())
 	}
 	if modeBuf[0] != downlinkMode(cfg) {
-		cConn.Close()
-		return nil, fmt.Errorf("downlink mode mismatch: client=%d server=%d", modeBuf[0], downlinkMode(cfg))
+		return suspicious(fmt.Errorf("downlink mode mismatch: client=%d server=%d", modeBuf[0], downlinkMode(cfg)), httpHeaderData, sConn.GetBufferedAndRecorded())
 	}
 
 	firstByte := make([]byte, 1)
 	if _, err := io.ReadFull(cConn, firstByte); err != nil {
-		cConn.Close()
-		return nil, fmt.Errorf("read first byte failed: %w", err)
+		return suspicious(fmt.Errorf("read first byte failed: %w", err), httpHeaderData, sConn.GetBufferedAndRecorded())
 	}
 
 	if firstByte[0] == MuxMagicByte {
 		version := make([]byte, 1)
 		if _, err := io.ReadFull(cConn, version); err != nil {
-			cConn.Close()
-			return nil, fmt.Errorf("read mux version failed: %w", err)
+			return suspicious(fmt.Errorf("read mux version failed: %w", err), httpHeaderData, sConn.GetBufferedAndRecorded())
 		}
 		if version[0] != muxVersion {
-			cConn.Close()
-			return nil, fmt.Errorf("unsupported mux version: %d", version[0])
+			return suspicious(fmt.Errorf("unsupported mux version: %d", version[0]), httpHeaderData, sConn.GetBufferedAndRecorded())
 		}
-		_ = rawConn.SetReadDeadline(time.Time{})
 		return &ServerSession{Conn: cConn, Type: SessionTypeMux, UserHash: userHash}, nil
 	}
 
 	if firstByte[0] == UoTMagicByte {
 		version := make([]byte, 1)
 		if _, err := io.ReadFull(cConn, version); err != nil {
-			cConn.Close()
-			return nil, fmt.Errorf("read uot version failed: %w", err)
+			return suspicious(fmt.Errorf("read uot version failed: %w", err), httpHeaderData, sConn.GetBufferedAndRecorded())
 		}
 		if version[0] != uotVersion {
-			cConn.Close()
-			return nil, fmt.Errorf("unsupported uot version: %d", version[0])
+			return suspicious(fmt.Errorf("unsupported uot version: %d", version[0]), httpHeaderData, sConn.GetBufferedAndRecorded())
 		}
-		_ = rawConn.SetReadDeadline(time.Time{})
 		return &ServerSession{Conn: cConn, Type: SessionTypeUoT, UserHash: userHash}, nil
 	}
 
 	prefixed := &preBufferedConn{Conn: cConn, buf: firstByte}
 	target, err := DecodeAddress(prefixed)
 	if err != nil {
-		cConn.Close()
-		return nil, fmt.Errorf("read target address failed: %w", err)
+		return suspicious(fmt.Errorf("read target address failed: %w", err), httpHeaderData, sConn.GetBufferedAndRecorded())
 	}
-	_ = rawConn.SetReadDeadline(time.Time{})
 	return &ServerSession{
 		Conn:     prefixed,
 		Type:     SessionTypeTCP,

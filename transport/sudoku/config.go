@@ -2,6 +2,7 @@ package sudoku
 
 import (
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
@@ -40,6 +41,13 @@ type ProtocolConfig struct {
 
 	// Server-side handshake timeout (seconds).
 	HandshakeTimeoutSeconds int
+
+	// Server-side: suspicious connection action.
+	// "fallback" proxies the raw connection to FallbackAddress; "silent" discards it (tarpit).
+	SuspiciousAction string
+
+	// Server-side: decoy address ("host:port") used when SuspiciousAction is "fallback".
+	FallbackAddress string
 
 	// DisableHTTPMask disables all HTTP camouflage layers.
 	DisableHTTPMask bool
@@ -107,6 +115,17 @@ func (c *ProtocolConfig) Validate() error {
 		return fmt.Errorf("handshake_timeout must be >= 0, got %d", c.HandshakeTimeoutSeconds)
 	}
 
+	switch strings.ToLower(strings.TrimSpace(c.SuspiciousAction)) {
+	case "", "fallback", "silent":
+	default:
+		return fmt.Errorf("invalid suspicious_action: %s, must be one of: fallback, silent", c.SuspiciousAction)
+	}
+	if strings.ToLower(strings.TrimSpace(c.SuspiciousAction)) == "fallback" && strings.TrimSpace(c.FallbackAddress) != "" {
+		if _, _, err := net.SplitHostPort(strings.TrimSpace(c.FallbackAddress)); err != nil {
+			return fmt.Errorf("invalid fallback_address: %w", err)
+		}
+	}
+
 	switch strings.ToLower(strings.TrimSpace(c.HTTPMaskMode)) {
 	case "", "legacy", "stream", "poll", "auto":
 	default:
@@ -160,6 +179,7 @@ func DefaultConfig() *ProtocolConfig {
 		PaddingMax:              30,
 		EnablePureDownlink:      true,
 		HandshakeTimeoutSeconds: 5,
+		SuspiciousAction:        "fallback",
 		HTTPMaskMode:            "legacy",
 		HTTPMaskMultiplex:       "off",
 	}

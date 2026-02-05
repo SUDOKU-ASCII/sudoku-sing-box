@@ -243,9 +243,9 @@ func parseTunnelToken(body []byte) (string, error) {
 }
 
 type httpStreamConn struct {
-	reader io.ReadCloser
-	writer *io.PipeWriter
-	cancel context.CancelFunc
+	reader    io.ReadCloser
+	writer    *io.PipeWriter
+	cancel    context.CancelFunc
 	closeIdle func()
 
 	localAddr  net.Addr
@@ -784,12 +784,12 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 		closeURL:   info.closeURL,
 		headerHost: info.headerHost,
 		queuedConn: queuedConn{
-			rxc:        make(chan []byte, 256),
-			closed:     make(chan struct{}),
-			writeCh:    make(chan []byte, 256),
+			rxc:         make(chan []byte, 256),
+			closed:      make(chan struct{}),
+			writeCh:     make(chan []byte, 256),
 			writeClosed: make(chan struct{}),
-			localAddr:  &net.TCPAddr{},
-			remoteAddr: &net.TCPAddr{},
+			localAddr:   &net.TCPAddr{},
+			remoteAddr:  &net.TCPAddr{},
 		},
 	}
 
@@ -1109,12 +1109,12 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 		closeURL:   info.closeURL,
 		headerHost: info.headerHost,
 		queuedConn: queuedConn{
-			rxc:        make(chan []byte, 128),
-			closed:     make(chan struct{}),
-			writeCh:    make(chan []byte, 256),
+			rxc:         make(chan []byte, 128),
+			closed:      make(chan struct{}),
+			writeCh:     make(chan []byte, 256),
 			writeClosed: make(chan struct{}),
-			localAddr:  &net.TCPAddr{},
-			remoteAddr: &net.TCPAddr{},
+			localAddr:   &net.TCPAddr{},
+			remoteAddr:  &net.TCPAddr{},
 		},
 	}
 
@@ -1441,6 +1441,11 @@ type TunnelServerOptions struct {
 	PathRoot string
 	// AuthKey enables short-term HMAC auth for HTTP tunnel requests (anti-probing).
 	AuthKey string
+	// PassThroughOnReject returns HandlePassThrough with a rejected marker (instead of replying 404)
+	// when the request looks like a tunnel but fails validation.
+	//
+	// This enables upper layers to handle suspicious connections via fallback/tarpit.
+	PassThroughOnReject bool
 	// PullReadTimeout controls how long the server long-poll waits for tunnel downlink data before replying with a keepalive newline.
 	PullReadTimeout time.Duration
 	// SessionTTL is a best-effort TTL to prevent leaked sessions. 0 uses a conservative default.
@@ -1448,9 +1453,10 @@ type TunnelServerOptions struct {
 }
 
 type TunnelServer struct {
-	mode TunnelMode
-	pathRoot string
-	auth     *tunnelAuth
+	mode                TunnelMode
+	pathRoot            string
+	auth                *tunnelAuth
+	passThroughOnReject bool
 
 	pullReadTimeout time.Duration
 	sessionTTL      time.Duration
@@ -1481,13 +1487,14 @@ func NewTunnelServer(opts TunnelServerOptions) *TunnelServer {
 		ttl = 2 * time.Minute
 	}
 	return &TunnelServer{
-		mode:            mode,
-		pathRoot:        opts.PathRoot,
-		auth:            newTunnelAuth(opts.AuthKey, 0),
-		pullReadTimeout: timeout,
-		sessionTTL:      ttl,
-		closed:          make(chan struct{}),
-		sessions:        make(map[string]*tunnelSession),
+		mode:                mode,
+		pathRoot:            opts.PathRoot,
+		auth:                newTunnelAuth(opts.AuthKey, 0),
+		passThroughOnReject: opts.PassThroughOnReject,
+		pullReadTimeout:     timeout,
+		sessionTTL:          ttl,
+		closed:              make(chan struct{}),
+		sessions:            make(map[string]*tunnelSession),
 	}
 }
 
@@ -1588,14 +1595,26 @@ func (s *TunnelServer) HandleConn(rawConn net.Conn) (HandleResult, net.Conn, err
 				}
 			}
 		}
+		if tunnelHeader == "" {
+			// Not our tunnel; replay full bytes to legacy handler.
+			prefix := make([]byte, 0, len(headerBytes)+len(buffered))
+			prefix = append(prefix, headerBytes...)
+			prefix = append(prefix, buffered...)
+			return HandlePassThrough, newPreBufferedConn(rawConn, prefix), nil
+		}
+	}
 
-		// Not our tunnel; replay full bytes to legacy handler.
+	reject := func() (HandleResult, net.Conn, error) {
 		prefix := make([]byte, 0, len(headerBytes)+len(buffered))
 		prefix = append(prefix, headerBytes...)
 		prefix = append(prefix, buffered...)
-		return HandlePassThrough, newPreBufferedConn(rawConn, prefix), nil
+		return HandlePassThrough, newRejectedPreBufferedConn(rawConn, prefix), nil
 	}
+
 	if s.mode == TunnelModeLegacy {
+		if s.passThroughOnReject {
+			return reject()
+		}
 		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
@@ -1604,19 +1623,28 @@ func (s *TunnelServer) HandleConn(rawConn net.Conn) (HandleResult, net.Conn, err
 	switch TunnelMode(tunnelHeader) {
 	case TunnelModeStream:
 		if s.mode != TunnelModeStream && s.mode != TunnelModeAuto {
+			if s.passThroughOnReject {
+				return reject()
+			}
 			_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
 			_ = rawConn.Close()
 			return HandleDone, nil, nil
 		}
-		return s.handleStream(rawConn, req, buffered)
+		return s.handleStream(rawConn, req, headerBytes, buffered)
 	case TunnelModePoll:
 		if s.mode != TunnelModePoll && s.mode != TunnelModeAuto {
+			if s.passThroughOnReject {
+				return reject()
+			}
 			_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
 			_ = rawConn.Close()
 			return HandleDone, nil, nil
 		}
-		return s.handlePoll(rawConn, req, buffered)
+		return s.handlePoll(rawConn, req, headerBytes, buffered)
 	default:
+		if s.passThroughOnReject {
+			return reject()
+		}
 		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
@@ -1706,13 +1734,52 @@ func readAllBuffered(r *bufio.Reader) []byte {
 
 type preBufferedConn struct {
 	net.Conn
-	buf []byte
+	buf      []byte
+	recorded []byte
+	rejected bool
 }
 
-func newPreBufferedConn(conn net.Conn, pre []byte) net.Conn {
+func (p *preBufferedConn) CloseWrite() error {
+	if p == nil {
+		return nil
+	}
+	if cw, ok := p.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (p *preBufferedConn) CloseRead() error {
+	if p == nil {
+		return nil
+	}
+	if cr, ok := p.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
+func newPreBufferedConn(conn net.Conn, pre []byte) *preBufferedConn {
 	cpy := make([]byte, len(pre))
 	copy(cpy, pre)
-	return &preBufferedConn{Conn: conn, buf: cpy}
+	return &preBufferedConn{Conn: conn, buf: cpy, recorded: cpy}
+}
+
+func newRejectedPreBufferedConn(conn net.Conn, pre []byte) *preBufferedConn {
+	c := newPreBufferedConn(conn, pre)
+	c.rejected = true
+	return c
+}
+
+func (p *preBufferedConn) IsHTTPMaskRejected() bool { return p.rejected }
+
+func (p *preBufferedConn) GetBufferedAndRecorded() []byte {
+	if p == nil || len(p.recorded) == 0 {
+		return nil
+	}
+	out := make([]byte, len(p.recorded))
+	copy(out, p.recorded)
+	return out
 }
 
 func (p *preBufferedConn) Read(b []byte) (int, error) {
@@ -1763,29 +1830,35 @@ func (c *bodyConn) Close() error {
 	return firstErr
 }
 
-func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, buffered []byte) (HandleResult, net.Conn, error) {
-	u, err := url.ParseRequestURI(req.target)
-	if err != nil {
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
+func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, headerBytes []byte, buffered []byte) (HandleResult, net.Conn, error) {
+	rejectOrReply := func(code int, body string) (HandleResult, net.Conn, error) {
+		if s.passThroughOnReject {
+			prefix := make([]byte, 0, len(headerBytes)+len(buffered))
+			prefix = append(prefix, headerBytes...)
+			prefix = append(prefix, buffered...)
+			return HandlePassThrough, newRejectedPreBufferedConn(rawConn, prefix), nil
+		}
+		_ = writeSimpleHTTPResponse(rawConn, code, body)
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
+	}
+
+	u, err := url.ParseRequestURI(req.target)
+	if err != nil {
+		return rejectOrReply(http.StatusBadRequest, "bad request")
 	}
 
 	// Only accept plausible paths to reduce accidental exposure.
 	path, ok := stripPathRoot(s.pathRoot, u.Path)
 	if !ok || !s.isAllowedBasePath(path) {
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusNotFound, "not found")
 	}
 	authVal := req.headers["authorization"]
 	if authVal == "" {
 		authVal = u.Query().Get(tunnelAuthQueryKey)
 	}
 	if !s.auth.verifyValue(authVal, TunnelModeStream, req.method, path, time.Now()) {
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusNotFound, "not found")
 	}
 
 	token := u.Query().Get("token")
@@ -1800,15 +1873,19 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, bu
 		}
 		// Stream split-session: GET /stream?token=... => downlink poll.
 		if token != "" && path == "/stream" {
+			if s.passThroughOnReject && !s.sessionHas(token) {
+				return rejectOrReply(http.StatusNotFound, "not found")
+			}
 			return s.streamPull(rawConn, token)
 		}
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusBadRequest, "bad request")
 
 	case http.MethodPost:
 		// Stream split-session: POST /api/v1/upload?token=... => uplink push.
 		if token != "" && path == "/api/v1/upload" {
+			if s.passThroughOnReject && !s.sessionHas(token) {
+				return rejectOrReply(http.StatusNotFound, "not found")
+			}
 			if closeFlag {
 				s.closeSession(token)
 				_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
@@ -1854,9 +1931,7 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, bu
 		return HandleStartTunnel, stream, nil
 
 	default:
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusBadRequest, "bad request")
 	}
 }
 
@@ -1910,28 +1985,34 @@ func writeTokenHTTPResponse(w io.Writer, token string) error {
 	return err
 }
 
-func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, buffered []byte) (HandleResult, net.Conn, error) {
-	u, err := url.ParseRequestURI(req.target)
-	if err != nil {
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
+func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, headerBytes []byte, buffered []byte) (HandleResult, net.Conn, error) {
+	rejectOrReply := func(code int, body string) (HandleResult, net.Conn, error) {
+		if s.passThroughOnReject {
+			prefix := make([]byte, 0, len(headerBytes)+len(buffered))
+			prefix = append(prefix, headerBytes...)
+			prefix = append(prefix, buffered...)
+			return HandlePassThrough, newRejectedPreBufferedConn(rawConn, prefix), nil
+		}
+		_ = writeSimpleHTTPResponse(rawConn, code, body)
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
 	}
 
+	u, err := url.ParseRequestURI(req.target)
+	if err != nil {
+		return rejectOrReply(http.StatusBadRequest, "bad request")
+	}
+
 	path, ok := stripPathRoot(s.pathRoot, u.Path)
 	if !ok || !s.isAllowedBasePath(path) {
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusNotFound, "not found")
 	}
 	authVal := req.headers["authorization"]
 	if authVal == "" {
 		authVal = u.Query().Get(tunnelAuthQueryKey)
 	}
 	if !s.auth.verifyValue(authVal, TunnelModePoll, req.method, path, time.Now()) {
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusNotFound, "not found")
 	}
 
 	token := u.Query().Get("token")
@@ -1943,21 +2024,21 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, buff
 			return s.authorizeSession(rawConn)
 		}
 		if path == "/stream" {
+			if s.passThroughOnReject && !s.sessionHas(token) {
+				return rejectOrReply(http.StatusNotFound, "not found")
+			}
 			return s.pollPull(rawConn, token)
 		}
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusBadRequest, "bad request")
 	case http.MethodPost:
 		if path != "/api/v1/upload" {
-			_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
-			_ = rawConn.Close()
-			return HandleDone, nil, nil
+			return rejectOrReply(http.StatusBadRequest, "bad request")
 		}
 		if token == "" {
-			_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "missing token")
-			_ = rawConn.Close()
-			return HandleDone, nil, nil
+			return rejectOrReply(http.StatusBadRequest, "missing token")
+		}
+		if s.passThroughOnReject && !s.sessionHas(token) {
+			return rejectOrReply(http.StatusNotFound, "not found")
 		}
 		if closeFlag {
 			s.closeSession(token)
@@ -1979,9 +2060,7 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, buff
 		}
 		return s.pollPush(rawConn, token, bodyReader)
 	default:
-		_ = writeSimpleHTTPResponse(rawConn, http.StatusBadRequest, "bad request")
-		_ = rawConn.Close()
-		return HandleDone, nil, nil
+		return rejectOrReply(http.StatusBadRequest, "bad request")
 	}
 }
 
@@ -2040,6 +2119,13 @@ func (s *TunnelServer) reapSessionLater(token string) {
 	delete(s.sessions, token)
 	s.mu.Unlock()
 	_ = sess.conn.Close()
+}
+
+func (s *TunnelServer) sessionHas(token string) bool {
+	s.mu.Lock()
+	_, ok := s.sessions[token]
+	s.mu.Unlock()
+	return ok
 }
 
 func (s *TunnelServer) getSession(token string) (*tunnelSession, bool) {

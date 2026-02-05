@@ -44,4 +44,3 @@ func GenerateAllGrids() []Grid {
 	backtrack(0)
 	return grids
 }
-

@@ -3,8 +3,6 @@ package sudoku
 import (
 	"bufio"
 	"bytes"
-	crypto_rand "crypto/rand"
-	"encoding/binary"
 	"math/rand"
 	"net"
 	"sync"
@@ -47,25 +45,20 @@ type Conn struct {
 	recording  bool
 	recordLock sync.Mutex
 
+	writeMu sync.Mutex
+
 	rawBuf      []byte
 	pendingData []byte
 	hintBuf     []byte
 
-	rng         *rand.Rand
-	paddingRate float32
+	rng              *rand.Rand
+	paddingThreshold uint64
+
+	writeBuf []byte
 }
 
 func NewConn(c net.Conn, table *Table, pMin, pMax int, record bool) *Conn {
-	var seedBytes [8]byte
-	if _, err := crypto_rand.Read(seedBytes[:]); err != nil {
-		binary.BigEndian.PutUint64(seedBytes[:], uint64(rand.Int63()))
-	}
-	seed := int64(binary.BigEndian.Uint64(seedBytes[:]))
-	localRng := rand.New(rand.NewSource(seed))
-
-	min := float32(pMin) / 100.0
-	span := float32(pMax-pMin) / 100.0
-	rate := min + localRng.Float32()*span
+	localRng := newSeededRand()
 
 	sc := &Conn{
 		Conn:        c,
@@ -75,13 +68,34 @@ func NewConn(c net.Conn, table *Table, pMin, pMax int, record bool) *Conn {
 		pendingData: make([]byte, 0, 4096),
 		hintBuf:     make([]byte, 0, 4),
 		rng:         localRng,
-		paddingRate: rate,
+		writeBuf:    make([]byte, 0, 4096),
 	}
+	sc.paddingThreshold = pickPaddingThreshold(localRng, pMin, pMax)
 	if record {
 		sc.recorder = new(bytes.Buffer)
 		sc.recording = true
 	}
 	return sc
+}
+
+func (sc *Conn) CloseWrite() error {
+	if sc == nil {
+		return nil
+	}
+	if cw, ok := sc.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (sc *Conn) CloseRead() error {
+	if sc == nil {
+		return nil
+	}
+	if cr, ok := sc.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
 }
 
 func (c *Conn) StopRecording() {
@@ -120,12 +134,19 @@ func (c *Conn) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	out := make([]byte, 0, len(p)*6)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	needed := len(p)*10 + 1
+	if cap(c.writeBuf) < needed {
+		c.writeBuf = make([]byte, 0, needed)
+	}
+	out := c.writeBuf[:0]
 	pads := c.table.PaddingPool
 	padLen := len(pads)
 
 	for _, b := range p {
-		if padLen > 0 && c.rng.Float32() < c.paddingRate {
+		if padLen > 0 && shouldPad(c.rng, c.paddingThreshold) {
 			out = append(out, pads[c.rng.Intn(padLen)])
 		}
 
@@ -134,29 +155,24 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 		perm := perm4[c.rng.Intn(len(perm4))]
 		for _, idx := range perm {
-			if padLen > 0 && c.rng.Float32() < c.paddingRate {
+			if padLen > 0 && shouldPad(c.rng, c.paddingThreshold) {
 				out = append(out, pads[c.rng.Intn(padLen)])
 			}
 			out = append(out, puzzle[idx])
 		}
 	}
 
-	if padLen > 0 && c.rng.Float32() < c.paddingRate {
+	if padLen > 0 && shouldPad(c.rng, c.paddingThreshold) {
 		out = append(out, pads[c.rng.Intn(padLen)])
 	}
 
+	c.writeBuf = out[:0]
 	_, err := c.Conn.Write(out)
 	return len(p), err
 }
 
 func (c *Conn) Read(p []byte) (int, error) {
-	if len(c.pendingData) > 0 {
-		n := copy(p, c.pendingData)
-		if n == len(c.pendingData) {
-			c.pendingData = c.pendingData[:0]
-		} else {
-			c.pendingData = c.pendingData[n:]
-		}
+	if n, ok := drainPending(p, &c.pendingData); ok {
 		return n, nil
 	}
 
@@ -200,12 +216,6 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 	}
 
-	n := copy(p, c.pendingData)
-	if n == len(c.pendingData) {
-		c.pendingData = c.pendingData[:0]
-	} else {
-		c.pendingData = c.pendingData[n:]
-	}
+	n, _ := drainPending(p, &c.pendingData)
 	return n, nil
 }
-

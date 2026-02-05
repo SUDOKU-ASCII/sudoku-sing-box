@@ -32,4 +32,3 @@ func (ts *TableSet) Candidates() []*Table {
 	}
 	return ts.Tables
 }
-

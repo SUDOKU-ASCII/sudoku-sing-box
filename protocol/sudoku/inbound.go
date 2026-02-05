@@ -2,8 +2,12 @@ package sudoku
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -44,29 +48,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 
 	defaultConf := sudokut.DefaultConfig()
 
-	tableType := strings.TrimSpace(options.ASCII)
-	if tableType == "" {
-		tableType = "prefer_ascii"
-	}
-
-	paddingMin := defaultConf.PaddingMin
-	paddingMax := defaultConf.PaddingMax
-	if options.PaddingMin != nil {
-		paddingMin = *options.PaddingMin
-	}
-	if options.PaddingMax != nil {
-		paddingMax = *options.PaddingMax
-	}
-	if options.PaddingMin == nil && options.PaddingMax != nil && paddingMax < paddingMin {
-		paddingMin = paddingMax
-	}
-	if options.PaddingMax == nil && options.PaddingMin != nil && paddingMax < paddingMin {
-		paddingMax = paddingMin
-	}
-	enablePureDownlink := defaultConf.EnablePureDownlink
-	if options.EnablePureDownlink != nil {
-		enablePureDownlink = *options.EnablePureDownlink
-	}
+	tableType := resolveTableType(options.ASCII)
+	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
+	enablePureDownlink := resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink)
 
 	handshakeTimeout := defaultConf.HandshakeTimeoutSeconds
 	if options.HandshakeTimeout > 0 {
@@ -80,6 +64,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		PaddingMax:              paddingMax,
 		EnablePureDownlink:      enablePureDownlink,
 		HandshakeTimeoutSeconds: handshakeTimeout,
+		SuspiciousAction:        defaultConf.SuspiciousAction,
+		FallbackAddress:         options.FallbackAddress,
 		DisableHTTPMask:         options.DisableHTTPMask,
 		HTTPMaskMode:            defaultConf.HTTPMaskMode,
 		HTTPMaskMultiplex:       defaultConf.HTTPMaskMultiplex,
@@ -87,6 +73,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	if options.AEADMethod != "" {
 		protoConf.AEADMethod = options.AEADMethod
+	}
+	if options.SuspiciousAction != "" {
+		protoConf.SuspiciousAction = options.SuspiciousAction
 	}
 	if options.HTTPMaskMode != "" {
 		protoConf.HTTPMaskMode = options.HTTPMaskMode
@@ -140,8 +129,9 @@ func (h *Inbound) Close() error {
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	handshakeConn := conn
 	handshakeCfg := &h.protoConf
+	allowFallback := true
 	if h.tunnelSrv != nil {
-		c, cfg, done, err := h.tunnelSrv.WrapConn(conn)
+		c, cfg, allow, done, err := h.tunnelSrv.WrapConn(conn)
 		if err != nil {
 			N.CloseOnHandshakeFailure(conn, onClose, err)
 			h.logger.ErrorContext(ctx, E.Cause(err, "wrap http tunnel from ", metadata.Source))
@@ -150,6 +140,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		if done {
 			return
 		}
+		allowFallback = allow
 		if c != nil {
 			handshakeConn = c
 		}
@@ -158,8 +149,20 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		}
 	}
 
+	if allowFallback {
+		if r, ok := handshakeConn.(interface{ IsHTTPMaskRejected() bool }); ok && r.IsHTTPMaskRejected() {
+			h.handleSuspicious(ctx, handshakeConn, conn, handshakeCfg, metadata.Source, onClose)
+			return
+		}
+	}
+
 	session, err := sudokut.ServerHandshake(handshakeConn, handshakeCfg)
 	if err != nil {
+		var suspErr *sudokut.SuspiciousError
+		if allowFallback && errors.As(err, &suspErr) {
+			h.handleSuspicious(ctx, suspErr.Conn, conn, handshakeCfg, metadata.Source, onClose)
+			return
+		}
 		N.CloseOnHandshakeFailure(handshakeConn, onClose, err)
 		if handshakeConn != conn {
 			common.Close(conn)
@@ -204,4 +207,93 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 		h.router.RouteConnectionEx(ctx, session.Conn, metadata, onClose)
 	}
+}
+
+func (h *Inbound) handleSuspicious(ctx context.Context, wrapper net.Conn, rawConn net.Conn, cfg *sudokut.ProtocolConfig, source M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer func() {
+		if onClose != nil {
+			onClose(nil)
+		}
+	}()
+
+	action := strings.ToLower(strings.TrimSpace(cfg.SuspiciousAction))
+	if action == "" {
+		action = "fallback"
+	}
+
+	switch action {
+	case "silent":
+		h.logger.WarnContext(ctx, "suspicious connection from ", source, ", silent")
+		_ = rawConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, _ = io.Copy(io.Discard, rawConn)
+		time.Sleep(5 * time.Second)
+		common.Close(rawConn)
+		return
+
+	case "fallback":
+		fallbackAddr := strings.TrimSpace(cfg.FallbackAddress)
+		if fallbackAddr == "" {
+			h.logger.WarnContext(ctx, "suspicious connection from ", source, ", no fallback_address")
+			common.Close(rawConn)
+			return
+		}
+
+		h.logger.InfoContext(ctx, "fallback suspicious connection from ", source, " -> ", fallbackAddr)
+		dst, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, N.NetworkTCP, fallbackAddr)
+		if err != nil {
+			h.logger.ErrorContext(ctx, E.Cause(err, "dial fallback"))
+			common.Close(rawConn)
+			return
+		}
+
+		var badData []byte
+		if recorder, ok := wrapper.(interface{ GetBufferedAndRecorded() []byte }); ok {
+			badData = recorder.GetBufferedAndRecorded()
+		}
+		if len(badData) > 0 {
+			_ = dst.SetWriteDeadline(time.Now().Add(3 * time.Second))
+			if err := writeFullConn(dst, badData); err != nil {
+				h.logger.ErrorContext(ctx, E.Cause(err, "write fallback prelude"))
+				common.Close(dst, rawConn)
+				return
+			}
+			_ = dst.SetWriteDeadline(time.Time{})
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			defer common.Close(dst)
+			_, _ = io.Copy(dst, rawConn)
+		}()
+		go func() {
+			defer wg.Done()
+			defer common.Close(rawConn)
+			_, _ = io.Copy(rawConn, dst)
+		}()
+		wg.Wait()
+		return
+
+	default:
+		h.logger.WarnContext(ctx, "suspicious connection from ", source, ", unknown action: ", cfg.SuspiciousAction)
+		common.Close(rawConn)
+		return
+	}
+}
+
+func writeFullConn(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
