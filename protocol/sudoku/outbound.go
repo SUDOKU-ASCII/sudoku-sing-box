@@ -5,7 +5,6 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -49,16 +48,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 
 	defaultConf := sudokut.DefaultConfig()
-	tableType := resolveTableType(options.ASCII)
 	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
-	enablePureDownlink := resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink)
-
-	httpMaskMode := defaultConf.HTTPMaskMode
-	if options.HTTPMaskMode != "" {
-		httpMaskMode = options.HTTPMaskMode
-	} else if strings.EqualFold(strings.TrimSpace(options.HTTPMaskStrategy), "websocket") {
-		httpMaskMode = "ws"
-	}
 
 	baseConf := sudokut.ProtocolConfig{
 		ServerAddress:      net.JoinHostPort(options.Server, strconv.Itoa(int(options.ServerPort))),
@@ -66,30 +56,23 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		AEADMethod:         defaultConf.AEADMethod,
 		PaddingMin:         paddingMin,
 		PaddingMax:         paddingMax,
-		EnablePureDownlink: enablePureDownlink,
+		EnablePureDownlink: resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink),
 		DisableHTTPMask:    options.DisableHTTPMask,
-		HTTPMaskMode:       httpMaskMode,
+		HTTPMaskMode:       resolveHTTPMaskMode(defaultConf.HTTPMaskMode, options.HTTPMaskMode, options.HTTPMaskStrategy),
 		HTTPMaskTLSEnabled: options.HTTPMaskTLS,
-		HTTPMaskMultiplex:  defaultConf.HTTPMaskMultiplex,
+		HTTPMaskMultiplex:  resolveConfigString(defaultConf.HTTPMaskMultiplex, options.HTTPMaskMultiplex),
 		HTTPMaskHost:       options.HTTPMaskHost,
 		HTTPMaskPathRoot:   options.HTTPMaskPathRoot,
 	}
 	if options.AEADMethod != "" {
 		baseConf.AEADMethod = options.AEADMethod
 	}
-	if options.HTTPMaskMultiplex != "" {
-		baseConf.HTTPMaskMultiplex = options.HTTPMaskMultiplex
-	}
 
-	tables, err := sudokut.NewTablesWithCustomPatterns(sudokut.ClientAEADSeed(options.Key), tableType, options.CustomTable, options.CustomTables)
+	tables, err := buildProtocolTables(baseConf.Key, options.ASCII, options.CustomTable, options.CustomTables, true)
 	if err != nil {
 		return nil, E.Cause(err, "build table(s)")
 	}
-	if len(tables) == 1 {
-		baseConf.Table = tables[0]
-	} else {
-		baseConf.Tables = tables
-	}
+	applyProtocolTables(&baseConf, tables)
 
 	out := &Outbound{
 		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeSudoku, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
@@ -100,9 +83,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	out.baseConf.DialContext = out.dialContext
 	out.baseConf.HTTPMaskTransportPool = out.httpMaskPool
 
-	mode := strings.ToLower(strings.TrimSpace(out.baseConf.HTTPMaskMode))
-	muxMode := strings.ToLower(strings.TrimSpace(out.baseConf.HTTPMaskMultiplex))
-	if !out.baseConf.DisableHTTPMask && (mode == "stream" || mode == "poll" || mode == "auto" || mode == "ws") && muxMode == "on" {
+	if allowHTTPMaskMux(&out.baseConf) {
 		out.muxClient, err = sudokut.NewMuxClient(&out.baseConf)
 		if err != nil {
 			return nil, err

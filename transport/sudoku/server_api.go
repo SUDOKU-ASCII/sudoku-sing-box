@@ -76,34 +76,12 @@ func ServerHandshakeSessionAutoWithUserHash(rawConn net.Conn, cfg *ProtocolConfi
 		userHash = meta.UserHash
 	}
 
-	for {
-		msg, err := internaltunnel.ReadKIPMessage(conn)
-		if err != nil {
-			_ = conn.Close()
-			return nil, SessionForward, "", "", nil, err
-		}
-		if msg.Type == internaltunnel.KIPTypeKeepAlive {
-			continue
-		}
-		switch msg.Type {
-		case internaltunnel.KIPTypeStartUoT:
-			return conn, SessionUoT, "", userHash, nil, nil
-		case internaltunnel.KIPTypeStartMux:
-			return conn, SessionMux, "", userHash, nil, nil
-		case internaltunnel.KIPTypeStartRev:
-			return conn, SessionReverse, "", userHash, msg.Payload, nil
-		case internaltunnel.KIPTypeOpenTCP:
-			targetAddr, _, _, err := internalprotocol.ReadAddress(bytes.NewReader(msg.Payload))
-			if err != nil {
-				_ = conn.Close()
-				return nil, SessionForward, "", "", nil, err
-			}
-			return conn, SessionForward, targetAddr, userHash, nil, nil
-		default:
-			_ = conn.Close()
-			return nil, SessionForward, "", "", nil, fmt.Errorf("unknown session message: %d", msg.Type)
-		}
+	session, targetAddr, payload, err := readServerSession(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, SessionForward, "", "", nil, err
 	}
+	return conn, session, targetAddr, userHash, payload, nil
 }
 
 func (s *HTTPMaskTunnelServer) HandleConnSessionAutoWithUserHash(rawConn net.Conn) (net.Conn, SessionKind, string, string, []byte, bool, error) {
@@ -111,8 +89,7 @@ func (s *HTTPMaskTunnelServer) HandleConnSessionAutoWithUserHash(rawConn net.Con
 		return nil, SessionForward, "", "", nil, false, nil
 	}
 	if s.ts == nil {
-		conn, session, target, userHash, payload, err := ServerHandshakeSessionAutoWithUserHash(rawConn, s.cfg)
-		return conn, session, target, userHash, payload, true, err
+		return handledServerHandshake(rawConn, s.cfg)
 	}
 
 	res, c, err := s.ts.HandleConn(rawConn)
@@ -124,14 +101,53 @@ func (s *HTTPMaskTunnelServer) HandleConnSessionAutoWithUserHash(rawConn net.Con
 	case httpmask.HandleDone:
 		return nil, SessionForward, "", "", nil, true, nil
 	case httpmask.HandlePassThrough:
-		conn, session, target, userHash, payload, err := ServerHandshakeSessionAutoWithUserHash(c, s.cfg)
-		return conn, session, target, userHash, payload, true, err
+		return handledServerHandshake(c, s.cfg)
 	case httpmask.HandleStartTunnel:
 		inner := *s.cfg
 		inner.DisableHTTPMask = true
-		conn, session, target, userHash, payload, err := ServerHandshakeSessionAutoWithUserHash(c, &inner)
-		return conn, session, target, userHash, payload, true, err
+		return handledServerHandshake(c, &inner)
 	default:
 		return nil, SessionForward, "", "", nil, true, nil
 	}
+}
+
+func handledServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (net.Conn, SessionKind, string, string, []byte, bool, error) {
+	conn, session, target, userHash, payload, err := ServerHandshakeSessionAutoWithUserHash(rawConn, cfg)
+	return conn, session, target, userHash, payload, true, err
+}
+
+func readServerSession(conn net.Conn) (SessionKind, string, []byte, error) {
+	for {
+		msg, err := internaltunnel.ReadKIPMessage(conn)
+		if err != nil {
+			return SessionForward, "", nil, err
+		}
+		if msg.Type == internaltunnel.KIPTypeKeepAlive {
+			continue
+		}
+		switch msg.Type {
+		case internaltunnel.KIPTypeStartUoT:
+			return SessionUoT, "", nil, nil
+		case internaltunnel.KIPTypeStartMux:
+			return SessionMux, "", nil, nil
+		case internaltunnel.KIPTypeStartRev:
+			return SessionReverse, "", msg.Payload, nil
+		case internaltunnel.KIPTypeOpenTCP:
+			targetAddr, err := readServerTarget(msg.Payload)
+			if err != nil {
+				return SessionForward, "", nil, err
+			}
+			return SessionForward, targetAddr, nil, nil
+		default:
+			return SessionForward, "", nil, fmt.Errorf("unknown session message: %d", msg.Type)
+		}
+	}
+}
+
+func readServerTarget(payload []byte) (string, error) {
+	targetAddr, _, _, err := internalprotocol.ReadAddress(bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	return targetAddr, nil
 }

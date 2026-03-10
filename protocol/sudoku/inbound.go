@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	sudokut "github.com/sagernet/sing-box/transport/sudoku"
+	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -46,27 +47,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 
 	defaultConf := sudokut.DefaultConfig()
-	tableType := resolveTableType(options.ASCII)
 	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
-	enablePureDownlink := resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink)
-
-	httpMaskMode := defaultConf.HTTPMaskMode
-	if options.HTTPMaskMode != "" {
-		httpMaskMode = options.HTTPMaskMode
-	}
 
 	protoConf := sudokut.ProtocolConfig{
 		Key:                     options.Key,
 		AEADMethod:              defaultConf.AEADMethod,
 		PaddingMin:              paddingMin,
 		PaddingMax:              paddingMax,
-		EnablePureDownlink:      enablePureDownlink,
+		EnablePureDownlink:      resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink),
 		HandshakeTimeoutSeconds: defaultConf.HandshakeTimeoutSeconds,
 		SuspiciousAction:        defaultConf.SuspiciousAction,
 		FallbackAddress:         options.FallbackAddress,
 		DisableHTTPMask:         options.DisableHTTPMask,
-		HTTPMaskMode:            httpMaskMode,
-		HTTPMaskMultiplex:       defaultConf.HTTPMaskMultiplex,
+		HTTPMaskMode:            resolveHTTPMaskMode(defaultConf.HTTPMaskMode, options.HTTPMaskMode, ""),
+		HTTPMaskMultiplex:       resolveConfigString(defaultConf.HTTPMaskMultiplex, options.HTTPMaskMultiplex),
 		HTTPMaskPathRoot:        options.HTTPMaskPathRoot,
 	}
 	if options.AEADMethod != "" {
@@ -78,19 +72,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.SuspiciousAction != "" {
 		protoConf.SuspiciousAction = options.SuspiciousAction
 	}
-	if options.HTTPMaskMultiplex != "" {
-		protoConf.HTTPMaskMultiplex = options.HTTPMaskMultiplex
-	}
 
-	tables, err := sudokut.NewTablesWithCustomPatterns(protoConf.Key, tableType, options.CustomTable, options.CustomTables)
+	tables, err := buildProtocolTables(protoConf.Key, options.ASCII, options.CustomTable, options.CustomTables, false)
 	if err != nil {
 		return nil, E.Cause(err, "build table(s)")
 	}
-	if len(tables) == 1 {
-		protoConf.Table = tables[0]
-	} else {
-		protoConf.Tables = tables
-	}
+	applyProtocolTables(&protoConf, tables)
 
 	in := &Inbound{
 		Adapter:   inbound.NewAdapter(C.TypeSudoku, tag),
@@ -231,16 +218,15 @@ func (h *Inbound) handleSuspicious(ctx context.Context, suspErr *sudokut.Suspici
 			}
 		}
 
-		go func() {
-			_, _ = io.Copy(dst, rawConn)
-			_ = dst.(*net.TCPConn).CloseWrite()
-		}()
-		go func() {
-			_, _ = io.Copy(rawConn, dst)
-			_ = rawConn.(*net.TCPConn).CloseWrite()
-		}()
+		go relaySuspiciousConn(dst, rawConn)
+		go relaySuspiciousConn(rawConn, dst)
 		return
 	default:
 		common.Close(rawConn)
 	}
+}
+
+func relaySuspiciousConn(dst, src net.Conn) {
+	_, _ = io.Copy(dst, src)
+	_ = connutil.TryCloseWrite(dst)
 }
