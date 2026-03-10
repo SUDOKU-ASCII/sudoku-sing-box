@@ -3,8 +3,8 @@ name: Build Linux Packages
 on:
   #push:
   #  branches:
-  #    - main-next
-  #    - dev-next
+  #    - stable
+  #    - testing
   workflow_dispatch:
     inputs:
       version:
@@ -16,10 +16,14 @@ on:
         required: false
         type: boolean
         default: false
+  release:
+    types:
+      - published
 
 jobs:
   calculate_version:
     name: Calculate version
+    if: github.event_name != 'release' || github.event.release.target_commitish != 'oldstable'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.outputs.outputs.version }}
@@ -31,7 +35,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.25.7
+          go-version: ~1.25.7
       - name: Check input version
         if: github.event_name == 'workflow_dispatch'
         run: |-
@@ -58,14 +62,14 @@ jobs:
           - { os: linux, arch: arm64, naive: true, debian: arm64, rpm: aarch64, pacman: aarch64 }
           - { os: linux, arch: "386", naive: true, debian: i386, rpm: i386 }
           - { os: linux, arch: arm, goarm: "7", naive: true, debian: armhf, rpm: armv7hl, pacman: armv7hl }
+          - { os: linux, arch: mipsle, gomips: softfloat, naive: true, debian: mipsel, rpm: mipsel }
+          - { os: linux, arch: riscv64, naive: true, debian: riscv64, rpm: riscv64 }
+          - { os: linux, arch: loong64, naive: true, debian: loongarch64, rpm: loongarch64 }
           # Non-naive builds (unsupported architectures)
           - { os: linux, arch: arm, goarm: "6", debian: armel, rpm: armv6hl }
           - { os: linux, arch: mips64le, debian: mips64el, rpm: mips64el }
-          - { os: linux, arch: mipsle, debian: mipsel, rpm: mipsel }
           - { os: linux, arch: s390x, debian: s390x, rpm: s390x }
           - { os: linux, arch: ppc64le, debian: ppc64el, rpm: ppc64le }
-          - { os: linux, arch: riscv64, debian: riscv64, rpm: riscv64 }
-          - { os: linux, arch: loong64, debian: loongarch64, rpm: loongarch64 }
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
@@ -74,13 +78,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.25.7
-      - name: Setup Android NDK
-        if: matrix.os == 'android'
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r28
-          local-cache: true
+          go-version: ~1.25.7
       - name: Clone cronet-go
         if: matrix.naive
         run: |
@@ -91,14 +89,23 @@ jobs:
           git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
           git -C ~/cronet-go checkout FETCH_HEAD
           git -C ~/cronet-go submodule update --init --recursive --depth=1
+      - name: Regenerate Debian keyring
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
       - name: Cache Chromium toolchain
         if: matrix.naive
         id: cache-chromium-toolchain
         uses: actions/cache@v4
         with:
           path: |
-            ~/cronet-go/naiveproxy/src/third_party/llvm-build/Release+Asserts
-            ~/cronet-go/naiveproxy/src/out/sysroot-build
+            ~/cronet-go/naiveproxy/src/third_party/llvm-build/
+            ~/cronet-go/naiveproxy/src/gn/out/
+            ~/cronet-go/naiveproxy/src/chrome/build/pgo_profiles/
+            ~/cronet-go/naiveproxy/src/out/sysroot-build/
           key: chromium-toolchain-${{ matrix.arch }}-musl-${{ hashFiles('.github/CRONET_GO_VERSION') }}
       - name: Download Chromium toolchain
         if: matrix.naive
@@ -119,24 +126,30 @@ jobs:
       - name: Set build tags
         run: |
           set -xeuo pipefail
-          TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0'
           if [[ "${{ matrix.naive }}" == "true" ]]; then
-            TAGS="${TAGS},with_naive_outbound,with_musl"
+            TAGS="$(cat release/DEFAULT_BUILD_TAGS),with_musl"
+          else
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           fi
           echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
       - name: Build (naive)
         if: matrix.naive
         run: |
           set -xeuo pipefail
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags '-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0' \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
           ./cmd/sing-box
         env:
           CGO_ENABLED: "1"
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
           GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build (non-naive)
         if: ${{ ! matrix.naive }}
@@ -144,7 +157,7 @@ jobs:
           set -xeuo pipefail
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags '-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0' \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
           ./cmd/sing-box
         env:
           CGO_ENABLED: "0"

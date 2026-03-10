@@ -3,8 +3,11 @@ name: Publish Docker Images
 on:
   #push:
   #  branches:
-  #    - main-next
-  #    - dev-next
+  #    - stable
+  #    - testing
+  release:
+    types:
+      - published
   workflow_dispatch:
     inputs:
       tag:
@@ -16,6 +19,7 @@ env:
 jobs:
   build_binary:
     name: Build binary
+    if: github.event_name != 'release' || github.event.release.target_commitish != 'oldstable'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
@@ -26,10 +30,12 @@ jobs:
           - { arch: arm64, naive: true, docker_platform: "linux/arm64" }
           - { arch: "386", naive: true, docker_platform: "linux/386" }
           - { arch: arm, goarm: "7", naive: true, docker_platform: "linux/arm/v7" }
+          - { arch: mipsle, gomips: softfloat, naive: true, docker_platform: "linux/mipsle" }
+          - { arch: riscv64, naive: true, docker_platform: "linux/riscv64" }
+          - { arch: loong64, naive: true, docker_platform: "linux/loong64" }
           # Non-naive builds
           - { arch: arm, goarm: "6", docker_platform: "linux/arm/v6" }
           - { arch: ppc64le, docker_platform: "linux/ppc64le" }
-          - { arch: riscv64, docker_platform: "linux/riscv64" }
           - { arch: s390x, docker_platform: "linux/s390x" }
     steps:
       - name: Get commit to build
@@ -50,7 +56,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.25.4
+          go-version: ~1.25.7
       - name: Clone cronet-go
         if: matrix.naive
         run: |
@@ -61,14 +67,23 @@ jobs:
           git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
           git -C ~/cronet-go checkout FETCH_HEAD
           git -C ~/cronet-go submodule update --init --recursive --depth=1
+      - name: Regenerate Debian keyring
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
       - name: Cache Chromium toolchain
         if: matrix.naive
         id: cache-chromium-toolchain
         uses: actions/cache@v4
         with:
           path: |
-            ~/cronet-go/naiveproxy/src/third_party/llvm-build/Release+Asserts
-            ~/cronet-go/naiveproxy/src/out/sysroot-build
+            ~/cronet-go/naiveproxy/src/third_party/llvm-build/
+            ~/cronet-go/naiveproxy/src/gn/out/
+            ~/cronet-go/naiveproxy/src/chrome/build/pgo_profiles/
+            ~/cronet-go/naiveproxy/src/out/sysroot-build/
           key: chromium-toolchain-${{ matrix.arch }}-musl-${{ hashFiles('.github/CRONET_GO_VERSION') }}
       - name: Download Chromium toolchain
         if: matrix.naive
@@ -90,29 +105,34 @@ jobs:
       - name: Set build tags
         run: |
           set -xeuo pipefail
-          TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0'
           if [[ "${{ matrix.naive }}" == "true" ]]; then
-            TAGS="${TAGS},with_naive_outbound,with_musl"
+            TAGS="$(cat release/DEFAULT_BUILD_TAGS),with_musl"
+          else
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           fi
           echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
       - name: Build (naive)
         if: matrix.naive
         run: |
           set -xeuo pipefail
           go build -v -trimpath -o sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X \"github.com/sagernet/sing-box/constant.Version=${VERSION}\" -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -s -w -buildid= -checklinkname=0" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
           ./cmd/sing-box
         env:
           CGO_ENABLED: "1"
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
           GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
       - name: Build (non-naive)
         if: ${{ ! matrix.naive }}
         run: |
           set -xeuo pipefail
           go build -v -trimpath -o sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X \"github.com/sagernet/sing-box/constant.Version=${VERSION}\" -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -s -w -buildid= -checklinkname=0" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
           ./cmd/sing-box
         env:
           CGO_ENABLED: "0"
@@ -145,15 +165,17 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        platform:
-          - linux/amd64
-          - linux/arm/v6
-          - linux/arm/v7
-          - linux/arm64
-          - linux/386
-          - linux/ppc64le
-          - linux/riscv64
-          - linux/s390x
+        include:
+          - { platform: "linux/amd64" }
+          - { platform: "linux/arm/v6" }
+          - { platform: "linux/arm/v7" }
+          - { platform: "linux/arm64" }
+          - { platform: "linux/386" }
+          # mipsle: no base Docker image available for this platform
+          - { platform: "linux/ppc64le" }
+          - { platform: "linux/riscv64" }
+          - { platform: "linux/s390x" }
+          - { platform: "linux/loong64", base_image: "ghcr.io/loong64/alpine:edge" }
     steps:
       - name: Get commit to build
         id: ref
@@ -206,6 +228,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           context: .
           file: Dockerfile.binary
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image || 'alpine' }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
@@ -221,6 +245,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
   merge:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     needs:
       - build_docker
