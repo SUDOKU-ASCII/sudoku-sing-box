@@ -159,8 +159,8 @@ func TestSudoku_OfficialInterop(t *testing.T) {
 					runOfficialServerSingBoxOutbound(t, officialBin, aead, combo)
 				})
 				t.Run("official_client-singbox_inbound", func(t *testing.T) {
-					if combo.httpmaskEnabled && combo.httpmaskMultiplex != "on" {
-						t.Skip("upstream sudoku v0.3.3 standalone client does not support early-handshake direct-forward over httpmask without mux; reproduced against official server")
+					if combo.httpmaskEnabled && combo.httpmaskMultiplex == "auto" {
+						t.Skip("upstream sudoku standalone client still flakes on UoT large-data with httpmask.multiplex=auto; direct-forward mux=off was fixed by upstream commit 2e518203")
 					}
 					runOfficialClientSingBoxInbound(t, officialBin, aead, combo)
 				})
