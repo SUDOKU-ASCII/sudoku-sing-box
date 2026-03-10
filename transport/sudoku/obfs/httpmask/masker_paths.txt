@@ -1,0 +1,10 @@
+/api/v1/upload
+/data/sync
+/uploads/raw
+/api/report
+/feed/update
+/v2/events
+/v1/telemetry
+/session
+/stream
+/ws

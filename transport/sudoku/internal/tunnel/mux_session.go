@@ -1,4 +1,23 @@
-package sudoku
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
+package tunnel
 
 import (
 	"encoding/binary"
@@ -6,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -155,6 +175,7 @@ func (s *muxSession) sendFrame(frameType byte, streamID uint32, payload []byte) 
 }
 
 func (s *muxSession) sendReset(streamID uint32, msg string) {
+	// Best-effort: ignore errors (session is probably already failing).
 	if msg == "" {
 		msg = "reset"
 	}
@@ -171,11 +192,12 @@ func (s *muxSession) readLoop() {
 		}
 		frameType := header[0]
 		streamID := binary.BigEndian.Uint32(header[1:5])
-		n := int(binary.BigEndian.Uint32(header[5:9]))
-		if n < 0 || n > muxMaxFrameSize {
-			s.closeWithError(fmt.Errorf("invalid mux frame length: %d", n))
+		payloadLen := binary.BigEndian.Uint32(header[5:9])
+		if payloadLen > muxMaxFrameSize {
+			s.closeWithError(fmt.Errorf("invalid mux frame length: %d", payloadLen))
 			return
 		}
+		n := int(payloadLen)
 
 		var payload []byte
 		if n > 0 {
@@ -202,11 +224,16 @@ func (s *muxSession) readLoop() {
 			}
 			st := newMuxStream(s, streamID)
 			s.registerStream(st)
+			// Avoid blocking the demux loop on dial/IO.
 			go s.onOpen(st, payload)
 
 		case muxFrameData:
 			st := s.getStream(streamID)
-			if st == nil || len(payload) == 0 {
+			if st == nil {
+				// Unknown stream; ignore to avoid killing the whole session.
+				continue
+			}
+			if len(payload) == 0 {
 				continue
 			}
 			st.enqueue(payload)
@@ -224,7 +251,7 @@ func (s *muxSession) readLoop() {
 			if st == nil {
 				continue
 			}
-			msg := stringsTrimASCII(payload)
+			msg := strings.TrimSpace(string(payload))
 			if msg == "" {
 				msg = "reset"
 			}
@@ -247,31 +274,6 @@ func writeFull(w io.Writer, b []byte) error {
 		b = b[n:]
 	}
 	return nil
-}
-
-func stringsTrimASCII(b []byte) string {
-	i := 0
-	j := len(b)
-	for i < j {
-		c := b[i]
-		if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
-			break
-		}
-		i++
-	}
-	for j > i {
-		c := b[j-1]
-		if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
-			break
-		}
-		j--
-	}
-	if i >= j {
-		return ""
-	}
-	out := make([]byte, j-i)
-	copy(out, b[i:j])
-	return string(out)
 }
 
 type muxStream struct {
@@ -298,20 +300,6 @@ func newMuxStream(session *muxSession, id uint32) *muxStream {
 	}
 	st.cond = sync.NewCond(&st.mu)
 	return st
-}
-
-func (c *muxStream) enqueue(payload []byte) {
-	if len(payload) == 0 {
-		return
-	}
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return
-	}
-	c.queue = append(c.queue, payload)
-	c.cond.Signal()
-	c.mu.Unlock()
 }
 
 func (c *muxStream) closeNoSend(err error) {
@@ -415,6 +403,9 @@ func (c *muxStream) Close() error {
 	return nil
 }
 
+func (c *muxStream) CloseWrite() error { return c.Close() }
+func (c *muxStream) CloseRead() error  { return c.Close() }
+
 func (c *muxStream) LocalAddr() net.Addr  { return c.localAddr }
 func (c *muxStream) RemoteAddr() net.Addr { return c.remoteAddr }
 
@@ -426,3 +417,17 @@ func (c *muxStream) SetDeadline(t time.Time) error {
 func (c *muxStream) SetReadDeadline(time.Time) error  { return nil }
 func (c *muxStream) SetWriteDeadline(time.Time) error { return nil }
 
+func (c *muxStream) enqueue(payload []byte) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if len(c.readBuf) == 0 && len(c.queue) == 0 {
+		c.readBuf = payload
+	} else {
+		c.queue = append(c.queue, payload)
+	}
+	c.cond.Signal()
+	c.mu.Unlock()
+}

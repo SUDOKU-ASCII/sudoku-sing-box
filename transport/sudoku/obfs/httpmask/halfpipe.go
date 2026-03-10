@@ -1,3 +1,22 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
 package httpmask
 
 import (
@@ -110,9 +129,9 @@ func newHalfPipe() (net.Conn, net.Conn) {
 		wrTx: cb2,
 		wrRx: cn2,
 
-		localReadDone:  r1,
-		localWriteDone: w1,
-		remoteReadDone: r2,
+		localReadDone:   r1,
+		localWriteDone:  w1,
+		remoteReadDone:  r2,
 		remoteWriteDone: w2,
 
 		readDeadline:  makePipeDeadline(),
@@ -124,9 +143,9 @@ func newHalfPipe() (net.Conn, net.Conn) {
 		wrTx: cb1,
 		wrRx: cn1,
 
-		localReadDone:  r2,
-		localWriteDone: w2,
-		remoteReadDone: r1,
+		localReadDone:   r2,
+		localWriteDone:  w2,
+		remoteReadDone:  r1,
 		remoteWriteDone: w1,
 
 		readDeadline:  makePipeDeadline(),
@@ -227,4 +246,3 @@ func (c *halfPipeConn) SetWriteDeadline(t time.Time) error {
 	c.writeDeadline.set(t)
 	return nil
 }
-

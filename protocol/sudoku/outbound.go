@@ -2,7 +2,6 @@ package sudoku
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -27,13 +26,10 @@ func RegisterOutbound(registry *outbound.Registry) {
 
 type Outbound struct {
 	outbound.Adapter
-	ctx              context.Context
-	dialer           N.Dialer
-	server           M.Socksaddr
-	baseConf         sudokut.ProtocolConfig
-	httpMaskPool     *sudokut.HTTPMaskTransportPool
-	muxClient        *sudokut.MuxClient
-	httpMaskStrategy string
+	dialer       N.Dialer
+	baseConf     sudokut.ProtocolConfig
+	httpMaskPool *sudokut.HTTPMaskTransportPool
+	muxClient    *sudokut.MuxClient
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SudokuOutboundOptions) (adapter.Outbound, error) {
@@ -53,32 +49,33 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 
 	defaultConf := sudokut.DefaultConfig()
-
 	tableType := resolveTableType(options.ASCII)
 	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
 	enablePureDownlink := resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink)
 
-	serverAddress := net.JoinHostPort(options.Server, strconv.Itoa(int(options.ServerPort)))
+	httpMaskMode := defaultConf.HTTPMaskMode
+	if options.HTTPMaskMode != "" {
+		httpMaskMode = options.HTTPMaskMode
+	} else if strings.EqualFold(strings.TrimSpace(options.HTTPMaskStrategy), "websocket") {
+		httpMaskMode = "ws"
+	}
+
 	baseConf := sudokut.ProtocolConfig{
-		ServerAddress:           serverAddress,
-		Key:                     options.Key,
-		AEADMethod:              defaultConf.AEADMethod,
-		PaddingMin:              paddingMin,
-		PaddingMax:              paddingMax,
-		EnablePureDownlink:      enablePureDownlink,
-		HandshakeTimeoutSeconds: defaultConf.HandshakeTimeoutSeconds,
-		DisableHTTPMask:         options.DisableHTTPMask,
-		HTTPMaskMode:            defaultConf.HTTPMaskMode,
-		HTTPMaskTLSEnabled:      options.HTTPMaskTLS,
-		HTTPMaskMultiplex:       defaultConf.HTTPMaskMultiplex,
-		HTTPMaskHost:            options.HTTPMaskHost,
-		HTTPMaskPathRoot:        options.HTTPMaskPathRoot,
+		ServerAddress:      net.JoinHostPort(options.Server, strconv.Itoa(int(options.ServerPort))),
+		Key:                options.Key,
+		AEADMethod:         defaultConf.AEADMethod,
+		PaddingMin:         paddingMin,
+		PaddingMax:         paddingMax,
+		EnablePureDownlink: enablePureDownlink,
+		DisableHTTPMask:    options.DisableHTTPMask,
+		HTTPMaskMode:       httpMaskMode,
+		HTTPMaskTLSEnabled: options.HTTPMaskTLS,
+		HTTPMaskMultiplex:  defaultConf.HTTPMaskMultiplex,
+		HTTPMaskHost:       options.HTTPMaskHost,
+		HTTPMaskPathRoot:   options.HTTPMaskPathRoot,
 	}
 	if options.AEADMethod != "" {
 		baseConf.AEADMethod = options.AEADMethod
-	}
-	if options.HTTPMaskMode != "" {
-		baseConf.HTTPMaskMode = options.HTTPMaskMode
 	}
 	if options.HTTPMaskMultiplex != "" {
 		baseConf.HTTPMaskMultiplex = options.HTTPMaskMultiplex
@@ -95,22 +92,28 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 
 	out := &Outbound{
-		Adapter:          outbound.NewAdapterWithDialerOptions(C.TypeSudoku, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
-		ctx:              ctx,
-		dialer:           outboundDialer,
-		server:           options.ServerOptions.Build(),
-		baseConf:         baseConf,
-		httpMaskPool:     new(sudokut.HTTPMaskTransportPool),
-		httpMaskStrategy: options.HTTPMaskStrategy,
+		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeSudoku, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		dialer:       outboundDialer,
+		baseConf:     baseConf,
+		httpMaskPool: new(sudokut.HTTPMaskTransportPool),
 	}
+	out.baseConf.DialContext = out.dialContext
+	out.baseConf.HTTPMaskTransportPool = out.httpMaskPool
 
-	httpMaskMode := strings.ToLower(strings.TrimSpace(out.baseConf.HTTPMaskMode))
-	httpMaskMux := strings.ToLower(strings.TrimSpace(out.baseConf.HTTPMaskMultiplex))
-	if !out.baseConf.DisableHTTPMask && (httpMaskMode == "stream" || httpMaskMode == "poll" || httpMaskMode == "auto") && httpMaskMux == "on" {
-		out.muxClient = sudokut.NewMuxClient(out.dialBaseForMux)
+	mode := strings.ToLower(strings.TrimSpace(out.baseConf.HTTPMaskMode))
+	muxMode := strings.ToLower(strings.TrimSpace(out.baseConf.HTTPMaskMultiplex))
+	if !out.baseConf.DisableHTTPMask && (mode == "stream" || mode == "poll" || mode == "auto" || mode == "ws") && muxMode == "on" {
+		out.muxClient, err = sudokut.NewMuxClient(&out.baseConf)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return out, nil
+}
+
+func (h *Outbound) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return h.dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
 }
 
 func (h *Outbound) Close() error {
@@ -125,7 +128,12 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		metadata.Network = N.NetworkTCP
-		return h.dialTCP(ctx, destination)
+		if h.muxClient != nil {
+			return h.muxClient.Dial(ctx, destination.String())
+		}
+		cfg := h.baseConf
+		cfg.TargetAddress = destination.String()
+		return sudokut.Dial(ctx, &cfg)
 	case N.NetworkUDP:
 		return nil, E.New("UDP dial is not supported, use listen_packet instead")
 	default:
@@ -138,175 +146,11 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	metadata.Network = N.NetworkUDP
-	return h.dialUoT(ctx)
-}
-
-func (h *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	if h.muxClient != nil {
-		return h.muxClient.Dial(ctx, destination.String())
-	}
 
 	cfg := h.baseConf
-	cfg.TargetAddress = destination.String()
-	if err := cfg.ValidateClient(); err != nil {
-		return nil, err
-	}
-
-	dialFn := func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-		return h.dialer.DialContext(dialCtx, network, M.ParseSocksaddr(addr))
-	}
-
-	var (
-		rawConn net.Conn
-		err     error
-	)
-	if !cfg.DisableHTTPMask {
-		switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
-		case "stream", "poll", "auto":
-			rawConn, err = sudokut.DialHTTPMaskTunnel(ctx, cfg.ServerAddress, &cfg, sudokut.HTTPMaskTunnelDialOptions{
-				Dial:          dialFn,
-				TransportPool: h.httpMaskPool,
-			})
-		}
-	}
-	if rawConn == nil && err == nil {
-		rawConn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.server)
-	}
+	conn, err := sudokut.DialUDPOverTCP(ctx, &cfg)
 	if err != nil {
 		return nil, err
 	}
-
-	success := false
-	defer func() {
-		if !success {
-			common.Close(rawConn)
-		}
-	}()
-
-	handshakeCfg := cfg
-	if !handshakeCfg.DisableHTTPMask {
-		switch strings.ToLower(strings.TrimSpace(handshakeCfg.HTTPMaskMode)) {
-		case "stream", "poll", "auto":
-			handshakeCfg.DisableHTTPMask = true
-		}
-	}
-	c, err := sudokut.ClientHandshakeWithOptions(rawConn, &handshakeCfg, sudokut.ClientHandshakeOptions{HTTPMaskStrategy: h.httpMaskStrategy})
-	if err != nil {
-		return nil, err
-	}
-
-	addrBuf, err := sudokut.EncodeAddress(cfg.TargetAddress)
-	if err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("encode target address failed: %w", err)
-	}
-	if _, err := c.Write(addrBuf); err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("send target address failed: %w", err)
-	}
-
-	success = true
-	return c, nil
-}
-
-func (h *Outbound) dialUoT(ctx context.Context) (net.PacketConn, error) {
-	cfg := h.baseConf
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-
-	dialFn := func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-		return h.dialer.DialContext(dialCtx, network, M.ParseSocksaddr(addr))
-	}
-
-	var (
-		rawConn net.Conn
-		err     error
-	)
-	if !cfg.DisableHTTPMask {
-		switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
-		case "stream", "poll", "auto":
-			rawConn, err = sudokut.DialHTTPMaskTunnel(ctx, cfg.ServerAddress, &cfg, sudokut.HTTPMaskTunnelDialOptions{
-				Dial:          dialFn,
-				TransportPool: h.httpMaskPool,
-			})
-		}
-	}
-	if rawConn == nil && err == nil {
-		rawConn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.server)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			common.Close(rawConn)
-		}
-	}()
-
-	handshakeCfg := cfg
-	if !handshakeCfg.DisableHTTPMask {
-		switch strings.ToLower(strings.TrimSpace(handshakeCfg.HTTPMaskMode)) {
-		case "stream", "poll", "auto":
-			handshakeCfg.DisableHTTPMask = true
-		}
-	}
-	c, err := sudokut.ClientHandshakeWithOptions(rawConn, &handshakeCfg, sudokut.ClientHandshakeOptions{HTTPMaskStrategy: h.httpMaskStrategy})
-	if err != nil {
-		return nil, err
-	}
-
-	if err := sudokut.WritePreface(c); err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("send uot preface failed: %w", err)
-	}
-
-	success = true
-	return sudokut.NewUoTPacketConn(c), nil
-}
-
-func (h *Outbound) dialBaseForMux(ctx context.Context) (net.Conn, error) {
-	cfg := h.baseConf
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	if cfg.DisableHTTPMask {
-		return nil, E.New("mux requires disable_http_mask=false")
-	}
-	switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
-	case "stream", "poll", "auto":
-	default:
-		return nil, E.New("mux requires http_mask_mode=stream/poll/auto (got ", cfg.HTTPMaskMode, ")")
-	}
-
-	dialFn := func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-		return h.dialer.DialContext(dialCtx, network, M.ParseSocksaddr(addr))
-	}
-
-	rawConn, err := sudokut.DialHTTPMaskTunnel(ctx, cfg.ServerAddress, &cfg, sudokut.HTTPMaskTunnelDialOptions{
-		Dial:          dialFn,
-		TransportPool: h.httpMaskPool,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			common.Close(rawConn)
-		}
-	}()
-
-	handshakeCfg := cfg
-	handshakeCfg.DisableHTTPMask = true
-	c, err := sudokut.ClientHandshakeWithOptions(rawConn, &handshakeCfg, sudokut.ClientHandshakeOptions{HTTPMaskStrategy: h.httpMaskStrategy})
-	if err != nil {
-		return nil, err
-	}
-
-	success = true
-	return c, nil
+	return sudokut.NewUoTPacketConn(conn), nil
 }

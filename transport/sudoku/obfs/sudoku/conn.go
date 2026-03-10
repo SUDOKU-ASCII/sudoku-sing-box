@@ -1,3 +1,22 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
 package sudoku
 
 import (
@@ -6,6 +25,8 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+
+	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 )
 
 const IOBufferSize = 32 * 1024
@@ -45,32 +66,41 @@ type Conn struct {
 	recording  bool
 	recordLock sync.Mutex
 
-	writeMu sync.Mutex
-
 	rawBuf      []byte
 	pendingData []byte
 	hintBuf     []byte
 
 	rng              *rand.Rand
 	paddingThreshold uint64
+}
 
-	writeBuf []byte
+func (sc *Conn) CloseWrite() error {
+	if sc == nil {
+		return nil
+	}
+	return connutil.TryCloseWrite(sc.Conn)
+}
+
+func (sc *Conn) CloseRead() error {
+	if sc == nil {
+		return nil
+	}
+	return connutil.TryCloseRead(sc.Conn)
 }
 
 func NewConn(c net.Conn, table *Table, pMin, pMax int, record bool) *Conn {
 	localRng := newSeededRand()
 
 	sc := &Conn{
-		Conn:        c,
-		table:       table,
-		reader:      bufio.NewReaderSize(c, IOBufferSize),
-		rawBuf:      make([]byte, IOBufferSize),
-		pendingData: make([]byte, 0, 4096),
-		hintBuf:     make([]byte, 0, 4),
-		rng:         localRng,
-		writeBuf:    make([]byte, 0, 4096),
+		Conn:             c,
+		table:            table,
+		reader:           bufio.NewReaderSize(c, IOBufferSize),
+		rawBuf:           make([]byte, IOBufferSize),
+		pendingData:      make([]byte, 0, 4096),
+		hintBuf:          make([]byte, 0, 4),
+		rng:              localRng,
+		paddingThreshold: pickPaddingThreshold(localRng, pMin, pMax),
 	}
-	sc.paddingThreshold = pickPaddingThreshold(localRng, pMin, pMax)
 	if record {
 		sc.recorder = new(bytes.Buffer)
 		sc.recording = true
@@ -78,49 +108,29 @@ func NewConn(c net.Conn, table *Table, pMin, pMax int, record bool) *Conn {
 	return sc
 }
 
-func (sc *Conn) CloseWrite() error {
+func (sc *Conn) StopRecording() {
+	sc.recordLock.Lock()
+	sc.recording = false
+	sc.recorder = nil
+	sc.recordLock.Unlock()
+}
+
+func (sc *Conn) GetBufferedAndRecorded() []byte {
 	if sc == nil {
 		return nil
 	}
-	if cw, ok := sc.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return nil
-}
 
-func (sc *Conn) CloseRead() error {
-	if sc == nil {
-		return nil
-	}
-	if cr, ok := sc.Conn.(interface{ CloseRead() error }); ok {
-		return cr.CloseRead()
-	}
-	return nil
-}
-
-func (c *Conn) StopRecording() {
-	c.recordLock.Lock()
-	c.recording = false
-	c.recorder = nil
-	c.recordLock.Unlock()
-}
-
-func (c *Conn) GetBufferedAndRecorded() []byte {
-	if c == nil {
-		return nil
-	}
-
-	c.recordLock.Lock()
-	defer c.recordLock.Unlock()
+	sc.recordLock.Lock()
+	defer sc.recordLock.Unlock()
 
 	var recorded []byte
-	if c.recorder != nil {
-		recorded = c.recorder.Bytes()
+	if sc.recorder != nil {
+		recorded = sc.recorder.Bytes()
 	}
 
-	buffered := c.reader.Buffered()
+	buffered := sc.reader.Buffered()
 	if buffered > 0 {
-		peeked, _ := c.reader.Peek(buffered)
+		peeked, _ := sc.reader.Peek(buffered)
 		full := make([]byte, len(recorded)+len(peeked))
 		copy(full, recorded)
 		copy(full[len(recorded):], peeked)
@@ -129,81 +139,73 @@ func (c *Conn) GetBufferedAndRecorded() []byte {
 	return recorded
 }
 
-func (c *Conn) Write(p []byte) (int, error) {
+func (sc *Conn) Write(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	needed := len(p)*10 + 1
-	if cap(c.writeBuf) < needed {
-		c.writeBuf = make([]byte, 0, needed)
-	}
-	out := c.writeBuf[:0]
-	pads := c.table.PaddingPool
+	outCapacity := len(p) * 6
+	out := make([]byte, 0, outCapacity)
+	pads := sc.table.PaddingPool
 	padLen := len(pads)
 
 	for _, b := range p {
-		if padLen > 0 && shouldPad(c.rng, c.paddingThreshold) {
-			out = append(out, pads[c.rng.Intn(padLen)])
+		if shouldPad(sc.rng, sc.paddingThreshold) {
+			out = append(out, pads[sc.rng.Intn(padLen)])
 		}
 
-		puzzles := c.table.EncodeTable[b]
-		puzzle := puzzles[c.rng.Intn(len(puzzles))]
+		puzzles := sc.table.EncodeTable[b]
+		puzzle := puzzles[sc.rng.Intn(len(puzzles))]
 
-		perm := perm4[c.rng.Intn(len(perm4))]
+		perm := perm4[sc.rng.Intn(len(perm4))]
 		for _, idx := range perm {
-			if padLen > 0 && shouldPad(c.rng, c.paddingThreshold) {
-				out = append(out, pads[c.rng.Intn(padLen)])
+			if shouldPad(sc.rng, sc.paddingThreshold) {
+				out = append(out, pads[sc.rng.Intn(padLen)])
 			}
 			out = append(out, puzzle[idx])
 		}
 	}
 
-	if padLen > 0 && shouldPad(c.rng, c.paddingThreshold) {
-		out = append(out, pads[c.rng.Intn(padLen)])
+	if shouldPad(sc.rng, sc.paddingThreshold) {
+		out = append(out, pads[sc.rng.Intn(padLen)])
 	}
 
-	c.writeBuf = out[:0]
-	_, err := c.Conn.Write(out)
-	return len(p), err
+	return len(p), connutil.WriteFull(sc.Conn, out)
 }
 
-func (c *Conn) Read(p []byte) (int, error) {
-	if n, ok := drainPending(p, &c.pendingData); ok {
+func (sc *Conn) Read(p []byte) (n int, err error) {
+	if n, ok := drainPending(p, &sc.pendingData); ok {
 		return n, nil
 	}
 
 	for {
-		if len(c.pendingData) > 0 {
+		if len(sc.pendingData) > 0 {
 			break
 		}
 
-		nr, rErr := c.reader.Read(c.rawBuf)
+		nr, rErr := sc.reader.Read(sc.rawBuf)
 		if nr > 0 {
-			chunk := c.rawBuf[:nr]
-			c.recordLock.Lock()
-			if c.recording {
-				c.recorder.Write(chunk)
+			chunk := sc.rawBuf[:nr]
+			sc.recordLock.Lock()
+			if sc.recording {
+				sc.recorder.Write(chunk)
 			}
-			c.recordLock.Unlock()
+			sc.recordLock.Unlock()
 
 			for _, b := range chunk {
-				if !c.table.layout.isHint(b) {
+				if !sc.table.layout.isHint(b) {
 					continue
 				}
 
-				c.hintBuf = append(c.hintBuf, b)
-				if len(c.hintBuf) == 4 {
-					key := packHintsToKey([4]byte{c.hintBuf[0], c.hintBuf[1], c.hintBuf[2], c.hintBuf[3]})
-					val, ok := c.table.DecodeMap[key]
+				sc.hintBuf = append(sc.hintBuf, b)
+				if len(sc.hintBuf) == 4 {
+					key := packHintsToKey([4]byte{sc.hintBuf[0], sc.hintBuf[1], sc.hintBuf[2], sc.hintBuf[3]})
+					val, ok := sc.table.DecodeMap[key]
 					if !ok {
 						return 0, ErrInvalidSudokuMapMiss
 					}
-					c.pendingData = append(c.pendingData, val)
-					c.hintBuf = c.hintBuf[:0]
+					sc.pendingData = append(sc.pendingData, val)
+					sc.hintBuf = sc.hintBuf[:0]
 				}
 			}
 		}
@@ -211,11 +213,11 @@ func (c *Conn) Read(p []byte) (int, error) {
 		if rErr != nil {
 			return 0, rErr
 		}
-		if len(c.pendingData) > 0 {
+		if len(sc.pendingData) > 0 {
 			break
 		}
 	}
 
-	n, _ := drainPending(p, &c.pendingData)
+	n, _ = drainPending(p, &sc.pendingData)
 	return n, nil
 }

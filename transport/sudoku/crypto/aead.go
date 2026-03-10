@@ -1,3 +1,22 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
 package crypto
 
 import (
@@ -12,6 +31,8 @@ import (
 	"io"
 	"net"
 
+	"github.com/sagernet/sing-box/transport/sudoku/connutil"
+
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -22,18 +43,32 @@ type AEADConn struct {
 	nonceSize int
 }
 
+func (cc *AEADConn) CloseWrite() error {
+	if cc == nil {
+		return nil
+	}
+	return connutil.TryCloseWrite(cc.Conn)
+}
+
+func (cc *AEADConn) CloseRead() error {
+	if cc == nil {
+		return nil
+	}
+	return connutil.TryCloseRead(cc.Conn)
+}
+
 func NewAEADConn(c net.Conn, key string, method string) (*AEADConn, error) {
 	if method == "none" {
 		return &AEADConn{Conn: c, aead: nil}, nil
 	}
 
-	hash := sha256.Sum256([]byte(key))
-	keyBytes := hash[:]
+	h := sha256.New()
+	h.Write([]byte(key))
+	keyBytes := h.Sum(nil)
 
-	var (
-		aead cipher.AEAD
-		err  error
-	)
+	var aead cipher.AEAD
+	var err error
+
 	switch method {
 	case "aes-128-gcm":
 		block, _ := aes.NewCipher(keyBytes[:16])
@@ -54,17 +89,16 @@ func NewAEADConn(c net.Conn, key string, method string) (*AEADConn, error) {
 	}, nil
 }
 
-func (c *AEADConn) Write(p []byte) (int, error) {
-	if c.aead == nil {
-		return c.Conn.Write(p)
+func (cc *AEADConn) Write(p []byte) (int, error) {
+	if cc.aead == nil {
+		return cc.Conn.Write(p)
 	}
 
-	// 2-byte length prefix (uint16), then nonce+ciphertext.
-	maxPayload := 65535 - c.nonceSize - c.aead.Overhead()
+	maxPayload := 65535 - cc.nonceSize - cc.aead.Overhead()
 	totalWritten := 0
 	var frameBuf bytes.Buffer
 	header := make([]byte, 2)
-	nonce := make([]byte, c.nonceSize)
+	nonce := make([]byte, cc.nonceSize)
 
 	for len(p) > 0 {
 		chunkSize := len(p)
@@ -78,7 +112,7 @@ func (c *AEADConn) Write(p []byte) (int, error) {
 			return totalWritten, err
 		}
 
-		ciphertext := c.aead.Seal(nil, nonce, chunk, nil)
+		ciphertext := cc.aead.Seal(nil, nonce, chunk, nil)
 		frameLen := len(nonce) + len(ciphertext)
 		binary.BigEndian.PutUint16(header, uint16(frameLen))
 
@@ -87,7 +121,7 @@ func (c *AEADConn) Write(p []byte) (int, error) {
 		frameBuf.Write(nonce)
 		frameBuf.Write(ciphertext)
 
-		if _, err := c.Conn.Write(frameBuf.Bytes()); err != nil {
+		if err := connutil.WriteFull(cc.Conn, frameBuf.Bytes()); err != nil {
 			return totalWritten, err
 		}
 		totalWritten += chunkSize
@@ -95,38 +129,37 @@ func (c *AEADConn) Write(p []byte) (int, error) {
 	return totalWritten, nil
 }
 
-func (c *AEADConn) Read(p []byte) (int, error) {
-	if c.aead == nil {
-		return c.Conn.Read(p)
+func (cc *AEADConn) Read(p []byte) (int, error) {
+	if cc.aead == nil {
+		return cc.Conn.Read(p)
 	}
 
-	if c.readBuf.Len() > 0 {
-		return c.readBuf.Read(p)
+	if cc.readBuf.Len() > 0 {
+		return cc.readBuf.Read(p)
 	}
 
 	header := make([]byte, 2)
-	if _, err := io.ReadFull(c.Conn, header); err != nil {
+	if _, err := io.ReadFull(cc.Conn, header); err != nil {
 		return 0, err
 	}
 	frameLen := int(binary.BigEndian.Uint16(header))
 
 	body := make([]byte, frameLen)
-	if _, err := io.ReadFull(c.Conn, body); err != nil {
+	if _, err := io.ReadFull(cc.Conn, body); err != nil {
 		return 0, err
 	}
 
-	if len(body) < c.nonceSize {
+	if len(body) < cc.nonceSize {
 		return 0, errors.New("frame too short")
 	}
-	nonce := body[:c.nonceSize]
-	ciphertext := body[c.nonceSize:]
+	nonce := body[:cc.nonceSize]
+	ciphertext := body[cc.nonceSize:]
 
-	plaintext, err := c.aead.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := cc.aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return 0, errors.New("decryption failed")
 	}
 
-	c.readBuf.Write(plaintext)
-	return c.readBuf.Read(p)
+	cc.readBuf.Write(plaintext)
+	return cc.readBuf.Read(p)
 }
-

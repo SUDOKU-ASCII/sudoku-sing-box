@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -47,14 +46,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 
 	defaultConf := sudokut.DefaultConfig()
-
 	tableType := resolveTableType(options.ASCII)
 	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
 	enablePureDownlink := resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink)
 
-	handshakeTimeout := defaultConf.HandshakeTimeoutSeconds
-	if options.HandshakeTimeout > 0 {
-		handshakeTimeout = options.HandshakeTimeout
+	httpMaskMode := defaultConf.HTTPMaskMode
+	if options.HTTPMaskMode != "" {
+		httpMaskMode = options.HTTPMaskMode
 	}
 
 	protoConf := sudokut.ProtocolConfig{
@@ -63,22 +61,22 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		PaddingMin:              paddingMin,
 		PaddingMax:              paddingMax,
 		EnablePureDownlink:      enablePureDownlink,
-		HandshakeTimeoutSeconds: handshakeTimeout,
+		HandshakeTimeoutSeconds: defaultConf.HandshakeTimeoutSeconds,
 		SuspiciousAction:        defaultConf.SuspiciousAction,
 		FallbackAddress:         options.FallbackAddress,
 		DisableHTTPMask:         options.DisableHTTPMask,
-		HTTPMaskMode:            defaultConf.HTTPMaskMode,
+		HTTPMaskMode:            httpMaskMode,
 		HTTPMaskMultiplex:       defaultConf.HTTPMaskMultiplex,
 		HTTPMaskPathRoot:        options.HTTPMaskPathRoot,
 	}
 	if options.AEADMethod != "" {
 		protoConf.AEADMethod = options.AEADMethod
 	}
+	if options.HandshakeTimeout > 0 {
+		protoConf.HandshakeTimeoutSeconds = options.HandshakeTimeout
+	}
 	if options.SuspiciousAction != "" {
 		protoConf.SuspiciousAction = options.SuspiciousAction
-	}
-	if options.HTTPMaskMode != "" {
-		protoConf.HTTPMaskMode = options.HTTPMaskMode
 	}
 	if options.HTTPMaskMultiplex != "" {
 		protoConf.HTTPMaskMultiplex = options.HTTPMaskMultiplex
@@ -100,8 +98,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		router:    router,
 		logger:    logger,
 		protoConf: protoConf,
+		tunnelSrv: sudokut.NewHTTPMaskTunnelServer(&protoConf),
 	}
-	in.tunnelSrv = sudokut.NewHTTPMaskTunnelServer(&in.protoConf)
 	in.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -120,96 +118,71 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Inbound) Close() error {
-	return common.Close(
-		h.listener,
-		common.PtrOrNil(h.tunnelSrv),
-	)
+	return common.Close(h.listener, common.PtrOrNil(h.tunnelSrv))
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	handshakeConn := conn
-	handshakeCfg := &h.protoConf
-	allowFallback := true
-	if h.tunnelSrv != nil {
-		c, cfg, allow, done, err := h.tunnelSrv.WrapConn(conn)
-		if err != nil {
-			N.CloseOnHandshakeFailure(conn, onClose, err)
-			h.logger.ErrorContext(ctx, E.Cause(err, "wrap http tunnel from ", metadata.Source))
-			return
-		}
-		if done {
-			return
-		}
-		allowFallback = allow
-		if c != nil {
-			handshakeConn = c
-		}
-		if cfg != nil {
-			handshakeCfg = cfg
-		}
-	}
-
-	if allowFallback {
-		if r, ok := handshakeConn.(interface{ IsHTTPMaskRejected() bool }); ok && r.IsHTTPMaskRejected() {
-			h.handleSuspicious(ctx, handshakeConn, conn, handshakeCfg, metadata.Source, onClose)
-			return
-		}
-	}
-
-	session, err := sudokut.ServerHandshake(handshakeConn, handshakeCfg)
+	sessionConn, session, targetAddr, userHash, payload, handled, err := h.tunnelSrv.HandleConnSessionAutoWithUserHash(conn)
 	if err != nil {
 		var suspErr *sudokut.SuspiciousError
-		if allowFallback && errors.As(err, &suspErr) {
-			h.handleSuspicious(ctx, suspErr.Conn, conn, handshakeCfg, metadata.Source, onClose)
+		if errors.As(err, &suspErr) {
+			h.handleSuspicious(ctx, suspErr, &h.protoConf, metadata.Source, onClose)
 			return
 		}
-		N.CloseOnHandshakeFailure(handshakeConn, onClose, err)
-		if handshakeConn != conn {
-			common.Close(conn)
-		}
+		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+		return
+	}
+	if !handled || sessionConn == nil {
 		return
 	}
 
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
 
-	switch session.Type {
-	case sudokut.SessionTypeUoT:
+	if userHash != "" {
+		h.logger.DebugContext(ctx, "sudoku user=", userHash)
+	}
+
+	switch session {
+	case sudokut.SessionUoT:
 		h.logger.InfoContext(ctx, "inbound Sudoku UoT session from ", metadata.Source)
 		metadata.Destination = M.Socksaddr{}
-		packetConn := bufio.NewPacketConn(sudokut.NewUoTPacketConn(session.Conn))
+		packetConn := bufio.NewPacketConn(sudokut.NewUoTPacketConn(sessionConn))
 		h.router.RoutePacketConnectionEx(ctx, packetConn, metadata, onClose)
-	case sudokut.SessionTypeMux:
+	case sudokut.SessionMux:
 		h.logger.InfoContext(ctx, "inbound Sudoku mux session from ", metadata.Source)
-		err = sudokut.HandleMuxServer(session.Conn, func(stream net.Conn, targetAddr string) {
+		err = sudokut.HandleMuxServer(sessionConn, func(stream net.Conn, target string) {
 			streamCtx := log.ContextWithNewID(ctx)
-			target := M.ParseSocksaddr(targetAddr)
-			if !target.IsValid() {
+			targetAddr := M.ParseSocksaddr(target)
+			if !targetAddr.IsValid() {
 				_ = stream.Close()
 				return
 			}
 			streamMetadata := metadata
-			streamMetadata.Destination = target
+			streamMetadata.Destination = targetAddr
 			h.logger.InfoContext(streamCtx, "inbound connection to ", streamMetadata.Destination)
 			h.router.RouteConnectionEx(streamCtx, stream, streamMetadata, nil)
 		})
 		if err != nil {
 			h.logger.ErrorContext(ctx, E.Cause(err, "process mux session from ", metadata.Source))
 		}
-	default:
-		target := M.ParseSocksaddr(session.Target)
+	case sudokut.SessionForward:
+		target := M.ParseSocksaddr(targetAddr)
 		if !target.IsValid() {
-			N.CloseOnHandshakeFailure(session.Conn, onClose, E.New("invalid target: ", session.Target))
+			N.CloseOnHandshakeFailure(sessionConn, onClose, E.New("invalid target: ", targetAddr))
 			return
 		}
 		metadata.Destination = target
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
-		h.router.RouteConnectionEx(ctx, session.Conn, metadata, onClose)
+		h.router.RouteConnectionEx(ctx, sessionConn, metadata, onClose)
+	default:
+		_ = sessionConn.Close()
+		h.logger.WarnContext(ctx, "unsupported Sudoku session from ", metadata.Source, ", payload=", len(payload))
 	}
 }
 
-func (h *Inbound) handleSuspicious(ctx context.Context, wrapper net.Conn, rawConn net.Conn, cfg *sudokut.ProtocolConfig, source M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (h *Inbound) handleSuspicious(ctx context.Context, suspErr *sudokut.SuspiciousError, cfg *sudokut.ProtocolConfig, source M.Socksaddr, onClose N.CloseHandlerFunc) {
 	defer func() {
 		if onClose != nil {
 			onClose(nil)
@@ -221,6 +194,7 @@ func (h *Inbound) handleSuspicious(ctx context.Context, wrapper net.Conn, rawCon
 		action = "fallback"
 	}
 
+	rawConn := suspErr.Conn
 	switch action {
 	case "silent":
 		h.logger.WarnContext(ctx, "suspicious connection from ", source, ", silent")
@@ -229,7 +203,6 @@ func (h *Inbound) handleSuspicious(ctx context.Context, wrapper net.Conn, rawCon
 		time.Sleep(5 * time.Second)
 		common.Close(rawConn)
 		return
-
 	case "fallback":
 		fallbackAddr := strings.TrimSpace(cfg.FallbackAddress)
 		if fallbackAddr == "" {
@@ -246,54 +219,28 @@ func (h *Inbound) handleSuspicious(ctx context.Context, wrapper net.Conn, rawCon
 			return
 		}
 
-		var badData []byte
-		if recorder, ok := wrapper.(interface{ GetBufferedAndRecorded() []byte }); ok {
-			badData = recorder.GetBufferedAndRecorded()
-		}
-		if len(badData) > 0 {
-			_ = dst.SetWriteDeadline(time.Now().Add(3 * time.Second))
-			if err := writeFullConn(dst, badData); err != nil {
-				h.logger.ErrorContext(ctx, E.Cause(err, "write fallback prelude"))
-				common.Close(dst, rawConn)
-				return
+		if recorder, ok := rawConn.(interface{ GetBufferedAndRecorded() []byte }); ok {
+			if badData := recorder.GetBufferedAndRecorded(); len(badData) > 0 {
+				_ = dst.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if _, err := dst.Write(badData); err != nil {
+					h.logger.ErrorContext(ctx, E.Cause(err, "write fallback prelude"))
+					common.Close(dst, rawConn)
+					return
+				}
+				_ = dst.SetWriteDeadline(time.Time{})
 			}
-			_ = dst.SetWriteDeadline(time.Time{})
 		}
 
-		var wg sync.WaitGroup
-		wg.Add(2)
 		go func() {
-			defer wg.Done()
-			defer common.Close(dst)
 			_, _ = io.Copy(dst, rawConn)
+			_ = dst.(*net.TCPConn).CloseWrite()
 		}()
 		go func() {
-			defer wg.Done()
-			defer common.Close(rawConn)
 			_, _ = io.Copy(rawConn, dst)
+			_ = rawConn.(*net.TCPConn).CloseWrite()
 		}()
-		wg.Wait()
 		return
-
 	default:
-		h.logger.WarnContext(ctx, "suspicious connection from ", source, ", unknown action: ", cfg.SuspiciousAction)
 		common.Close(rawConn)
-		return
 	}
-}
-
-func writeFullConn(conn net.Conn, data []byte) error {
-	for len(data) > 0 {
-		n, err := conn.Write(data)
-		if n > 0 {
-			data = data[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
 }

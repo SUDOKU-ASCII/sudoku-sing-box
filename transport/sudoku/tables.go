@@ -2,79 +2,45 @@ package sudoku
 
 import (
 	"strings"
-	"sync"
 
-	"github.com/sagernet/sing-box/transport/sudoku/crypto"
-	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
+	sudokuc "github.com/sagernet/sing-box/transport/sudoku/crypto"
+	obfssudoku "github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
-type tableCacheKey struct {
-	key     string
-	mode    string
-	pattern string
+func ClientAEADSeed(key string) string {
+	return clientTableSeed(key)
 }
 
-var tableCache sync.Map
-
-func cachedTable(key string, mode string, customPattern string) (*sudoku.Table, error) {
-	cacheKey := tableCacheKey{
-		key:     key,
-		mode:    strings.ToLower(strings.TrimSpace(mode)),
-		pattern: strings.ToLower(strings.TrimSpace(customPattern)),
+func clientTableSeed(key string) string {
+	if recovered, err := sudokuc.RecoverPublicKey(strings.TrimSpace(key)); err == nil {
+		return sudokuc.EncodePoint(recovered)
 	}
-	if v, ok := tableCache.Load(cacheKey); ok {
-		return v.(*sudoku.Table), nil
-	}
-	t, err := sudoku.NewTableWithCustom(key, mode, customPattern)
-	if err != nil {
-		return nil, err
-	}
-	actual, _ := tableCache.LoadOrStore(cacheKey, t)
-	return actual.(*sudoku.Table), nil
+	return strings.TrimSpace(key)
 }
 
-// NewTablesWithCustomPatterns builds one or more obfuscation tables from x/v/p custom patterns.
-// When customTables is non-empty it overrides customTable (matching upstream Sudoku behavior).
-func NewTablesWithCustomPatterns(key string, tableType string, customTable string, customTables []string) ([]*sudoku.Table, error) {
+func NewTablesWithCustomPatterns(key string, tableType string, customTable string, customTables []string) ([]*obfssudoku.Table, error) {
 	patterns := customTables
 	if len(patterns) == 0 && strings.TrimSpace(customTable) != "" {
-		patterns = []string{customTable}
+		patterns = []string{strings.TrimSpace(customTable)}
 	}
 	if len(patterns) == 0 {
 		patterns = []string{""}
 	}
-
-	tables := make([]*sudoku.Table, 0, len(patterns))
-	for _, pattern := range patterns {
-		t, err := cachedTable(key, tableType, pattern)
-		if err != nil {
-			return nil, err
-		}
-		tables = append(tables, t)
+	tableSet, err := obfssudoku.NewTableSet(strings.TrimSpace(key), strings.TrimSpace(tableType), patterns)
+	if err != nil {
+		return nil, err
 	}
-	return tables, nil
-}
-
-// ClientAEADSeed derives the shared public seed from a client key string.
-// If key is an ED25519 split/master private key, it recovers the public key and uses that instead,
-// ensuring client(private) and server(public) are wire compatible.
-func ClientAEADSeed(key string) string {
-	if recovered, err := crypto.RecoverPublicKey(key); err == nil {
-		return crypto.EncodePoint(recovered)
-	}
-	return key
+	return tableSet.Candidates(), nil
 }
 
 func GenKeyPair() (privateKey, publicKey string, err error) {
-	pair, err := crypto.GenerateMasterKey()
+	keyPair, err := sudokuc.GenerateMasterKey()
 	if err != nil {
 		return "", "", err
 	}
-	privateKey, err = crypto.SplitPrivateKey(pair.Private)
+	privateKey, err = sudokuc.SplitPrivateKey(keyPair.Private)
 	if err != nil {
 		return "", "", err
 	}
-	publicKey = crypto.EncodePoint(pair.Public)
-	return privateKey, publicKey, nil
+	return privateKey, sudokuc.EncodePoint(keyPair.Public), nil
 }
-

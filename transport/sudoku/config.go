@@ -1,80 +1,47 @@
 package sudoku
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
 
+	"github.com/sagernet/sing-box/transport/sudoku/obfs/httpmask"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
-// ProtocolConfig defines the configuration for the Sudoku protocol stack.
-// It is intentionally kept close to the upstream Sudoku project to ensure wire compatibility.
 type ProtocolConfig struct {
-	// Client-only: "host:port".
 	ServerAddress string
 
-	// Pre-shared key (or ED25519 key material) used to derive crypto and tables.
 	Key string
 
-	// "aes-128-gcm", "chacha20-poly1305", or "none".
 	AEADMethod string
 
-	// Table is the single obfuscation table to use when table rotation is disabled.
-	Table *sudoku.Table
-
-	// Tables is an optional candidate set for table rotation.
-	// If provided (len>0), the client will pick one table per connection and the server will
-	// probe the handshake to detect which one was used, keeping the handshake format unchanged.
-	// When Tables is set, Table may be nil.
+	Table  *sudoku.Table
 	Tables []*sudoku.Table
 
-	// Padding insertion ratio (0-100). Must satisfy PaddingMax >= PaddingMin.
 	PaddingMin int
 	PaddingMax int
 
-	// EnablePureDownlink toggles the bandwidth-optimized downlink mode.
 	EnablePureDownlink bool
 
-	// Client-only: final target "host:port".
 	TargetAddress string
 
-	// Server-side handshake timeout (seconds).
 	HandshakeTimeoutSeconds int
 
-	// Server-side: suspicious connection action.
-	// "fallback" proxies the raw connection to FallbackAddress; "silent" discards it (tarpit).
 	SuspiciousAction string
+	FallbackAddress  string
 
-	// Server-side: decoy address ("host:port") used when SuspiciousAction is "fallback".
-	FallbackAddress string
-
-	// DisableHTTPMask disables all HTTP camouflage layers.
 	DisableHTTPMask bool
+	HTTPMaskMode    string
 
-	// HTTPMaskMode controls how the HTTP layer behaves:
-	//   - "legacy": write a fake HTTP/1.1 header then switch to raw stream (default, not CDN-compatible)
-	//   - "stream": real HTTP tunnel (stream-one or split), CDN-compatible
-	//   - "poll": plain HTTP tunnel (authorize/push/pull), strong restricted-network pass-through
-	//   - "auto": try stream then fall back to poll
-	HTTPMaskMode string
-
-	// HTTPMaskTLSEnabled enables HTTPS for HTTP tunnel modes (client-side).
-	// If false, the tunnel uses HTTP (no port-based inference).
 	HTTPMaskTLSEnabled bool
+	HTTPMaskHost       string
+	HTTPMaskPathRoot   string
+	HTTPMaskMultiplex  string
 
-	// HTTPMaskMultiplex controls multiplex behavior when HTTPMask tunnel modes are enabled:
-	//   - "off": disable all multiplexing (default)
-	//   - "auto": reuse underlying HTTP connections across DialTunnel calls (keep-alive / h2)
-	//   - "on": single tunnel, multi-target mux inside one HTTPMask tunnel (requires HTTPMaskMode=stream/poll/auto)
-	HTTPMaskMultiplex string
-
-	// HTTPMaskHost optionally overrides the HTTP Host header / SNI host for HTTP tunnel modes (client-side).
-	HTTPMaskHost string
-
-	// HTTPMaskPathRoot optionally prefixes all HTTP mask paths with a first-level segment.
-	// Example: "aabbcc" => "/aabbcc/session", "/aabbcc/api/v1/upload", ...
-	HTTPMaskPathRoot string
+	DialContext           func(ctx context.Context, network, addr string) (net.Conn, error)
+	HTTPMaskTransportPool *httpmask.TransportPool
 }
 
 func (c *ProtocolConfig) Validate() error {
@@ -127,9 +94,9 @@ func (c *ProtocolConfig) Validate() error {
 	}
 
 	switch strings.ToLower(strings.TrimSpace(c.HTTPMaskMode)) {
-	case "", "legacy", "stream", "poll", "auto":
+	case "", "legacy", "stream", "poll", "auto", "ws":
 	default:
-		return fmt.Errorf("invalid http_mask_mode: %s, must be one of: legacy, stream, poll, auto", c.HTTPMaskMode)
+		return fmt.Errorf("invalid http_mask_mode: %s, must be one of: legacy, stream, poll, auto, ws", c.HTTPMaskMode)
 	}
 
 	switch strings.ToLower(strings.TrimSpace(c.HTTPMaskMultiplex)) {
@@ -144,14 +111,14 @@ func (c *ProtocolConfig) Validate() error {
 			return fmt.Errorf("invalid http_mask_path_root: must be a single path segment")
 		}
 		for i := 0; i < len(v); i++ {
-			c := v[i]
+			ch := v[i]
 			switch {
-			case c >= 'a' && c <= 'z':
-			case c >= 'A' && c <= 'Z':
-			case c >= '0' && c <= '9':
-			case c == '_' || c == '-':
+			case ch >= 'a' && ch <= 'z':
+			case ch >= 'A' && ch <= 'Z':
+			case ch >= '0' && ch <= '9':
+			case ch == '_' || ch == '-':
 			default:
-				return fmt.Errorf("invalid http_mask_path_root: contains invalid character %q", c)
+				return fmt.Errorf("invalid http_mask_path_root: contains invalid character %q", ch)
 			}
 		}
 	}

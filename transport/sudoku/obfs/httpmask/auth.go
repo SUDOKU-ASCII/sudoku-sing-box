@@ -1,3 +1,22 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
 package httpmask
 
 import (
@@ -31,7 +50,7 @@ func newTunnelAuth(key string, skew time.Duration) *tunnelAuth {
 		skew = 60 * time.Second
 	}
 
-	// Domain separation: keep this HMAC key independent from other uses.
+	// Domain separation: keep this HMAC key independent from other uses of cfg.Key.
 	h := sha256.New()
 	_, _ = h.Write([]byte("sudoku-httpmask-auth-v1:"))
 	_, _ = h.Write([]byte(key))
@@ -54,6 +73,17 @@ func (a *tunnelAuth) token(mode TunnelMode, method, path string, now time.Time) 
 	binary.BigEndian.PutUint64(buf[:8], uint64(ts))
 	copy(buf[8:], sig[:])
 	return base64.RawURLEncoding.EncodeToString(buf[:])
+}
+
+func (a *tunnelAuth) verify(headers map[string]string, mode TunnelMode, method, path string, now time.Time) bool {
+	if a == nil {
+		return true
+	}
+	if headers == nil {
+		return false
+	}
+
+	return a.verifyValue(headers["authorization"], mode, method, path, now)
 }
 
 func (a *tunnelAuth) verifyValue(val string, mode TunnelMode, method, path string, now time.Time) bool {
@@ -120,7 +150,7 @@ func (a *tunnelAuth) sign(mode TunnelMode, method, path string, ts int64) [16]by
 	return out
 }
 
-func applyTunnelAuthHeader(h http.Header, auth *tunnelAuth, mode TunnelMode, method, path string) {
+func applyTunnelAuthHeader(h httpHeaderSetter, auth *tunnelAuth, mode TunnelMode, method, path string) {
 	if auth == nil || h == nil {
 		return
 	}
@@ -130,6 +160,8 @@ func applyTunnelAuthHeader(h http.Header, auth *tunnelAuth, mode TunnelMode, met
 	}
 	h.Set(tunnelAuthHeaderKey, tunnelAuthHeaderPrefix+token)
 }
+
+type httpHeaderSetter = http.Header
 
 func applyTunnelAuth(req *http.Request, auth *tunnelAuth, mode TunnelMode, method, path string) {
 	if auth == nil || req == nil {
@@ -146,4 +178,3 @@ func applyTunnelAuth(req *http.Request, auth *tunnelAuth, mode TunnelMode, metho
 		req.URL.RawQuery = q.Encode()
 	}
 }
-

@@ -1,3 +1,22 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
 package crypto
 
 import (
@@ -9,26 +28,36 @@ import (
 	"filippo.io/edwards25519"
 )
 
+// KeyPair holds the scalar private key and point public key
 type KeyPair struct {
 	Private *edwards25519.Scalar
 	Public  *edwards25519.Point
 }
 
+// GenerateMasterKey generates a random master private key (scalar) and its public key (point)
 func GenerateMasterKey() (*KeyPair, error) {
+	// 1. Generate random scalar x (32 bytes)
 	var seed [64]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return nil, err
 	}
 
-	private, err := edwards25519.NewScalar().SetUniformBytes(seed[:])
+	x, err := edwards25519.NewScalar().SetUniformBytes(seed[:])
 	if err != nil {
 		return nil, err
 	}
-	public := new(edwards25519.Point).ScalarBaseMult(private)
-	return &KeyPair{Private: private, Public: public}, nil
+
+	// 2. Calculate Public Key P = x * G
+	P := new(edwards25519.Point).ScalarBaseMult(x)
+
+	return &KeyPair{Private: x, Public: P}, nil
 }
 
-func SplitPrivateKey(master *edwards25519.Scalar) (string, error) {
+// SplitPrivateKey takes a master private key x and returns a new random split key (r, k)
+// such that x = r + k (mod L).
+// Returns hex encoded string of r || k (64 bytes)
+func SplitPrivateKey(x *edwards25519.Scalar) (string, error) {
+	// 1. Generate random r (32 bytes)
 	var seed [64]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return "", err
@@ -37,17 +66,24 @@ func SplitPrivateKey(master *edwards25519.Scalar) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	k := new(edwards25519.Scalar).Subtract(master, r)
+
+	// 2. Calculate k = x - r (mod L)
+	k := new(edwards25519.Scalar).Subtract(x, r)
+
+	// 3. Encode r and k
+	rBytes := r.Bytes()
+	kBytes := k.Bytes()
 
 	full := make([]byte, 64)
-	copy(full[:32], r.Bytes())
-	copy(full[32:], k.Bytes())
+	copy(full[:32], rBytes)
+	copy(full[32:], kBytes)
+
 	return hex.EncodeToString(full), nil
 }
 
-// RecoverPublicKey takes either a master private scalar (32 bytes hex) or a split private key (64 bytes hex, r||k)
-// and returns the corresponding public key point.
-func RecoverPublicKey(keyHex string) (*edwards25519.Point, error) {
+// ParsePrivateScalar parses either a master private scalar (32-byte hex) or a split key (64-byte hex)
+// and returns the corresponding master scalar x.
+func ParsePrivateScalar(keyHex string) (*edwards25519.Scalar, error) {
 	keyBytes, err := hex.DecodeString(keyHex)
 	if err != nil {
 		return nil, fmt.Errorf("invalid hex: %w", err)
@@ -55,60 +91,47 @@ func RecoverPublicKey(keyHex string) (*edwards25519.Point, error) {
 
 	switch len(keyBytes) {
 	case 32:
-		private, err := edwards25519.NewScalar().SetCanonicalBytes(keyBytes)
+		// Master key x
+		x, err := edwards25519.NewScalar().SetCanonicalBytes(keyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("invalid scalar: %w", err)
 		}
-		return new(edwards25519.Point).ScalarBaseMult(private), nil
+		return x, nil
 	case 64:
-		rBytes := keyBytes[:32]
-		kBytes := keyBytes[32:]
-
-		r, err := edwards25519.NewScalar().SetCanonicalBytes(rBytes)
+		// Split key r || k
+		r, err := edwards25519.NewScalar().SetCanonicalBytes(keyBytes[:32])
 		if err != nil {
 			return nil, fmt.Errorf("invalid scalar r: %w", err)
 		}
-		k, err := edwards25519.NewScalar().SetCanonicalBytes(kBytes)
+		k, err := edwards25519.NewScalar().SetCanonicalBytes(keyBytes[32:])
 		if err != nil {
 			return nil, fmt.Errorf("invalid scalar k: %w", err)
 		}
-		sum := new(edwards25519.Scalar).Add(r, k)
-		return new(edwards25519.Point).ScalarBaseMult(sum), nil
+		return new(edwards25519.Scalar).Add(r, k), nil
 	default:
 		return nil, errors.New("invalid key length: must be 32 bytes (Master) or 64 bytes (Split)")
 	}
 }
 
-// DecodePrivateKeyBytes parses a master/split private key hex string and returns its raw bytes.
-// It returns ok=false when keyHex is not a valid ED25519 scalar encoding used by Sudoku.
-func DecodePrivateKeyBytes(keyHex string) (keyBytes []byte, ok bool) {
-	keyBytes, err := hex.DecodeString(keyHex)
+// RecoverPublicKey takes a split private key (r, k) or a master private key (x)
+// and returns the public key P.
+// Input can be:
+// - 32 bytes hex (Master Scalar x)
+// - 64 bytes hex (Split Key r || k)
+func RecoverPublicKey(keyHex string) (*edwards25519.Point, error) {
+	x, err := ParsePrivateScalar(keyHex)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
-
-	switch len(keyBytes) {
-	case 32:
-		if _, err := edwards25519.NewScalar().SetCanonicalBytes(keyBytes); err != nil {
-			return nil, false
-		}
-		return keyBytes, true
-	case 64:
-		rBytes := keyBytes[:32]
-		kBytes := keyBytes[32:]
-
-		if _, err := edwards25519.NewScalar().SetCanonicalBytes(rBytes); err != nil {
-			return nil, false
-		}
-		if _, err := edwards25519.NewScalar().SetCanonicalBytes(kBytes); err != nil {
-			return nil, false
-		}
-		return keyBytes, true
-	default:
-		return nil, false
-	}
+	return new(edwards25519.Point).ScalarBaseMult(x), nil
 }
 
+// EncodePoint returns the hex string of the compressed point
 func EncodePoint(p *edwards25519.Point) string {
 	return hex.EncodeToString(p.Bytes())
+}
+
+// EncodeScalar returns the hex string of the scalar
+func EncodeScalar(s *edwards25519.Scalar) string {
+	return hex.EncodeToString(s.Bytes())
 }

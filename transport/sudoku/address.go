@@ -91,4 +91,3 @@ func DecodeAddress(r io.Reader) (string, error) {
 		return "", fmt.Errorf("unknown address type: %d", atyp[0])
 	}
 }
-

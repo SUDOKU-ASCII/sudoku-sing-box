@@ -1,8 +1,29 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
 package sudoku
 
 import (
 	"io"
 	"net"
+
+	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 )
 
 // DirectionalConn wires separate reader/writer streams onto a single net.Conn.
@@ -32,66 +53,27 @@ func (c *DirectionalConn) Write(p []byte) (int, error) {
 }
 
 func (c *DirectionalConn) CloseRead() error {
-	if err := tryCloseRead(c.reader); err != nil {
+	if err := connutil.TryCloseRead(c.reader); err != nil {
 		return err
 	}
-	return tryCloseRead(c.Conn)
+	return connutil.TryCloseRead(c.Conn)
 }
 
 func (c *DirectionalConn) CloseWrite() error {
-	firstErr := runClosers(c.closers...)
-	if err := tryCloseWrite(c.writer); err != nil && firstErr == nil {
+	firstErr := connutil.RunClosers(c.closers...)
+	if err := connutil.TryCloseWrite(c.writer); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if err := tryCloseWrite(c.Conn); err != nil && firstErr == nil {
+	if err := connutil.TryCloseWrite(c.Conn); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
 }
 
 func (c *DirectionalConn) Close() error {
-	firstErr := runClosers(c.closers...)
+	firstErr := connutil.RunClosers(c.closers...)
 	if err := c.Conn.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
-}
-
-func runClosers(closers ...func() error) error {
-	var firstErr error
-	for _, fn := range closers {
-		if fn == nil {
-			continue
-		}
-		if err := fn(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-func tryCloseRead(v any) error {
-	if v == nil {
-		return nil
-	}
-	if cr, ok := v.(interface{ CloseRead() error }); ok {
-		return cr.CloseRead()
-	}
-	if c, ok := v.(io.Closer); ok {
-		return c.Close()
-	}
-	return nil
-}
-
-func tryCloseWrite(v any) error {
-	if v == nil {
-		return nil
-	}
-	if cw, ok := v.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	if c, ok := v.(io.Closer); ok {
-		return c.Close()
-	}
-	return nil
 }
