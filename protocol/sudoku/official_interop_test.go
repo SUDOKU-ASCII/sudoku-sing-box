@@ -31,6 +31,108 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type interopCombo struct {
+	enablePureDownlink bool
+	httpmaskEnabled    bool
+	httpmaskMode       string
+	httpmaskMultiplex  string
+	httpmaskPathRoot   string
+	asciiMode          string
+	tableSetName       string
+	customTables       []string
+}
+
+func (c interopCombo) canonical() interopCombo {
+	out := c
+	if !out.httpmaskEnabled {
+		out.httpmaskMode = "legacy"
+		out.httpmaskMultiplex = "off"
+		out.httpmaskPathRoot = ""
+	}
+	return out
+}
+
+func (c interopCombo) name() string {
+	cc := c.canonical()
+	pathRoot := "none"
+	if cc.httpmaskPathRoot != "" {
+		pathRoot = cc.httpmaskPathRoot
+	}
+	return fmt.Sprintf(
+		"downlink=%t_httpmask=%t_mode=%s_mux=%s_root=%s_ascii=%s_tables=%s",
+		cc.enablePureDownlink,
+		cc.httpmaskEnabled,
+		cc.httpmaskMode,
+		cc.httpmaskMultiplex,
+		pathRoot,
+		cc.asciiMode,
+		cc.tableSetName,
+	)
+}
+
+func interopMatrix() []interopCombo {
+	tableSets := []struct {
+		name     string
+		patterns []string
+	}{
+		{name: "default"},
+		{
+			name: "custom7",
+			patterns: []string{
+				"xpxvvpvv",
+				"xpvvxvpv",
+				"vpxvvpvx",
+				"vvpxvpvx",
+				"vvpvpxvx",
+				"pvxvvpvx",
+				"vxpvpvvx",
+			},
+		},
+	}
+
+	var out []interopCombo
+	seen := make(map[string]struct{})
+	for _, enablePureDownlink := range []bool{false, true} {
+		for _, httpmaskEnabled := range []bool{false, true} {
+			httpmaskModes := []string{"legacy"}
+			muxModes := []string{"off"}
+			pathRoots := []string{""}
+			if httpmaskEnabled {
+				httpmaskModes = []string{"auto", "ws"}
+				muxModes = []string{"off", "auto", "on"}
+				pathRoots = []string{"", "cli"}
+			}
+			for _, httpmaskMode := range httpmaskModes {
+				for _, muxMode := range muxModes {
+					for _, pathRoot := range pathRoots {
+						for _, asciiMode := range []string{"prefer_ascii", "prefer_entropy"} {
+							for _, tableSet := range tableSets {
+								combo := interopCombo{
+									enablePureDownlink: enablePureDownlink,
+									httpmaskEnabled:    httpmaskEnabled,
+									httpmaskMode:       httpmaskMode,
+									httpmaskMultiplex:  muxMode,
+									httpmaskPathRoot:   pathRoot,
+									asciiMode:          asciiMode,
+									tableSetName:       tableSet.name,
+									customTables:       tableSet.patterns,
+								}.canonical()
+								key := combo.name()
+								if _, exists := seen[key]; exists {
+									continue
+								}
+								seen[key] = struct{}{}
+								out = append(out, combo)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
 func TestSudoku_OfficialInterop(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping interop test in -short mode")
@@ -48,43 +150,29 @@ func TestSudoku_OfficialInterop(t *testing.T) {
 		officialBin = path
 	}
 
-	profiles := []struct {
-		name         string
-		customTables []string
-	}{
-		{name: "default"},
-		{name: "custom_tables", customTables: []string{"xpxvvpvv", "vxpvxvvp", "vpxpvvxv"}},
-	}
-
 	for _, aead := range []string{"aes-128-gcm", "chacha20-poly1305"} {
 		aead := aead
-		for _, profile := range profiles {
-			profile := profile
-			t.Run(aead+"/"+profile.name, func(t *testing.T) {
+		for _, combo := range interopMatrix() {
+			combo := combo
+			t.Run(aead+"/"+combo.name(), func(t *testing.T) {
 				t.Run("official_server-singbox_outbound", func(t *testing.T) {
-					runOfficialServerSingBoxOutbound(t, officialBin, aead, profile.customTables, false)
-					if profile.name == "default" {
-						runOfficialServerSingBoxOutbound(t, officialBin, aead, profile.customTables, true)
-					}
+					runOfficialServerSingBoxOutbound(t, officialBin, aead, combo)
 				})
 				t.Run("official_client-singbox_inbound", func(t *testing.T) {
-					runOfficialClientSingBoxInbound(t, officialBin, aead, profile.customTables, false)
-					if profile.name == "default" {
-						runOfficialClientSingBoxInbound(t, officialBin, aead, profile.customTables, true)
+					if combo.httpmaskEnabled && combo.httpmaskMultiplex != "on" {
+						t.Skip("upstream sudoku v0.3.3 standalone client does not support early-handshake direct-forward over httpmask without mux; reproduced against official server")
 					}
+					runOfficialClientSingBoxInbound(t, officialBin, aead, combo)
 				})
 				t.Run("singbox-singbox", func(t *testing.T) {
-					runSingBoxToSingBox(t, aead, profile.customTables, false)
-					if profile.name == "default" {
-						runSingBoxToSingBox(t, aead, profile.customTables, true)
-					}
+					runSingBoxToSingBox(t, aead, combo)
 				})
 			})
 		}
 	}
 }
 
-func runOfficialServerSingBoxOutbound(t *testing.T, officialBin string, aead string, customTables []string, mux bool) {
+func runOfficialServerSingBoxOutbound(t *testing.T, officialBin string, aead string, combo interopCombo) {
 	key := "test_key_interop"
 	serverPort := allocateTCPPort(t)
 	clientPort := allocateTCPPort(t)
@@ -98,13 +186,16 @@ func runOfficialServerSingBoxOutbound(t *testing.T, officialBin string, aead str
 		"aead":                 aead,
 		"padding_min":          1,
 		"padding_max":          9,
-		"ascii":                "prefer_entropy",
-		"custom_tables":        customTables,
-		"enable_pure_downlink": false,
-		"disable_http_mask":    !mux,
-		"http_mask_mode":       ternary(mux, "stream", "legacy"),
-		"http_mask_multiplex":  ternary(mux, "on", "off"),
-		"http_mask_tls":        false,
+		"ascii":                combo.asciiMode,
+		"custom_tables":        combo.customTables,
+		"enable_pure_downlink": combo.enablePureDownlink,
+		"httpmask": map[string]any{
+			"disable":   !combo.httpmaskEnabled,
+			"mode":      combo.httpmaskMode,
+			"multiplex": combo.httpmaskMultiplex,
+			"path_root": combo.httpmaskPathRoot,
+			"tls":       false,
+		},
 	}
 	officialLog := startOfficial(t, officialBin, officialCfg)
 	waitTCPPort(t, serverPort, "official server")
@@ -140,13 +231,14 @@ func runOfficialServerSingBoxOutbound(t *testing.T, officialBin string, aead str
 					AEADMethod:         aead,
 					PaddingMin:         ptr(1),
 					PaddingMax:         ptr(9),
-					ASCII:              "prefer_entropy",
-					CustomTables:       customTables,
-					EnablePureDownlink: ptr(false),
-					DisableHTTPMask:    !mux,
-					HTTPMaskMode:       ternary(mux, "stream", "legacy"),
+					ASCII:              combo.asciiMode,
+					CustomTables:       combo.customTables,
+					EnablePureDownlink: ptr(combo.enablePureDownlink),
+					DisableHTTPMask:    !combo.httpmaskEnabled,
+					HTTPMaskMode:       combo.httpmaskMode,
 					HTTPMaskTLS:        false,
-					HTTPMaskMultiplex:  ternary(mux, "on", "off"),
+					HTTPMaskMultiplex:  combo.httpmaskMultiplex,
+					HTTPMaskPathRoot:   combo.httpmaskPathRoot,
 				},
 			},
 		},
@@ -171,12 +263,12 @@ func runOfficialServerSingBoxOutbound(t *testing.T, officialBin string, aead str
 	}
 	startBox(t, singBoxOpts)
 
-	runSuite(t, clientPort, mux)
+	runSuite(t, clientPort, combo.httpmaskMultiplex)
 
 	_ = officialLog
 }
 
-func runOfficialClientSingBoxInbound(t *testing.T, officialBin string, aead string, customTables []string, mux bool) {
+func runOfficialClientSingBoxInbound(t *testing.T, officialBin string, aead string, combo interopCombo) {
 	key := "test_key_interop"
 	serverPort := allocateTCPPort(t)
 	clientPort := allocateTCPPort(t)
@@ -192,16 +284,17 @@ func runOfficialClientSingBoxInbound(t *testing.T, officialBin string, aead stri
 						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
 						ListenPort: serverPort,
 					},
-					Key:               key,
-					AEADMethod:        aead,
-					PaddingMin:        ptr(1),
-					PaddingMax:        ptr(9),
-					ASCII:             "prefer_entropy",
-					CustomTables:      customTables,
-					EnablePureDownlink: ptr(false),
-					DisableHTTPMask:    !mux,
-					HTTPMaskMode:       ternary(mux, "stream", "legacy"),
-					HTTPMaskMultiplex:  ternary(mux, "on", "off"),
+					Key:                key,
+					AEADMethod:         aead,
+					PaddingMin:         ptr(1),
+					PaddingMax:         ptr(9),
+					ASCII:              combo.asciiMode,
+					CustomTables:       combo.customTables,
+					EnablePureDownlink: ptr(combo.enablePureDownlink),
+					DisableHTTPMask:    !combo.httpmaskEnabled,
+					HTTPMaskMode:       combo.httpmaskMode,
+					HTTPMaskMultiplex:  combo.httpmaskMultiplex,
+					HTTPMaskPathRoot:   combo.httpmaskPathRoot,
 				},
 			},
 		},
@@ -227,24 +320,27 @@ func runOfficialClientSingBoxInbound(t *testing.T, officialBin string, aead stri
 		"aead":                 aead,
 		"padding_min":          1,
 		"padding_max":          9,
-		"ascii":                "prefer_entropy",
-		"custom_tables":        customTables,
-		"enable_pure_downlink": false,
-		"disable_http_mask":    !mux,
-		"http_mask_mode":       ternary(mux, "stream", "legacy"),
-		"http_mask_multiplex":  ternary(mux, "on", "off"),
-		"http_mask_tls":        false,
-		"rule_urls":            []string{"global"},
+		"ascii":                combo.asciiMode,
+		"custom_tables":        combo.customTables,
+		"enable_pure_downlink": combo.enablePureDownlink,
+		"httpmask": map[string]any{
+			"disable":   !combo.httpmaskEnabled,
+			"mode":      combo.httpmaskMode,
+			"multiplex": combo.httpmaskMultiplex,
+			"path_root": combo.httpmaskPathRoot,
+			"tls":       false,
+		},
+		"rule_urls": []string{"global"},
 	}
 	officialLog := startOfficial(t, officialBin, officialCfg)
 	waitTCPPort(t, clientPort, "official client")
 
-	runSuite(t, clientPort, mux)
+	runSuite(t, clientPort, combo.httpmaskMultiplex)
 
 	_ = officialLog
 }
 
-func runSingBoxToSingBox(t *testing.T, aead string, customTables []string, mux bool) {
+func runSingBoxToSingBox(t *testing.T, aead string, combo interopCombo) {
 	key := "test_key_interop"
 	serverPort := allocateTCPPort(t)
 	clientPort := allocateTCPPort(t)
@@ -264,12 +360,13 @@ func runSingBoxToSingBox(t *testing.T, aead string, customTables []string, mux b
 					AEADMethod:         aead,
 					PaddingMin:         ptr(1),
 					PaddingMax:         ptr(9),
-					ASCII:              "prefer_entropy",
-					CustomTables:       customTables,
-					EnablePureDownlink: ptr(false),
-					DisableHTTPMask:    !mux,
-					HTTPMaskMode:       ternary(mux, "stream", "legacy"),
-					HTTPMaskMultiplex:  ternary(mux, "on", "off"),
+					ASCII:              combo.asciiMode,
+					CustomTables:       combo.customTables,
+					EnablePureDownlink: ptr(combo.enablePureDownlink),
+					DisableHTTPMask:    !combo.httpmaskEnabled,
+					HTTPMaskMode:       combo.httpmaskMode,
+					HTTPMaskMultiplex:  combo.httpmaskMultiplex,
+					HTTPMaskPathRoot:   combo.httpmaskPathRoot,
 				},
 			},
 		},
@@ -315,13 +412,14 @@ func runSingBoxToSingBox(t *testing.T, aead string, customTables []string, mux b
 					AEADMethod:         aead,
 					PaddingMin:         ptr(1),
 					PaddingMax:         ptr(9),
-					ASCII:              "prefer_entropy",
-					CustomTables:       customTables,
-					EnablePureDownlink: ptr(false),
-					DisableHTTPMask:    !mux,
-					HTTPMaskMode:       ternary(mux, "stream", "legacy"),
+					ASCII:              combo.asciiMode,
+					CustomTables:       combo.customTables,
+					EnablePureDownlink: ptr(combo.enablePureDownlink),
+					DisableHTTPMask:    !combo.httpmaskEnabled,
+					HTTPMaskMode:       combo.httpmaskMode,
 					HTTPMaskTLS:        false,
-					HTTPMaskMultiplex:  ternary(mux, "on", "off"),
+					HTTPMaskMultiplex:  combo.httpmaskMultiplex,
+					HTTPMaskPathRoot:   combo.httpmaskPathRoot,
 				},
 			},
 		},
@@ -331,10 +429,10 @@ func runSingBoxToSingBox(t *testing.T, aead string, customTables []string, mux b
 	}
 	startBox(t, clientOpts)
 
-	runSuite(t, clientPort, mux)
+	runSuite(t, clientPort, combo.httpmaskMultiplex)
 }
 
-func runSuite(t *testing.T, clientPort uint16, mux bool) {
+func runSuite(t *testing.T, clientPort uint16, muxMode string) {
 	t.Run("tcp_udp_ping_pong", func(t *testing.T) {
 		testPort := allocateTCPPort(t)
 		dialTCP, dialUDP := dialViaSocks(t, clientPort, testPort)
@@ -351,7 +449,7 @@ func runSuite(t *testing.T, clientPort uint16, mux bool) {
 		runLargeDataUDP(t, testPort, dialUDP)
 	})
 
-	if mux {
+	if muxMode == "on" {
 		t.Run("multi_load_tcp", func(t *testing.T) {
 			ports := make([]uint16, 8)
 			dialers := make([]func() (net.Conn, error), 8)
