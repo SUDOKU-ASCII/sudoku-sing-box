@@ -66,15 +66,24 @@ jobs:
         run: |-
           set -xeuo pipefail
           mkdir -p dist
+          BUILD_TAGS_CURRENT="${BUILD_TAGS}"
+          if [[ "${{ matrix.os }}" == "freebsd" ]]; then
+            # sagernet/tailscale v1.92.4-sing-box-1.13-mod.6 has a broken
+            # freebsd-only file (unused wireguard-go/tun import), so exclude
+            # tailscale from this target until that dependency is fixed.
+            BUILD_TAGS_CURRENT="${BUILD_TAGS_CURRENT/,with_tailscale/}"
+            BUILD_TAGS_CURRENT="${BUILD_TAGS_CURRENT/with_tailscale,/}"
+            BUILD_TAGS_CURRENT="${BUILD_TAGS_CURRENT/with_tailscale/}"
+          fi
           if [[ "${{ matrix.os }}" == "android" ]]; then
             go install -v ./cmd/internal/build
             export CC='${{ matrix.ndk }}-clang'
             export CXX="${CC}++"
-            CGO_ENABLED=1 BUILD_GOOS=android BUILD_GOARCH=${{ matrix.arch }} GOOS=android GOARCH=${{ matrix.arch }} build go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            CGO_ENABLED=1 BUILD_GOOS=android BUILD_GOARCH=${{ matrix.arch }} GOOS=android GOARCH=${{ matrix.arch }} build go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS_CURRENT}" \
               -ldflags '-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0' \
               ./cmd/sing-box
           else
-            CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS_CURRENT}" \
               -ldflags '-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0' \
               ./cmd/sing-box
           fi
