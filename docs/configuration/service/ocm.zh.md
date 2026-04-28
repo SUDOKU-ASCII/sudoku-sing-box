@@ -37,7 +37,9 @@ OCM（OpenAI Codex 多路复用器）服务是一个多路复用服务，允许�
 
 OpenAI OAuth 凭据文件的路径。
 
-如果未指定，默认值为 `~/.codex/auth.json`。
+如果未指定，默认值为：
+- 如果设置了 `CODEX_HOME` 环境变量，则使用 `$CODEX_HOME/auth.json`
+- 否则使用 `~/.codex/auth.json`
 
 刷新的令牌会自动写回相同位置。
 
@@ -88,7 +90,7 @@ OpenAI OAuth 凭据文件的路径。
 
 #### tls
 
-TLS 配置，参阅 [TLS](/zh/configuration/shared/tls/#inbound)。
+TLS 配置，参阅 [TLS](/zh/configuration/shared/tls/#入站)。
 
 ### 示例
 
@@ -111,17 +113,24 @@ TLS 配置，参阅 [TLS](/zh/configuration/shared/tls/#inbound)。
 在 `~/.codex/config.toml` 中添加：
 
 ```toml
+# profile = "ocm"                # 设为默认配置
+
+
 [model_providers.ocm]
 name = "OCM Proxy"
 base_url = "http://127.0.0.1:8080/v1"
-wire_api = "responses"
-requires_openai_auth = false
+supports_websockets = true
+
+[profiles.ocm]
+model_provider = "ocm"
+# model = "gpt-5.4"              # 如果最新模型尚未公开发布
+# model_reasoning_effort = "xhigh"
 ```
 
 然后运行：
 
 ```bash
-codex --model-provider ocm
+codex --profile ocm
 ```
 
 ### 带身份验证的示例
@@ -139,11 +148,11 @@ codex --model-provider ocm
       "users": [
         {
           "name": "alice",
-          "token": "sk-alice-secret-token"
+          "token": "sk-ocm-hello-world"
         },
         {
           "name": "bob",
-          "token": "sk-bob-secret-token"
+          "token": "sk-ocm-hello-bob"
         }
       ]
     }
@@ -156,16 +165,22 @@ codex --model-provider ocm
 在 `~/.codex/config.toml` 中添加：
 
 ```toml
+# profile = "ocm"                # 设为默认配置
+
 [model_providers.ocm]
 name = "OCM Proxy"
 base_url = "http://127.0.0.1:8080/v1"
-wire_api = "responses"
-requires_openai_auth = false
-experimental_bearer_token = "sk-alice-secret-token"
+supports_websockets = true
+experimental_bearer_token = "sk-ocm-hello-world"
+
+[profiles.ocm]
+model_provider = "ocm"
+# model = "gpt-5.4"              # 如果最新模型尚未公开发布
+# model_reasoning_effort = "xhigh"
 ```
 
 然后运行：
 
 ```bash
-codex --model-provider ocm
+codex --profile ocm
 ```

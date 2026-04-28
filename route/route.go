@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/sniff"
 	C "github.com/sagernet/sing-box/constant"
 	R "github.com/sagernet/sing-box/route/rule"
@@ -349,7 +348,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, routeContext tun.Dire
 		}
 		directRouteOutbound = defaultOutbound.(adapter.DirectRouteOutbound)
 	}
-	if metadata.Destination.IsFqdn() {
+	if metadata.Destination.IsDomain() {
 		if len(metadata.DestinationAddresses) == 0 {
 			var strategy C.DomainStrategy
 			if metadata.Source.IsIPv4() {
@@ -408,37 +407,7 @@ func (r *Router) matchRule(
 	selectedRule adapter.Rule, selectedRuleIndex int,
 	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
 ) {
-	if r.processSearcher != nil && metadata.ProcessInfo == nil {
-		var originDestination netip.AddrPort
-		if metadata.OriginDestination.IsValid() {
-			originDestination = metadata.OriginDestination.AddrPort()
-		} else if metadata.Destination.IsIP() {
-			originDestination = metadata.Destination.AddrPort()
-		}
-		processInfo, fErr := process.FindProcessInfo(r.processSearcher, ctx, metadata.Network, metadata.Source.AddrPort(), originDestination)
-		if fErr != nil {
-			r.logger.InfoContext(ctx, "failed to search process: ", fErr)
-		} else {
-			if processInfo.ProcessPath != "" {
-				if processInfo.UserName != "" {
-					r.logger.InfoContext(ctx, "found process path: ", processInfo.ProcessPath, ", user: ", processInfo.UserName)
-				} else if processInfo.UserId != -1 {
-					r.logger.InfoContext(ctx, "found process path: ", processInfo.ProcessPath, ", user id: ", processInfo.UserId)
-				} else {
-					r.logger.InfoContext(ctx, "found process path: ", processInfo.ProcessPath)
-				}
-			} else if processInfo.AndroidPackageName != "" {
-				r.logger.InfoContext(ctx, "found package name: ", processInfo.AndroidPackageName)
-			} else if processInfo.UserId != -1 {
-				if processInfo.UserName != "" {
-					r.logger.InfoContext(ctx, "found user: ", processInfo.UserName)
-				} else {
-					r.logger.InfoContext(ctx, "found user id: ", processInfo.UserId)
-				}
-			}
-			metadata.ProcessInfo = processInfo
-		}
-	}
+	r.searchProcessInfo(ctx, metadata)
 	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
 		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
 		if !loaded {
@@ -790,7 +759,7 @@ func (r *Router) actionSniff(
 }
 
 func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionResolve) error {
-	if metadata.Destination.IsFqdn() {
+	if metadata.Destination.IsDomain() {
 		var transport adapter.DNSTransport
 		if action.Server != "" {
 			var loaded bool

@@ -283,6 +283,9 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 	if timeToLive == 0 {
 		for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 			for _, record := range recordList {
+				if record.Header().Rrtype == dns.TypeOPT {
+					continue
+				}
 				if timeToLive == 0 || record.Header().Ttl > 0 && record.Header().Ttl < timeToLive {
 					timeToLive = record.Header().Ttl
 				}
@@ -294,6 +297,9 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 	}
 	for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 		for _, record := range recordList {
+			if record.Header().Rrtype == dns.TypeOPT {
+				continue
+			}
 			record.Header().Ttl = timeToLive
 		}
 	}
@@ -324,16 +330,20 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	} else {
 		strategy = options.Strategy
 	}
+	lookupOptions := options
+	if options.LookupStrategy != C.DomainStrategyAsIS {
+		lookupOptions.Strategy = strategy
+	}
 	if strategy == C.DomainStrategyIPv4Only {
-		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, responseChecker)
+		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
 	} else if strategy == C.DomainStrategyIPv6Only {
-		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, responseChecker)
+		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
 	}
 	var response4 []netip.Addr
 	var response6 []netip.Addr
 	var group task.Group
 	group.Append("exchange4", func(ctx context.Context) error {
-		response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, responseChecker)
+		response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
 		if err != nil {
 			return err
 		}
@@ -341,7 +351,7 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 		return nil
 	})
 	group.Append("exchange6", func(ctx context.Context) error {
-		response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, responseChecker)
+		response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
 		if err != nil {
 			return err
 		}
@@ -377,21 +387,21 @@ func (c *Client) storeCache(transport adapter.DNSTransport, question dns.Questio
 	}
 	if c.disableExpire {
 		if !c.independentCache {
-			c.cache.Add(question, message)
+			c.cache.Add(question, message.Copy())
 		} else {
 			c.transportCache.Add(transportCacheKey{
 				Question:     question,
 				transportTag: transport.Tag(),
-			}, message)
+			}, message.Copy())
 		}
 	} else {
 		if !c.independentCache {
-			c.cache.AddWithLifetime(question, message, time.Second*time.Duration(timeToLive))
+			c.cache.AddWithLifetime(question, message.Copy(), time.Second*time.Duration(timeToLive))
 		} else {
 			c.transportCache.AddWithLifetime(transportCacheKey{
 				Question:     question,
 				transportTag: transport.Tag(),
-			}, message, time.Second*time.Duration(timeToLive))
+			}, message.Copy(), time.Second*time.Duration(timeToLive))
 		}
 	}
 }
@@ -482,6 +492,9 @@ func (c *Client) loadResponse(question dns.Question, transport adapter.DNSTransp
 		var originTTL int
 		for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 			for _, record := range recordList {
+				if record.Header().Rrtype == dns.TypeOPT {
+					continue
+				}
 				if originTTL == 0 || record.Header().Ttl > 0 && int(record.Header().Ttl) < originTTL {
 					originTTL = int(record.Header().Ttl)
 				}
@@ -496,12 +509,18 @@ func (c *Client) loadResponse(question dns.Question, transport adapter.DNSTransp
 			duration := uint32(originTTL - nowTTL)
 			for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 				for _, record := range recordList {
+					if record.Header().Rrtype == dns.TypeOPT {
+						continue
+					}
 					record.Header().Ttl = record.Header().Ttl - duration
 				}
 			}
 		} else {
 			for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
 				for _, record := range recordList {
+					if record.Header().Rrtype == dns.TypeOPT {
+						continue
+					}
 					record.Header().Ttl = uint32(nowTTL)
 				}
 			}
