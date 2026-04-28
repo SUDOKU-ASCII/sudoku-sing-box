@@ -74,10 +74,6 @@ func (c *ProtocolConfig) Validate() error {
 		return fmt.Errorf("padding_max (%d) must be >= padding_min (%d)", c.PaddingMax, c.PaddingMin)
 	}
 
-	if !c.EnablePureDownlink && c.AEADMethod == "none" {
-		return fmt.Errorf("bandwidth optimized downlink requires AEAD")
-	}
-
 	if c.HandshakeTimeoutSeconds < 0 {
 		return fmt.Errorf("handshake_timeout must be >= 0, got %d", c.HandshakeTimeoutSeconds)
 	}
