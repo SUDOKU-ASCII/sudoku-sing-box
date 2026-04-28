@@ -71,14 +71,6 @@ func canonicalHeaderHost(urlHost, scheme string) string {
 	return host
 }
 
-func parseTunnelToken(body []byte) (string, error) {
-	resp, err := parseAuthorizeResponse(body)
-	if err != nil {
-		return "", err
-	}
-	return resp.token, nil
-}
-
 func parseAuthorizeResponse(body []byte) (*authorizeResponse, error) {
 	s := strings.TrimSpace(string(body))
 	idx := strings.Index(s, "token=")

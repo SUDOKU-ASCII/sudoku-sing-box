@@ -17,45 +17,28 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 In addition, no derivative work may use the name or imply association
 with this application without prior consent.
 */
-package sudoku
+package config
 
-const probOne = uint64(1) << 32
+import (
+	"encoding/json"
+	"os"
+)
 
-func pickPaddingThreshold(r randomSource, pMin, pMax int) uint64 {
-	if r == nil {
-		return 0
+func Load(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	if pMin < 0 {
-		pMin = 0
-	}
-	if pMax < pMin {
-		pMax = pMin
-	}
-	if pMax > 100 {
-		pMax = 100
-	}
-	if pMin > 100 {
-		pMin = 100
-	}
+	defer f.Close()
 
-	min := uint64(pMin) * probOne / 100
-	max := uint64(pMax) * probOne / 100
-	if max <= min {
-		return min
+	cfg := Config{
+		EnablePureDownlink: true,
 	}
-	u := uint64(r.Uint32())
-	return min + (u * (max - min) >> 32)
-}
-
-func shouldPad(r randomSource, threshold uint64) bool {
-	if threshold == 0 {
-		return false
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		return nil, err
 	}
-	if threshold >= probOne {
-		return true
+	if err := cfg.Finalize(); err != nil {
+		return nil, err
 	}
-	if r == nil {
-		return false
-	}
-	return uint64(r.Uint32()) < threshold
+	return &cfg, nil
 }

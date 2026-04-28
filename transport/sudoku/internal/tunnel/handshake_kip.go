@@ -36,7 +36,7 @@ const (
 	kipHandshakeSkew = 60 * time.Second
 )
 
-func KIPHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUserHashSize]byte, feats uint32) (selectedFeats uint32, err error) {
+func KIPHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUserHashSize]byte, feats uint32, tableHint uint32, hasTableHint bool) (selectedFeats uint32, err error) {
 	if rc == nil {
 		return 0, fmt.Errorf("nil conn")
 	}
@@ -56,11 +56,13 @@ func KIPHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUs
 	copy(clientPub[:], ephemeral.PublicKey().Bytes())
 
 	ch := &KIPClientHello{
-		Timestamp: time.Now(),
-		UserHash:  userHash,
-		Nonce:     nonce,
-		ClientPub: clientPub,
-		Features:  feats,
+		Timestamp:    time.Now(),
+		UserHash:     userHash,
+		Nonce:        nonce,
+		ClientPub:    clientPub,
+		Features:     feats,
+		TableHint:    tableHint,
+		HasTableHint: hasTableHint,
 	}
 	if err := WriteKIPMessage(rc, KIPTypeClientHello, ch.EncodePayload()); err != nil {
 		return 0, fmt.Errorf("write client hello failed: %w", err)
@@ -97,17 +99,23 @@ func KIPHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUs
 }
 
 func ClientHandshake(conn net.Conn, cfg *config.Config, table *sudoku.Table, privateKey []byte) (net.Conn, error) {
+	return ClientHandshakeWithUplinkMode(conn, cfg, table, privateKey, ObfsUplinkPure, 0, false)
+}
+
+func ClientHandshakeWithUplinkMode(conn net.Conn, cfg *config.Config, table *sudoku.Table, privateKey []byte, uplinkMode ObfsUplinkMode, tableHint uint32, hasTableHint bool) (net.Conn, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("nil config")
 	}
 	if table == nil {
 		return nil, fmt.Errorf("nil table")
 	}
-	if !cfg.EnablePureDownlink && cfg.AEAD == "none" {
-		return nil, fmt.Errorf("enable_pure_downlink=false requires AEAD")
+	var obfsConn net.Conn
+	switch uplinkMode {
+	case ObfsUplinkPacked:
+		obfsConn = buildReverseObfsConnForClient(conn, table, cfg)
+	default:
+		obfsConn = buildObfsConnForClient(conn, table, cfg)
 	}
-
-	obfsConn := buildObfsConnForClient(conn, table, cfg)
 
 	pskC2S, pskS2C := derivePSKDirectionalBases(cfg.Key)
 	rc, err := crypto.NewRecordConn(obfsConn, cfg.AEAD, pskC2S, pskS2C)
@@ -116,7 +124,7 @@ func ClientHandshake(conn net.Conn, cfg *config.Config, table *sudoku.Table, pri
 	}
 
 	userHash := kipUserHashFromPrivateKey(privateKey, cfg.Key)
-	if _, err := KIPHandshakeClient(rc, cfg.Key, userHash, KIPFeatAll); err != nil {
+	if _, err := KIPHandshakeClient(rc, cfg.Key, userHash, KIPFeatAll, tableHint, hasTableHint); err != nil {
 		_ = rc.Close()
 		return nil, err
 	}

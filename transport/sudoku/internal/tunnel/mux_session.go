@@ -38,9 +38,11 @@ const (
 )
 
 const (
-	muxHeaderSize     = 1 + 4 + 4
-	muxMaxFrameSize   = 256 * 1024
-	muxMaxDataPayload = 32 * 1024
+	muxHeaderSize   = 1 + 4 + 4
+	muxMaxFrameSize = 256 * 1024
+	// Larger data frames materially reduce per-frame lock/copy overhead for
+	// single-tunnel large downloads while still staying well below the hard cap.
+	muxMaxDataPayload = 128 * 1024
 )
 
 type muxSession struct {

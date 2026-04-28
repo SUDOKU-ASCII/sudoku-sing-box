@@ -560,7 +560,7 @@ func TestTunnelServer_SessionTTL_ReapsAfterIdle(t *testing.T) {
 	)
 	done := make(chan struct{})
 	go func() {
-		res, c, err = srv.sessionAuthorize(server, nil)
+		res, c, err = srv.sessionAuthorize(server, nil, nil, nil)
 		close(done)
 	}()
 
@@ -582,10 +582,11 @@ func TestTunnelServer_SessionTTL_ReapsAfterIdle(t *testing.T) {
 	if len(parts) != 2 {
 		t.Fatalf("invalid http response: %q", string(raw))
 	}
-	token, err := parseTunnelToken([]byte(parts[1]))
-	if err != nil || token == "" {
+	authResp, err := parseAuthorizeResponse([]byte(parts[1]))
+	if err != nil || authResp.token == "" {
 		t.Fatalf("parse token: %v (%q)", err, strings.TrimSpace(parts[1]))
 	}
+	token := authResp.token
 
 	// Ensure the session is considered active right before the first TTL check, then becomes idle.
 	time.Sleep(ttl / 2)

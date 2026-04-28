@@ -52,6 +52,14 @@ func (c *DirectionalConn) Write(p []byte) (int, error) {
 	return c.writer.Write(p)
 }
 
+func (c *DirectionalConn) ReplaceWriter(writer io.Writer, closers ...func() error) {
+	if c == nil {
+		return
+	}
+	c.writer = writer
+	c.closers = closers
+}
+
 func (c *DirectionalConn) CloseRead() error {
 	if err := connutil.TryCloseRead(c.reader); err != nil {
 		return err

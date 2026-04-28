@@ -51,10 +51,19 @@ type BaseDialer struct {
 // DialBase establishes a Sudoku tunnel connection to the configured server,
 // performing the handshake but not requesting any target address.
 func (d *BaseDialer) DialBase() (net.Conn, error) {
-	return d.dialBase()
+	return d.dialBaseWithUplinkMode(ObfsUplinkPure)
 }
 
-func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.Table, upgrade func(net.Conn) (net.Conn, error)) (net.Conn, error) {
+// DialReverseBase establishes a reverse-session tunnel using packed uplink on the client side.
+func (d *BaseDialer) DialReverseBase() (net.Conn, error) {
+	return d.dialBaseWithUplinkMode(ObfsUplinkPacked)
+}
+
+func (d *BaseDialer) dialBase() (net.Conn, error) {
+	return d.dialBaseWithUplinkMode(ObfsUplinkPure)
+}
+
+func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.Table, tableHint uint32, hasTableHint bool, uplinkMode ObfsUplinkMode, upgrade func(net.Conn) (net.Conn, error)) (net.Conn, error) {
 	if d.Config == nil {
 		return nil, fmt.Errorf("missing config")
 	}
@@ -64,7 +73,8 @@ func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.T
 		EnablePureDownlink: d.Config.EnablePureDownlink,
 		PaddingMin:         d.Config.PaddingMin,
 		PaddingMax:         d.Config.PaddingMax,
-	}, table, kipUserHashFromPrivateKey(d.PrivateKey, d.Config.Key), KIPFeatAll)
+		PackedUplink:       uplinkMode == ObfsUplinkPacked,
+	}, table, tableHint, hasTableHint, kipUserHashFromPrivateKey(d.PrivateKey, d.Config.Key), KIPFeatAll)
 	if err != nil {
 		return nil, err
 	}
@@ -85,23 +95,23 @@ func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.T
 	return httpmask.DialTunnel(dialCtx, d.Config.ServerAddress, opts)
 }
 
-func (d *BaseDialer) pickTable() (*sudoku.Table, error) {
+func (d *BaseDialer) pickTable() (*sudoku.Table, uint32, bool, error) {
 	if len(d.Tables) == 0 {
-		return nil, fmt.Errorf("no table configured")
+		return nil, 0, false, fmt.Errorf("no table configured")
 	}
 	if len(d.Tables) == 1 {
-		return d.Tables[0], nil
+		return d.Tables[0], d.Tables[0].Hint(), false, nil
 	}
 	// Use crypto/rand to avoid shared global RNG in concurrent dialing.
 	var b [1]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return nil, fmt.Errorf("random table pick failed: %w", err)
+		return nil, 0, false, fmt.Errorf("random table pick failed: %w", err)
 	}
 	idx := int(b[0]) % len(d.Tables)
-	return d.Tables[idx], nil
+	return d.Tables[idx], d.Tables[idx].Hint(), true, nil
 }
 
-func (d *BaseDialer) dialBase() (net.Conn, error) {
+func (d *BaseDialer) dialBaseWithUplinkMode(uplinkMode ObfsUplinkMode) (net.Conn, error) {
 	if d.Config == nil {
 		return nil, fmt.Errorf("missing config")
 	}
@@ -116,19 +126,18 @@ func (d *BaseDialer) dialBase() (net.Conn, error) {
 		}
 		dialCtx, cancel := context.WithTimeout(baseCtx, 10*time.Second)
 		defer cancel()
-		table, err := d.pickTable()
+		table, tableHint, hasTableHint, err := d.pickTable()
 		if err != nil {
 			return nil, err
 		}
-		conn, err := d.dialHTTPMaskTunnel(dialCtx, table, func(raw net.Conn) (net.Conn, error) {
-			return ClientHandshake(raw, d.Config, table, d.PrivateKey)
+		conn, err := d.dialHTTPMaskTunnel(dialCtx, table, tableHint, hasTableHint, uplinkMode, func(raw net.Conn) (net.Conn, error) {
+			return ClientHandshakeWithUplinkMode(raw, d.Config, table, d.PrivateKey, uplinkMode, tableHint, hasTableHint)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("dial http tunnel failed: %w", err)
 		}
 		baseConn = conn
 	} else {
-		// Resolve server address with DNS concurrency and optimistic cache.
 		var (
 			rawRemote net.Conn
 			err       error
@@ -142,6 +151,7 @@ func (d *BaseDialer) dialBase() (net.Conn, error) {
 			defer cancel()
 			rawRemote, err = d.DialContext(dialCtx, "tcp", d.Config.ServerAddress)
 		} else {
+			// Resolve server address with DNS concurrency and optimistic cache.
 			baseCtx := d.Context
 			if baseCtx == nil {
 				baseCtx = context.Background()
@@ -169,12 +179,12 @@ func (d *BaseDialer) dialBase() (net.Conn, error) {
 			}
 		}
 
-		table, err := d.pickTable()
+		table, tableHint, hasTableHint, err := d.pickTable()
 		if err != nil {
 			rawRemote.Close()
 			return nil, err
 		}
-		baseConn, err = ClientHandshake(rawRemote, d.Config, table, d.PrivateKey)
+		baseConn, err = ClientHandshakeWithUplinkMode(rawRemote, d.Config, table, d.PrivateKey, uplinkMode, tableHint, hasTableHint)
 		if err != nil {
 			return nil, err
 		}
@@ -187,7 +197,6 @@ func (d *BaseDialer) dialTarget(destAddrStr string) (net.Conn, error) {
 	if strings.TrimSpace(destAddrStr) == "" {
 		return nil, fmt.Errorf("empty target address")
 	}
-
 	cConn, err := d.dialBase()
 	if err != nil {
 		return nil, err

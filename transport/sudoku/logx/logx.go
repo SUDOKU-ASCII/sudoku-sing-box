@@ -46,7 +46,6 @@ var (
 	writeMu sync.Mutex
 )
 
-func Debugf(component, format string, args ...any) { logf(LevelDebug, component, format, args...) }
 func Infof(component, format string, args ...any)  { logf(LevelInfo, component, format, args...) }
 func Warnf(component, format string, args ...any)  { logf(LevelWarn, component, format, args...) }
 func Errorf(component, format string, args ...any) { logf(LevelError, component, format, args...) }
@@ -72,11 +71,6 @@ func Promptf(component, format string, args ...any) {
 func Fatalf(component, format string, args ...any) {
 	Errorf(component, format, args...)
 	os.Exit(1)
-}
-
-func Panicf(component, format string, args ...any) {
-	Errorf(component, format, args...)
-	panic(fmt.Sprintf(format, args...))
 }
 
 func Dim(s string) string     { return color("\x1b[2m", s) }

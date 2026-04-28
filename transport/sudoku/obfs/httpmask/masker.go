@@ -157,11 +157,6 @@ func appendCommonHeaders(buf []byte, host string, r *rand.Rand) []byte {
 	return buf
 }
 
-// WriteRandomRequestHeader writes a plausible HTTP/1.1 request header as a mask.
-func WriteRandomRequestHeader(w io.Writer, host string) error {
-	return WriteRandomRequestHeaderWithPathRoot(w, host, "")
-}
-
 // WriteRandomRequestHeaderWithPathRoot is like WriteRandomRequestHeader but prefixes all paths with pathRoot
 // (a single segment such as "aabbcc" => "/aabbcc/...").
 func WriteRandomRequestHeaderWithPathRoot(w io.Writer, host string, pathRoot string) error {

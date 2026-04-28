@@ -123,11 +123,17 @@ type PreparedServerEarlyHandshake struct {
 
 type earlyHandshakeMeta interface {
 	HTTPMaskEarlyHandshakeUserHash() string
+	HTTPMaskEarlyHandshakeUplinkPacked() bool
+}
+
+type obfsMeta interface {
+	SudokuUplinkPacked() bool
 }
 
 type earlyHandshakeConn struct {
 	net.Conn
-	userHash string
+	userHash     string
+	uplinkPacked bool
 }
 
 func (c *earlyHandshakeConn) HTTPMaskEarlyHandshakeUserHash() string {
@@ -137,11 +143,29 @@ func (c *earlyHandshakeConn) HTTPMaskEarlyHandshakeUserHash() string {
 	return c.userHash
 }
 
-func wrapEarlyHandshakeConn(conn net.Conn, userHash string) net.Conn {
+func (c *earlyHandshakeConn) HTTPMaskEarlyHandshakeUplinkPacked() bool {
+	if c == nil {
+		return false
+	}
+	return c.uplinkPacked
+}
+
+func wrapEarlyHandshakeConn(conn net.Conn, userHash string, uplinkPacked bool) net.Conn {
 	if conn == nil {
 		return nil
 	}
-	return &earlyHandshakeConn{Conn: conn, userHash: userHash}
+	return &earlyHandshakeConn{Conn: conn, userHash: userHash, uplinkPacked: uplinkPacked}
+}
+
+func wrappedConnUplinkPacked(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	v, ok := conn.(obfsMeta)
+	if !ok {
+		return false
+	}
+	return v.SudokuUplinkPacked()
 }
 
 func EarlyHandshakeUserHash(conn net.Conn) (string, bool) {
@@ -153,6 +177,17 @@ func EarlyHandshakeUserHash(conn net.Conn) (string, bool) {
 		return "", false
 	}
 	return v.HTTPMaskEarlyHandshakeUserHash(), true
+}
+
+func EarlyHandshakeUplinkPacked(conn net.Conn) (bool, bool) {
+	if conn == nil {
+		return false, false
+	}
+	v, ok := conn.(earlyHandshakeMeta)
+	if !ok {
+		return false, false
+	}
+	return v.HTTPMaskEarlyHandshakeUplinkPacked(), true
 }
 
 // DialTunnel establishes a bidirectional stream over HTTP:

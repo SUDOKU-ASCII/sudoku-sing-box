@@ -60,6 +60,50 @@ func TestCustomLayoutAsciiPriority(t *testing.T) {
 	if table.layout.name != "ascii" {
 		t.Fatalf("expected ascii layout, got %s", table.layout.name)
 	}
+
+	defaultTable, err := NewTableWithCustom("seed-custom", "prefer_ascii", "")
+	if err != nil {
+		t.Fatalf("failed to build default ascii table: %v", err)
+	}
+	if table.Hint() != defaultTable.Hint() {
+		t.Fatalf("ascii hint should ignore custom pattern: got %d want %d", table.Hint(), defaultTable.Hint())
+	}
+}
+
+func TestCustomLayoutDirectionalModes(t *testing.T) {
+	table, err := NewTableWithCustom("seed-custom", "up_ascii_down_entropy", "xpxvvpvv")
+	if err != nil {
+		t.Fatalf("failed to build directional table: %v", err)
+	}
+	if !table.IsASCII || table.layout.name != "ascii" {
+		t.Fatalf("expected uplink ascii layout, got %s", table.layout.name)
+	}
+	if peer := table.OppositeDirection(); peer == nil || peer == table {
+		t.Fatalf("expected distinct downlink table")
+	} else if peer.IsASCII || peer.layout.name == "ascii" {
+		t.Fatalf("expected entropy/custom downlink layout, got %s", peer.layout.name)
+	}
+
+	table, err = NewTableWithCustom("seed-custom", "up_entropy_down_ascii", "xpxvvpvv")
+	if err != nil {
+		t.Fatalf("failed to build reverse directional table: %v", err)
+	}
+	if table.IsASCII || table.layout.name == "ascii" {
+		t.Fatalf("expected entropy/custom uplink layout, got %s", table.layout.name)
+	}
+	if peer := table.OppositeDirection(); peer == nil || peer == table {
+		t.Fatalf("expected distinct ascii downlink table")
+	} else if !peer.IsASCII || peer.layout.name != "ascii" {
+		t.Fatalf("expected ascii downlink layout, got %s", peer.layout.name)
+	}
+
+	alt, err := NewTableWithCustom("seed-custom", "up_ascii_down_entropy", "vxpvxvvp")
+	if err != nil {
+		t.Fatalf("failed to build alternate directional table: %v", err)
+	}
+	if table.Hint() == alt.Hint() {
+		t.Fatalf("directional entropy downlink hint should change with custom pattern")
+	}
 }
 
 func TestCustomLayoutConnRoundTrip(t *testing.T) {
@@ -101,7 +145,6 @@ func TestCustomLayoutPackedRoundTrip(t *testing.T) {
 	}
 
 	c1, c2 := net.Pipe()
-	defer c1.Close()
 	defer c2.Close()
 
 	writer := NewPackedConn(c1, table, 0, 0)
@@ -110,6 +153,8 @@ func TestCustomLayoutPackedRoundTrip(t *testing.T) {
 	payload := bytes.Repeat([]byte{0xAB, 0xCD, 0xEF, 0x01}, 8192)
 	done := make(chan error, 1)
 	go func() {
+		defer c1.Close()
+
 		if _, err := writer.Write(payload); err != nil {
 			done <- err
 			return
@@ -120,6 +165,9 @@ func TestCustomLayoutPackedRoundTrip(t *testing.T) {
 	buf := make([]byte, len(payload))
 	if _, err := io.ReadFull(reader, buf); err != nil {
 		t.Fatalf("read failed: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("drain failed: %v", err)
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("write/flush failed: %v", err)
@@ -136,6 +184,9 @@ func TestCustomLayoutInvalidPatterns(t *testing.T) {
 	if _, err := NewTableWithCustom("seed", "badmode", "xpxvvpvv"); err == nil {
 		t.Fatalf("expected error for invalid ascii mode")
 	}
+	if _, err := NewTableWithCustom("seed", "up_ascii_down_bad", "xpxvvpvv"); err == nil {
+		t.Fatalf("expected error for invalid directional ascii mode")
+	}
 }
 
 func TestCustomLayoutPackedStress(t *testing.T) {
@@ -145,7 +196,6 @@ func TestCustomLayoutPackedStress(t *testing.T) {
 	}
 
 	c1, c2 := net.Pipe()
-	defer c1.Close()
 	defer c2.Close()
 
 	writer := NewPackedConn(c1, table, 2, 4)
@@ -154,6 +204,8 @@ func TestCustomLayoutPackedStress(t *testing.T) {
 	payload := bytes.Repeat([]byte{0xFF, 0x00, 0x7F, 0x11, 0x22}, 20000) // ~100KB stress payload
 	done := make(chan error, 1)
 	go func() {
+		defer c1.Close()
+
 		if _, err := writer.Write(payload); err != nil {
 			done <- err
 			return
@@ -164,6 +216,9 @@ func TestCustomLayoutPackedStress(t *testing.T) {
 	buf := make([]byte, len(payload))
 	if _, err := io.ReadFull(reader, buf); err != nil {
 		t.Fatalf("read failed: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("drain failed: %v", err)
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("write/flush failed: %v", err)

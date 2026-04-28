@@ -59,7 +59,20 @@ func buildProtocolTables(key, ascii, customTable string, customTables []string, 
 	if clientSeed {
 		key = sudokut.ClientAEADSeed(key)
 	}
-	return sudokut.NewTablesWithCustomPatterns(key, resolveTableType(ascii), customTable, customTables)
+	patterns := customTables
+	if len(patterns) == 0 && strings.TrimSpace(customTable) != "" {
+		patterns = []string{strings.TrimSpace(customTable)}
+	}
+	if !clientSeed && len(patterns) > 0 && strings.TrimSpace(patterns[0]) != "" {
+		asciiMode, err := sudokuo.ParseASCIIMode(resolveTableType(ascii))
+		if err != nil {
+			return nil, err
+		}
+		if asciiMode.Uplink == "entropy" {
+			patterns = append([]string{""}, patterns...)
+		}
+	}
+	return sudokut.NewTablesWithCustomPatterns(key, resolveTableType(ascii), "", patterns)
 }
 
 func applyProtocolTables(cfg *sudokut.ProtocolConfig, tables []*sudokuo.Table) {

@@ -1,0 +1,111 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
+package tunnel
+
+import (
+	"io"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/sagernet/sing-box/transport/sudoku/internal/config"
+	"github.com/sagernet/sing-box/transport/sudoku/internal/protocol"
+	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
+)
+
+func TestSudokuTunnel_StandardDialer(t *testing.T) {
+	cfg := &config.Config{
+		Mode:               "server",
+		Transport:          "tcp",
+		ServerAddress:      "127.0.0.1:0",
+		Key:                "test-key-123",
+		AEAD:               "chacha20-poly1305",
+		PaddingMin:         0,
+		PaddingMax:         0,
+		ASCII:              "prefer_entropy",
+		EnablePureDownlink: true,
+		HTTPMask: config.HTTPMaskConfig{
+			Disable:   false,
+			Mode:      "legacy",
+			Multiplex: "on",
+		},
+	}
+	table := sudoku.NewTable(cfg.Key, cfg.ASCII)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	cfg.ServerAddress = listener.Addr().String()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+
+				sConn, _, err := HandshakeAndUpgradeWithTablesMeta(c, cfg, []*sudoku.Table{table})
+				if err != nil {
+					return
+				}
+				defer sConn.Close()
+
+				target, _, _, err := protocol.ReadAddress(sConn)
+				if err != nil || target == "" {
+					return
+				}
+
+				io.Copy(sConn, sConn)
+			}(conn)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	dialer := &StandardDialer{
+		BaseDialer: BaseDialer{
+			Config: cfg,
+			Tables: []*sudoku.Table{table},
+		},
+	}
+
+	conn, err := dialer.Dial("example.com:80")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	message := "hello"
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, len(message))
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = io.ReadFull(conn, buf)
+	}()
+	_, _ = conn.Write([]byte(message))
+	wg.Wait()
+}

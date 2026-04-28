@@ -146,11 +146,6 @@ func (e *SuspiciousError) Error() string {
 	return e.Err.Error()
 }
 
-// HandshakeAndUpgrade wraps the raw connection with Sudoku/Crypto and performs handshake.
-func HandshakeAndUpgrade(rawConn net.Conn, cfg *config.Config, table *sudoku.Table) (net.Conn, error) {
-	return HandshakeAndUpgradeWithTables(rawConn, cfg, []*sudoku.Table{table})
-}
-
 // HandshakeMeta carries optional, per-connection identity hints extracted from the client handshake.
 //
 // UserHash is a hex-encoded 8-byte value derived from the client's private key (when the client uses one):
@@ -159,6 +154,8 @@ type HandshakeMeta struct {
 	// UserHash is a hex-encoded 8-byte client identifier.
 	// When the client has a private key, it is sha256(privateKey)[:8].
 	UserHash string
+	// UplinkPacked reports whether the client used packed uplink obfuscation.
+	UplinkPacked bool
 }
 
 type recordedConn struct {
@@ -214,9 +211,9 @@ func (pc *prefixedRecorderConn) GetBufferedAndRecorded() []byte {
 	return out
 }
 
-func probeHandshakeBytes(probe []byte, cfg *config.Config, table *sudoku.Table) error {
+func probeHandshakeBytes(probe []byte, cfg *config.Config, table *sudoku.Table, uplinkMode ObfsUplinkMode) error {
 	rc := &connutil.ReadOnlyConn{Reader: bytes.NewReader(probe)}
-	_, obfsConn := buildObfsConnForServer(rc, table, cfg, false)
+	_, obfsConn := buildObfsConnForServer(rc, table, cfg, uplinkMode, false)
 	pskC2S, pskS2C := derivePSKDirectionalBases(cfg.Key)
 	// Server side: recv is client->server, send is server->client.
 	cConn, err := crypto.NewRecordConn(obfsConn, cfg.AEAD, pskS2C, pskC2S)
@@ -241,13 +238,6 @@ func probeHandshakeBytes(probe []byte, cfg *config.Config, table *sudoku.Table) 
 	return nil
 }
 
-// HandshakeAndUpgradeWithTables performs the handshake by probing one of multiple tables.
-// This enables per-connection table rotation without adding a plaintext table selector.
-func HandshakeAndUpgradeWithTables(rawConn net.Conn, cfg *config.Config, tables []*sudoku.Table) (net.Conn, error) {
-	conn, _, err := HandshakeAndUpgradeWithTablesMeta(rawConn, cfg, tables)
-	return conn, err
-}
-
 // HandshakeAndUpgradeWithTablesMeta is like HandshakeAndUpgradeWithTables but also returns handshake metadata
 // that can be used for multi-user accounting (e.g., per-split-private-key identification).
 func HandshakeAndUpgradeWithTablesMeta(rawConn net.Conn, cfg *config.Config, tables []*sudoku.Table) (net.Conn, *HandshakeMeta, error) {
@@ -258,7 +248,8 @@ func HandshakeAndUpgradeWithTablesMeta(rawConn net.Conn, cfg *config.Config, tab
 		return nil, nil, fmt.Errorf("nil config")
 	}
 	if userHash, ok := httpmask.EarlyHandshakeUserHash(rawConn); ok {
-		return rawConn, &HandshakeMeta{UserHash: userHash}, nil
+		uplinkPacked, _ := httpmask.EarlyHandshakeUplinkPacked(rawConn)
+		return rawConn, &HandshakeMeta{UserHash: userHash, UplinkPacked: uplinkPacked}, nil
 	}
 
 	// 0) Byte-level prelude handling (legacy HTTP mask + buffered probe bytes).
@@ -272,12 +263,8 @@ func HandshakeAndUpgradeWithTablesMeta(rawConn net.Conn, cfg *config.Config, tab
 	}
 
 	// 1. Sudoku Layer
-	if !cfg.EnablePureDownlink && cfg.AEAD == "none" {
-		return nil, nil, fmt.Errorf("enable_pure_downlink=false requires AEAD")
-	}
-
-	selectedTable, preRead, err := SelectTableByProbe(bufReader, tables, func(probe []byte, table *sudoku.Table) error {
-		return probeHandshakeBytes(probe, cfg, table)
+	selected, preRead, err := SelectHandshakeObfsByProbe(bufReader, tables, func(probe []byte, table *sudoku.Table, uplinkMode ObfsUplinkMode) error {
+		return probeHandshakeBytes(probe, cfg, table, uplinkMode)
 	})
 	if err != nil {
 		combined := make([]byte, 0, len(httpHeaderData)+len(preRead))
@@ -287,7 +274,7 @@ func HandshakeAndUpgradeWithTablesMeta(rawConn net.Conn, cfg *config.Config, tab
 	}
 
 	baseConn := NewPreBufferedConn(rawConn, preRead)
-	sConn, obfsConn := buildObfsConnForServer(baseConn, selectedTable, cfg, true)
+	sConn, obfsConn := buildObfsConnForServer(baseConn, selected.Table, cfg, selected.UplinkMode, true)
 
 	// 2. Crypto Layer
 	pskC2S, pskS2C := derivePSKDirectionalBases(cfg.Key)
@@ -313,9 +300,22 @@ func HandshakeAndUpgradeWithTablesMeta(rawConn net.Conn, cfg *config.Config, tab
 	if connutil.AbsInt64(time.Now().Unix()-ch.Timestamp.Unix()) > int64(kipHandshakeSkew.Seconds()) {
 		return nil, nil, &SuspiciousError{Err: fmt.Errorf("time skew/replay"), Conn: &prefixedRecorderConn{Conn: sConn, prefix: httpHeaderData}}
 	}
-	meta := &HandshakeMeta{UserHash: kipUserHashHex(ch.UserHash)}
+	meta := &HandshakeMeta{
+		UserHash:     kipUserHashHex(ch.UserHash),
+		UplinkPacked: selected.UplinkMode == ObfsUplinkPacked,
+	}
 	if !globalHandshakeReplay.allow(meta.UserHash, ch.Nonce, time.Now()) {
 		return nil, nil, &SuspiciousError{Err: fmt.Errorf("replay"), Conn: &prefixedRecorderConn{Conn: sConn, prefix: httpHeaderData}}
+	}
+	resolvedTable, err := ResolveClientHelloTable(selected.Table, tables, ch)
+	if err != nil {
+		return nil, nil, &SuspiciousError{Err: fmt.Errorf("resolve table hint failed: %w", err), Conn: &prefixedRecorderConn{Conn: sConn, prefix: httpHeaderData}}
+	}
+	if resolvedTable != selected.Table {
+		downlink, closers := sudoku.NewServerDownlinkWriter(baseConn, resolvedTable.OppositeDirection(), cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink)
+		if !SwitchConnDownlinkWriter(obfsConn, downlink, closers...) {
+			return nil, nil, &SuspiciousError{Err: fmt.Errorf("switch downlink writer failed"), Conn: &prefixedRecorderConn{Conn: sConn, prefix: httpHeaderData}}
+		}
 	}
 
 	curve := ecdh.X25519()
@@ -347,7 +347,7 @@ func HandshakeAndUpgradeWithTablesMeta(rawConn net.Conn, cfg *config.Config, tab
 	}
 
 	sConn.StopRecording()
-	return cConn, meta, nil
+	return wrapConnWithObfsMeta(cConn, selected.UplinkMode), meta, nil
 }
 
 func maybeConsumeLegacyHTTPMask(rawConn net.Conn, r *bufio.Reader, cfg *config.Config) ([]byte, *SuspiciousError) {

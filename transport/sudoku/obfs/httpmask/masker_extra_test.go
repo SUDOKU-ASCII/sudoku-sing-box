@@ -28,8 +28,8 @@ import (
 
 func TestWriteRandomRequestHeader(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteRandomRequestHeader(&buf, "example.com"); err != nil {
-		t.Fatalf("WriteRandomRequestHeader error: %v", err)
+	if err := WriteRandomRequestHeaderWithPathRoot(&buf, "example.com", ""); err != nil {
+		t.Fatalf("WriteRandomRequestHeaderWithPathRoot error: %v", err)
 	}
 	raw := buf.String()
 	if !(strings.HasPrefix(raw, "POST ") || strings.HasPrefix(raw, "GET ")) {

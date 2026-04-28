@@ -17,45 +17,34 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 In addition, no derivative work may use the name or imply association
 with this application without prior consent.
 */
-package sudoku
+package config
 
-const probOne = uint64(1) << 32
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
 
-func pickPaddingThreshold(r randomSource, pMin, pMax int) uint64 {
-	if r == nil {
-		return 0
-	}
-	if pMin < 0 {
-		pMin = 0
-	}
-	if pMax < pMin {
-		pMax = pMin
-	}
-	if pMax > 100 {
-		pMax = 100
-	}
-	if pMin > 100 {
-		pMin = 100
+// Save writes the config to disk with indentation.
+func Save(path string, cfg *Config) error {
+	if cfg == nil {
+		return nil
 	}
 
-	min := uint64(pMin) * probOne / 100
-	max := uint64(pMax) * probOne / 100
-	if max <= min {
-		return min
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
 	}
-	u := uint64(r.Uint32())
-	return min + (u * (max - min) >> 32)
-}
 
-func shouldPad(r randomSource, threshold uint64) bool {
-	if threshold == 0 {
-		return false
+	f, err := os.Create(path)
+	if err != nil {
+		return err
 	}
-	if threshold >= probOne {
-		return true
-	}
-	if r == nil {
-		return false
-	}
-	return uint64(r.Uint32()) < threshold
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(cfg)
 }

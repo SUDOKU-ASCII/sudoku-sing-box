@@ -110,17 +110,6 @@ func newResolver(ttl time.Duration, fn lookupIPFunc) *Resolver {
 	}
 }
 
-func ConfigureDefault(opts Options) error {
-	r, err := NewResolver(opts)
-	if err != nil {
-		return err
-	}
-	defaultResolverMu.Lock()
-	defaultResolver = r
-	defaultResolverMu.Unlock()
-	return nil
-}
-
 func Default() *Resolver {
 	defaultResolverMu.RLock()
 	r := defaultResolver
@@ -386,6 +375,12 @@ func buildNameServers(opts Options) ([]nameServer, error) {
 			servers = append(servers, localNameServer{})
 		case "https":
 			ns, err := newHTTPSNameServer(srv, opts.timeout())
+			if err != nil {
+				return nil, err
+			}
+			servers = append(servers, ns)
+		case "dot":
+			ns, err := newTLSNameServer(srv, opts.timeout())
 			if err != nil {
 				return nil, err
 			}

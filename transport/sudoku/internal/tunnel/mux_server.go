@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"syscall"
 	"time"
 
@@ -61,7 +62,7 @@ func HandleMuxWithStreamHandler(conn net.Conn, handler func(stream net.Conn, tar
 
 	<-sess.closed
 	err := sess.closedErr()
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) {
+	if isExpectedMuxSessionClose(err) {
 		return nil
 	}
 	return err
@@ -105,10 +106,21 @@ func HandleMuxWithDialer(conn net.Conn, onConnect func(targetAddr string), dialT
 
 	<-sess.closed
 	err := sess.closedErr()
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) {
+	if isExpectedMuxSessionClose(err) {
 		return nil
 	}
 	return err
+}
+
+func isExpectedMuxSessionClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset by peer") || strings.Contains(msg, "forcibly closed by the remote host")
 }
 
 func decodeMuxOpenTarget(payload []byte) (string, error) {
