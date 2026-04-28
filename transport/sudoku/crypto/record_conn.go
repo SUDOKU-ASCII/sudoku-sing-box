@@ -93,6 +93,10 @@ type RecordConn struct {
 	// writeFrame is a reusable buffer for [len||header||ciphertext] on the wire.
 	// Guarded by writeMu.
 	writeFrame []byte
+
+	// readFrame is a reusable buffer for [header||ciphertext] from the wire.
+	// Guarded by readMu.
+	readFrame []byte
 }
 
 func (c *RecordConn) CloseWrite() error {
@@ -401,7 +405,10 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 		return 0, errors.New("frame too large")
 	}
 
-	body := make([]byte, bodyLen)
+	if cap(c.readFrame) < bodyLen {
+		c.readFrame = make([]byte, bodyLen)
+	}
+	body := c.readFrame[:bodyLen]
 	if _, err := io.ReadFull(c.Conn, body); err != nil {
 		return 0, err
 	}
@@ -438,7 +445,7 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	}
 	aead := c.recvAEAD
 
-	plaintext, err := aead.Open(nil, header, ciphertext, header)
+	plaintext, err := aead.Open(ciphertext[:0], header, ciphertext, header)
 	if err != nil {
 		return 0, fmt.Errorf("decryption failed: epoch=%d seq=%d: %w", epoch, seq, err)
 	}
@@ -446,6 +453,9 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	c.recvSeq = seq + 1
 	c.recvInitialized = true
 
-	c.readBuf.Write(plaintext)
-	return c.readBuf.Read(p)
+	n := copy(p, plaintext)
+	if n < len(plaintext) {
+		_, _ = c.readBuf.Write(plaintext[n:])
+	}
+	return n, nil
 }

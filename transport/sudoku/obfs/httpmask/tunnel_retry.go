@@ -54,15 +54,28 @@ func resetTimer(t *time.Timer, d time.Duration) {
 	t.Reset(d)
 }
 
+func waitOrClosed(timer *time.Timer, d time.Duration, closed <-chan struct{}) bool {
+	resetTimer(timer, d)
+	select {
+	case <-timer.C:
+		return true
+	case <-closed:
+		return false
+	}
+}
+
 func retryDial(closed <-chan struct{}, closedErr func() error, maxRetry int, minBackoff, maxBackoff time.Duration, fn func() error) error {
 	backoff := minBackoff
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
 	for tries := 0; ; tries++ {
 		if err := fn(); err == nil {
 			return nil
 		} else if isDialError(err) && tries < maxRetry {
-			select {
-			case <-time.After(backoff):
-			case <-closed:
+			if !waitOrClosed(timer, backoff, closed) {
 				if closedErr != nil {
 					return closedErr()
 				}

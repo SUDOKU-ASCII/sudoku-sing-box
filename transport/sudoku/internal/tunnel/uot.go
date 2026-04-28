@@ -43,25 +43,26 @@ type UoTDialer interface {
 
 // WriteUoTDatagram sends a single UDP datagram frame over the reliable tunnel.
 func WriteUoTDatagram(w io.Writer, addr string, payload []byte) error {
-	addrBuf := &bytes.Buffer{}
-	if err := protocol.WriteAddress(addrBuf, addr); err != nil {
+	var addrStorage [300]byte
+	addrBytes, err := protocol.AppendAddress(addrStorage[:0], addr)
+	if err != nil {
 		return fmt.Errorf("encode address: %w", err)
 	}
 
-	if addrBuf.Len() > int(^uint16(0)) {
-		return fmt.Errorf("address too long: %d", addrBuf.Len())
+	if len(addrBytes) > int(^uint16(0)) {
+		return fmt.Errorf("address too long: %d", len(addrBytes))
 	}
 	if len(payload) > int(^uint16(0)) {
 		return fmt.Errorf("payload too large: %d", len(payload))
 	}
 
 	var header [4]byte
-	binary.BigEndian.PutUint16(header[:2], uint16(addrBuf.Len()))
+	binary.BigEndian.PutUint16(header[:2], uint16(len(addrBytes)))
 	binary.BigEndian.PutUint16(header[2:], uint16(len(payload)))
 	if err := connutil.WriteFull(w, header[:]); err != nil {
 		return err
 	}
-	if err := connutil.WriteFull(w, addrBuf.Bytes()); err != nil {
+	if err := connutil.WriteFull(w, addrBytes); err != nil {
 		return err
 	}
 	return connutil.WriteFull(w, payload)
