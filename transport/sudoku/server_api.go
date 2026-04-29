@@ -2,10 +2,12 @@ package sudoku
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 
+	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 	internalprotocol "github.com/sagernet/sing-box/transport/sudoku/internal/protocol"
 	internaltunnel "github.com/sagernet/sing-box/transport/sudoku/internal/tunnel"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/httpmask"
@@ -28,9 +30,10 @@ func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) *HTTPMaskTunnelServer {
 		switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
 		case "stream", "poll", "auto", "ws":
 			ts = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{
-				Mode:     cfg.HTTPMaskMode,
-				PathRoot: cfg.HTTPMaskPathRoot,
-				AuthKey:  cfg.Key,
+				Mode:                cfg.HTTPMaskMode,
+				PathRoot:            cfg.HTTPMaskPathRoot,
+				AuthKey:             cfg.Key,
+				PassThroughOnReject: shouldPassThroughRejectedHTTPMask(cfg),
 				EarlyHandshake: internaltunnel.NewHTTPMaskServerEarlyHandshake(internaltunnel.EarlyCodecConfig{
 					PSK:                cfg.Key,
 					AEAD:               cfg.AEADMethod,
@@ -43,6 +46,20 @@ func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) *HTTPMaskTunnelServer {
 	}
 
 	return &HTTPMaskTunnelServer{cfg: cfg, ts: ts}
+}
+
+func shouldPassThroughRejectedHTTPMask(cfg *ProtocolConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.SuspiciousAction)) {
+	case "", "fallback":
+		return strings.TrimSpace(cfg.FallbackAddress) != ""
+	case "silent":
+		return true
+	default:
+		return false
+	}
 }
 
 func ServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (*ServerSession, error) {
@@ -101,19 +118,86 @@ func (s *HTTPMaskTunnelServer) HandleConnSessionAutoWithUserHash(rawConn net.Con
 	case httpmask.HandleDone:
 		return nil, SessionForward, "", "", nil, true, nil
 	case httpmask.HandlePassThrough:
-		return handledServerHandshake(c, s.cfg)
+		if rejected, ok := c.(interface{ IsHTTPMaskRejected() bool }); ok && rejected.IsHTTPMaskRejected() {
+			return nil, SessionForward, "", "", nil, true, &internaltunnel.SuspiciousError{
+				Err:  fmt.Errorf("httpmask request rejected"),
+				Conn: newFallbackReplayConn(c, rawConn),
+			}
+		}
+		return handledServerHandshakeWithFallbackConn(c, s.cfg, c, true)
 	case httpmask.HandleStartTunnel:
 		inner := *s.cfg
 		inner.DisableHTTPMask = true
-		return handledServerHandshake(c, &inner)
+		return handledServerHandshakeWithFallbackConn(c, &inner, nil, false)
 	default:
 		return nil, SessionForward, "", "", nil, true, nil
 	}
 }
 
 func handledServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (net.Conn, SessionKind, string, string, []byte, bool, error) {
+	return handledServerHandshakeWithFallbackConn(rawConn, cfg, rawConn, true)
+}
+
+func handledServerHandshakeWithFallbackConn(rawConn net.Conn, cfg *ProtocolConfig, fallbackStream net.Conn, allowFallback bool) (net.Conn, SessionKind, string, string, []byte, bool, error) {
 	conn, session, target, userHash, payload, err := ServerHandshakeSessionAutoWithUserHash(rawConn, cfg)
+	if err != nil {
+		if !allowFallback && rawConn != nil {
+			_ = rawConn.Close()
+		}
+		var suspErr *internaltunnel.SuspiciousError
+		if errors.As(err, &suspErr) {
+			if allowFallback {
+				suspErr.Conn = newFallbackReplayConn(suspErr.Conn, fallbackStream)
+			} else {
+				err = suspErr.Err
+			}
+		}
+	}
 	return conn, session, target, userHash, payload, true, err
+}
+
+type fallbackReplayConn struct {
+	net.Conn
+	recorder interface {
+		GetBufferedAndRecorded() []byte
+	}
+}
+
+func newFallbackReplayConn(recorderConn net.Conn, streamConn net.Conn) net.Conn {
+	if streamConn == nil {
+		streamConn = recorderConn
+	}
+	if streamConn == nil {
+		return nil
+	}
+	recorder, _ := recorderConn.(interface {
+		GetBufferedAndRecorded() []byte
+	})
+	return &fallbackReplayConn{
+		Conn:     streamConn,
+		recorder: recorder,
+	}
+}
+
+func (c *fallbackReplayConn) CloseWrite() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseWrite(c.Conn)
+}
+
+func (c *fallbackReplayConn) CloseRead() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseRead(c.Conn)
+}
+
+func (c *fallbackReplayConn) GetBufferedAndRecorded() []byte {
+	if c == nil || c.recorder == nil {
+		return nil
+	}
+	return c.recorder.GetBufferedAndRecorded()
 }
 
 func readServerSession(conn net.Conn) (SessionKind, string, []byte, error) {
