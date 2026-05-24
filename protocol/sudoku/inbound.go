@@ -238,7 +238,7 @@ func (h *Inbound) handleSuspicious(ctx context.Context, suspErr *sudokut.Suspici
 		if recorder, ok := rawConn.(interface{ GetBufferedAndRecorded() []byte }); ok {
 			if badData := recorder.GetBufferedAndRecorded(); len(badData) > 0 {
 				_ = dst.SetWriteDeadline(time.Now().Add(3 * time.Second))
-				if err := writeFullConn(dst, badData); err != nil {
+				if err := connutil.WriteFull(dst, badData); err != nil {
 					h.logger.ErrorContext(ctx, E.Cause(err, "write fallback prelude"))
 					common.Close(dst, rawConn)
 					return
@@ -252,22 +252,6 @@ func (h *Inbound) handleSuspicious(ctx context.Context, suspErr *sudokut.Suspici
 	default:
 		common.Close(rawConn)
 	}
-}
-
-func writeFullConn(conn net.Conn, data []byte) error {
-	for len(data) > 0 {
-		n, err := conn.Write(data)
-		if n > 0 {
-			data = data[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
 }
 
 func relaySuspiciousPair(client, upstream net.Conn) {
