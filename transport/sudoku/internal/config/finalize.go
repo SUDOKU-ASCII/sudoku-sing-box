@@ -224,7 +224,11 @@ func (c *Config) Finalize() error {
 		}
 	}
 	if len(c.RuleURLs) > 0 {
-		c.ProxyMode = "pac"
+		if hasActionableRuleURLs(c.RuleURLs) {
+			c.ProxyMode = "pac"
+		} else {
+			c.ProxyMode = normalizeProxyMode(c.ProxyMode)
+		}
 	} else {
 		c.ProxyMode = normalizeProxyMode(c.ProxyMode)
 	}

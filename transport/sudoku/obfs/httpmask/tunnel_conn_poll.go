@@ -123,12 +123,7 @@ func (c *pollConn) pullLoop() {
 	var (
 		dialRetry int
 		backoff   = minBackoff
-		timer     = time.NewTimer(time.Hour)
 	)
-	if !timer.Stop() {
-		<-timer.C
-	}
-	defer timer.Stop()
 	for {
 		select {
 		case <-c.closed:
@@ -149,7 +144,9 @@ func (c *pollConn) pullLoop() {
 		if err != nil {
 			if isDialError(err) && dialRetry < maxDialRetry {
 				dialRetry++
-				if !waitOrClosed(timer, backoff, c.closed) {
+				select {
+				case <-time.After(backoff):
+				case <-c.closed:
 					return
 				}
 				backoff *= 2

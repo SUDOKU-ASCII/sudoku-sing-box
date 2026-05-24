@@ -23,6 +23,9 @@
     "mode": "legacy",
     "path_root": "",
     "multiplex": "off"
+  },
+  "reverse": {
+    "listen": "127.0.0.1:8081"
   }
 }
 ```
@@ -143,3 +146,9 @@ Optional first-level path prefix for all HTTP mask endpoints.
 Example: `aabbcc` => `/aabbcc/session`, `/aabbcc/api/v1/upload`, ...
 
 Must match the client when `httpmask.mode` is `stream`/`poll`/`auto`.
+
+#### reverse.listen
+
+Server-side reverse proxy entry address.
+
+When set, reverse clients can register routes through the Sudoku tunnel and this address serves the public reverse entry. HTTP path routes and one raw TCP route are supported, matching the official Sudoku reverse behavior.

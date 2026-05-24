@@ -28,10 +28,6 @@ import (
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
-// TableProbeFunc returns nil when the current probe bytes are sufficient to identify table as a match.
-// It should return io.EOF/io.ErrUnexpectedEOF when more bytes are needed, and any other error on mismatch.
-type TableProbeFunc func(probe []byte, table *sudoku.Table) error
-
 type HandshakeObfsProbeFunc func(probe []byte, table *sudoku.Table, uplinkMode ObfsUplinkMode) error
 
 type HandshakeObfsSelection struct {
@@ -56,34 +52,6 @@ func drainBuffered(r *bufio.Reader) ([]byte, error) {
 
 func isProbeNeedMore(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-// SelectTableByProbe detects which Sudoku table the client used by reading incremental bytes and
-// calling probe(probeBytes, table) for each remaining candidate.
-//
-// It returns the selected table and all bytes consumed from r (including any buffered bytes),
-// so the caller can replay them into the next layer without losing data.
-func SelectTableByProbe(r *bufio.Reader, tables []*sudoku.Table, probe TableProbeFunc) (*sudoku.Table, []byte, error) {
-	if probe == nil {
-		return nil, nil, fmt.Errorf("nil probe func")
-	}
-	if len(tables) > 255 {
-		return nil, nil, fmt.Errorf("too many table candidates: %d", len(tables))
-	}
-
-	candidates := make([]*sudoku.Table, 0, len(tables))
-	for _, table := range tables {
-		if table != nil {
-			candidates = append(candidates, table)
-		}
-	}
-	if len(candidates) == 0 {
-		return nil, nil, fmt.Errorf("no table candidates")
-	}
-
-	return selectProbeCandidates(r, candidates, func(probeBytes []byte, table *sudoku.Table) error {
-		return probe(probeBytes, table)
-	})
 }
 
 // SelectHandshakeObfsByProbe detects the Sudoku table and uplink mode used by the client handshake.

@@ -23,6 +23,9 @@
     "mode": "legacy",
     "path_root": "",
     "multiplex": "off"
+  },
+  "reverse": {
+    "listen": "127.0.0.1:8081"
   }
 }
 ```
@@ -143,3 +146,9 @@ HTTP 伪装模式。
 例如：`aabbcc` => `/aabbcc/session`、`/aabbcc/api/v1/upload` ...
 
 当 `httpmask.mode` 为 `stream`/`poll`/`auto` 时需与客户端一致。
+
+#### reverse.listen
+
+服务端反向代理入口地址。
+
+设置后，反向代理客户端可以通过 Sudoku 隧道注册路由，该地址会作为公开反代入口。支持 HTTP 路径路由和一个原始 TCP 路由，行为与官方 Sudoku 反代保持一致。

@@ -15,6 +15,19 @@ type SudokuHTTPMaskOptions struct {
 	Multiplex string `json:"multiplex,omitempty"`
 }
 
+type SudokuReverseOptions struct {
+	Listen   string               `json:"listen,omitempty"`
+	ClientID string               `json:"client_id,omitempty"`
+	Routes   []SudokuReverseRoute `json:"routes,omitempty"`
+}
+
+type SudokuReverseRoute struct {
+	Path        string `json:"path"`
+	Target      string `json:"target"`
+	StripPrefix *bool  `json:"strip_prefix,omitempty"`
+	HostHeader  string `json:"host_header,omitempty"`
+}
+
 func unmarshalOptional(obj map[string]json.RawMessage, key string, out any) (bool, error) {
 	raw, ok := obj[key]
 	if !ok {
@@ -45,6 +58,7 @@ type SudokuInboundOptions struct {
 	HTTPMaskMultiplex  string                `json:"http_mask_multiplex,omitempty"`
 	HTTPMaskPathRoot   string                `json:"http_mask_path_root,omitempty"`
 	HTTPMask           SudokuHTTPMaskOptions `json:"httpmask,omitempty"`
+	Reverse            SudokuReverseOptions  `json:"reverse,omitempty"`
 }
 
 type SudokuOutboundOptions struct {
@@ -66,6 +80,7 @@ type SudokuOutboundOptions struct {
 	HTTPMaskHost       string                `json:"http_mask_host,omitempty"`
 	HTTPMaskStrategy   string                `json:"http_mask_strategy,omitempty"`
 	HTTPMask           SudokuHTTPMaskOptions `json:"httpmask,omitempty"`
+	Reverse            SudokuReverseOptions  `json:"reverse,omitempty"`
 }
 
 func (o *SudokuInboundOptions) UnmarshalJSON(data []byte) error {

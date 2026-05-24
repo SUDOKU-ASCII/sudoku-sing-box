@@ -20,7 +20,6 @@ with this application without prior consent.
 package crypto
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -88,15 +87,13 @@ type RecordConn struct {
 	recvSeq         uint64
 	recvInitialized bool
 
-	readBuf bytes.Buffer
+	readFrame []byte
+	readPlain []byte
+	readOff   int
 
 	// writeFrame is a reusable buffer for [len||header||ciphertext] on the wire.
 	// Guarded by writeMu.
 	writeFrame []byte
-
-	// readFrame is a reusable buffer for [header||ciphertext] from the wire.
-	// Guarded by readMu.
-	readFrame []byte
 }
 
 func (c *RecordConn) CloseWrite() error {
@@ -155,7 +152,8 @@ func (c *RecordConn) Rekey(baseSend, baseRecv []byte) error {
 	if err := c.resetTrafficState(); err != nil {
 		return err
 	}
-	c.readBuf.Reset()
+	c.readPlain = nil
+	c.readOff = 0
 
 	c.sendAEAD = nil
 	c.recvAEAD = nil
@@ -382,6 +380,9 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	if c == nil || c.Conn == nil {
 		return 0, net.ErrClosed
 	}
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if c.method == "none" {
 		return c.Conn.Read(p)
 	}
@@ -389,8 +390,8 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	if c.readBuf.Len() > 0 {
-		return c.readBuf.Read(p)
+	if c.hasPendingPlainLocked() {
+		return c.drainPlainLocked(p), nil
 	}
 
 	var lenBuf [2]byte
@@ -453,9 +454,21 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	c.recvSeq = seq + 1
 	c.recvInitialized = true
 
-	n := copy(p, plaintext)
-	if n < len(plaintext) {
-		_, _ = c.readBuf.Write(plaintext[n:])
+	c.readPlain = plaintext
+	c.readOff = 0
+	return c.drainPlainLocked(p), nil
+}
+
+func (c *RecordConn) hasPendingPlainLocked() bool {
+	return c != nil && c.readOff < len(c.readPlain)
+}
+
+func (c *RecordConn) drainPlainLocked(dst []byte) int {
+	n := copy(dst, c.readPlain[c.readOff:])
+	c.readOff += n
+	if c.readOff >= len(c.readPlain) {
+		c.readPlain = nil
+		c.readOff = 0
 	}
-	return n, nil
+	return n
 }

@@ -5,6 +5,9 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -25,10 +28,20 @@ func RegisterOutbound(registry *outbound.Registry) {
 
 type Outbound struct {
 	outbound.Adapter
+	ctx          context.Context
+	logger       log.ContextLogger
 	dialer       N.Dialer
 	baseConf     sudokut.ProtocolConfig
 	httpMaskPool *sudokut.HTTPMaskTransportPool
 	muxClient    *sudokut.MuxClient
+	reverse      *reverseClient
+}
+
+type reverseClient struct {
+	clientID string
+	routes   []sudokut.ReverseRoute
+	done     chan struct{}
+	once     sync.Once
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SudokuOutboundOptions) (adapter.Outbound, error) {
@@ -76,6 +89,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	out := &Outbound{
 		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeSudoku, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		ctx:          ctx,
+		logger:       logger,
 		dialer:       outboundDialer,
 		baseConf:     baseConf,
 		httpMaskPool: new(sudokut.HTTPMaskTransportPool),
@@ -89,8 +104,32 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			return nil, err
 		}
 	}
+	if len(options.Reverse.Routes) > 0 {
+		routes := make([]sudokut.ReverseRoute, 0, len(options.Reverse.Routes))
+		for _, route := range options.Reverse.Routes {
+			routes = append(routes, sudokut.ReverseRoute{
+				Path:        route.Path,
+				Target:      route.Target,
+				StripPrefix: route.StripPrefix,
+				HostHeader:  route.HostHeader,
+			})
+		}
+		out.reverse = &reverseClient{
+			clientID: strings.TrimSpace(options.Reverse.ClientID),
+			routes:   routes,
+			done:     make(chan struct{}),
+		}
+	}
 
 	return out, nil
+}
+
+func (h *Outbound) Start(stage adapter.StartStage) error {
+	if stage != adapter.StartStateStart || h.reverse == nil {
+		return nil
+	}
+	go h.serveReverse()
+	return nil
 }
 
 func (h *Outbound) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -98,7 +137,46 @@ func (h *Outbound) dialContext(ctx context.Context, network, addr string) (net.C
 }
 
 func (h *Outbound) Close() error {
+	if h.reverse != nil {
+		h.reverse.once.Do(func() { close(h.reverse.done) })
+	}
 	return common.Close(common.PtrOrNil(h.muxClient), common.PtrOrNil(h.httpMaskPool))
+}
+
+func (h *Outbound) serveReverse() {
+	backoff := 250 * time.Millisecond
+	maxBackoff := 10 * time.Second
+	for {
+		select {
+		case <-h.reverse.done:
+			return
+		default:
+		}
+
+		err := sudokut.DialReverseClientSession(h.ctx, &h.baseConf, h.reverse.clientID, h.reverse.routes)
+		select {
+		case <-h.reverse.done:
+			return
+		default:
+		}
+		if err != nil {
+			h.logger.WarnContext(h.ctx, E.Cause(err, "Sudoku reverse session ended"))
+		} else {
+			h.logger.InfoContext(h.ctx, "Sudoku reverse session ended")
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+		case <-h.reverse.done:
+			timer.Stop()
+			return
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

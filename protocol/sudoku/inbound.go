@@ -40,6 +40,7 @@ type Inbound struct {
 	listener  *listener.Listener
 	protoConf sudokut.ProtocolConfig
 	tunnelSrv *sudokut.HTTPMaskTunnelServer
+	reverse   *sudokut.ReverseManager
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SudokuInboundOptions) (adapter.Inbound, error) {
@@ -80,6 +81,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	applyProtocolTables(&protoConf, tables)
 
+	var reverseManager *sudokut.ReverseManager
+	if strings.TrimSpace(options.Reverse.Listen) != "" {
+		reverseManager, err = sudokut.NewReverseManager(options.Reverse.Listen)
+		if err != nil {
+			return nil, E.Cause(err, "create reverse entry")
+		}
+	}
+
 	in := &Inbound{
 		Adapter:   inbound.NewAdapter(C.TypeSudoku, tag),
 		ctx:       ctx,
@@ -87,6 +96,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:    logger,
 		protoConf: protoConf,
 		tunnelSrv: sudokut.NewHTTPMaskTunnelServer(&protoConf),
+		reverse:   reverseManager,
 	}
 	in.listener = listener.New(listener.Options{
 		Context:           ctx,
@@ -102,11 +112,18 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	if h.reverse != nil {
+		go func() {
+			if err := h.reverse.Serve(); err != nil {
+				h.logger.ErrorContext(h.ctx, E.Cause(err, "serve Sudoku reverse entry"))
+			}
+		}()
+	}
 	return h.listener.Start()
 }
 
 func (h *Inbound) Close() error {
-	return common.Close(h.listener, common.PtrOrNil(h.tunnelSrv))
+	return common.Close(h.listener, common.PtrOrNil(h.tunnelSrv), common.PtrOrNil(h.reverse))
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -154,6 +171,17 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		})
 		if err != nil {
 			h.logger.ErrorContext(ctx, E.Cause(err, "process mux session from ", metadata.Source))
+		}
+	case sudokut.SessionReverse:
+		if h.reverse == nil {
+			_ = sessionConn.Close()
+			h.logger.WarnContext(ctx, "drop Sudoku reverse session from ", metadata.Source, ": reverse entry is not configured")
+			return
+		}
+		h.logger.InfoContext(ctx, "inbound Sudoku reverse session from ", metadata.Source)
+		err = h.reverse.HandleServerSession(sessionConn, userHash, payload)
+		if err != nil {
+			h.logger.ErrorContext(ctx, E.Cause(err, "process reverse session from ", metadata.Source))
 		}
 	case sudokut.SessionForward:
 		target := M.ParseSocksaddr(targetAddr)

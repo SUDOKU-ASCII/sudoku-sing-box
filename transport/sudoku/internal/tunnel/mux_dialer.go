@@ -20,6 +20,7 @@ with this application without prior consent.
 package tunnel
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -62,9 +63,8 @@ func (d *MuxDialer) Dial(destAddrStr string) (net.Conn, error) {
 		return nil, err
 	}
 
-	var addrStorage [300]byte
-	addrBytes, err := protocol.AppendAddress(addrStorage[:0], destAddrStr)
-	if err != nil {
+	var addrBuf bytes.Buffer
+	if err := protocol.WriteAddress(&addrBuf, destAddrStr); err != nil {
 		return nil, fmt.Errorf("encode address failed: %w", err)
 	}
 
@@ -72,7 +72,7 @@ func (d *MuxDialer) Dial(destAddrStr string) (net.Conn, error) {
 	st := newMuxStream(sess, streamID)
 	sess.registerStream(st)
 
-	if err := sess.sendFrame(muxFrameOpen, streamID, addrBytes); err != nil {
+	if err := sess.sendFrame(muxFrameOpen, streamID, addrBuf.Bytes()); err != nil {
 		st.closeNoSend(err)
 		sess.removeStream(streamID)
 		return nil, fmt.Errorf("mux open failed: %w", err)

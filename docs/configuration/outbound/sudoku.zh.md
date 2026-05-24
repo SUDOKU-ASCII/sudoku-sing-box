@@ -24,6 +24,17 @@
     "path_root": "",
     "multiplex": "off"
   },
+  "reverse": {
+    "client_id": "client-a",
+    "routes": [
+      {
+        "path": "/app",
+        "target": "127.0.0.1:3000",
+        "strip_prefix": true,
+        "host_header": ""
+      }
+    ]
+  },
 
   ... // 拨号字段
 }
@@ -150,6 +161,23 @@ HTTP 伪装模式。
 * `random`
 * `post`
 * `websocket`
+
+#### reverse.client_id
+
+可选的反向代理客户端标识。
+
+#### reverse.routes
+
+需要通过服务端 `reverse.listen` 入口暴露的客户端侧服务。
+
+每条路由字段：
+
+* `path`：公开 HTTP 路径前缀。为空时表示原始 TCP 反向转发。
+* `target`：客户端侧 `host:port` 目标。
+* `strip_prefix`：代理到上游前是否剥离公开路径，默认 `true`。
+* `host_header`：可选的上游 Host 头覆盖。
+
+反向代理会使用 packed uplink，与官方 Sudoku v0.4.6 的反代行为一致。
 
 ### 拨号字段
 

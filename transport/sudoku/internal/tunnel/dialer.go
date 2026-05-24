@@ -142,20 +142,16 @@ func (d *BaseDialer) dialBaseWithUplinkMode(uplinkMode ObfsUplinkMode) (net.Conn
 			rawRemote net.Conn
 			err       error
 		)
+		baseCtx := d.Context
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
 		if d.DialContext != nil {
-			baseCtx := d.Context
-			if baseCtx == nil {
-				baseCtx = context.Background()
-			}
 			dialCtx, cancel := context.WithTimeout(baseCtx, 10*time.Second)
 			defer cancel()
 			rawRemote, err = d.DialContext(dialCtx, "tcp", d.Config.ServerAddress)
 		} else {
 			// Resolve server address with DNS concurrency and optimistic cache.
-			baseCtx := d.Context
-			if baseCtx == nil {
-				baseCtx = context.Background()
-			}
 			resolveCtx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
 			defer cancel()
 

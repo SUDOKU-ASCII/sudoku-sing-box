@@ -130,12 +130,7 @@ func (c *streamSplitConn) pullLoop() {
 	var (
 		dialRetry int
 		backoff   = minBackoff
-		timer     = time.NewTimer(time.Hour)
 	)
-	if !timer.Stop() {
-		<-timer.C
-	}
-	defer timer.Stop()
 	buf := make([]byte, readChunkSize)
 	for {
 		select {
@@ -160,7 +155,9 @@ func (c *streamSplitConn) pullLoop() {
 			cancel()
 			if isDialError(err) && dialRetry < maxDialRetry {
 				dialRetry++
-				if !waitOrClosed(timer, backoff, c.closed) {
+				select {
+				case <-time.After(backoff):
+				case <-c.closed:
 					return
 				}
 				backoff *= 2
@@ -211,7 +208,9 @@ func (c *streamSplitConn) pullLoop() {
 		cancel()
 		if !readAny {
 			// Avoid tight loop if the server replied quickly with an empty body.
-			if !waitOrClosed(timer, idleBackoff, c.closed) {
+			select {
+			case <-time.After(idleBackoff):
+			case <-c.closed:
 				return
 			}
 		}

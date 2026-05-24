@@ -24,6 +24,17 @@
     "path_root": "",
     "multiplex": "off"
   },
+  "reverse": {
+    "client_id": "client-a",
+    "routes": [
+      {
+        "path": "/app",
+        "target": "127.0.0.1:3000",
+        "strip_prefix": true,
+        "host_header": ""
+      }
+    ]
+  },
 
   ... // Dial Fields
 }
@@ -150,6 +161,23 @@ Available values:
 * `random`
 * `post`
 * `websocket`
+
+#### reverse.client_id
+
+Optional reverse client identifier.
+
+#### reverse.routes
+
+Client-side services to expose through a server-side `reverse.listen` entry.
+
+Each route uses:
+
+* `path`: public HTTP path prefix. Empty path means raw TCP reverse forwarding.
+* `target`: client-side `host:port` target.
+* `strip_prefix`: strip the public path before proxying. Defaults to `true`.
+* `host_header`: optional upstream Host header override.
+
+Reverse sessions use packed uplink, matching official Sudoku v0.4.6 reverse behavior.
 
 ### Dial Fields
 

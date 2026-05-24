@@ -152,10 +152,13 @@ func dialWS(ctx context.Context, serverAddress string, opts TunnelDialOptions) (
 		ResponseHeaderTimeout: 20 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-			d := dnsutil.OutboundDialer(0)
 			if addr == urlHost {
 				addr = dialAddr
 			}
+			if opts.DialContext != nil {
+				return opts.DialContext(dialCtx, network, addr)
+			}
+			d := dnsutil.OutboundDialer(0)
 			return d.DialContext(dialCtx, network, addr)
 		},
 	}

@@ -91,16 +91,16 @@ func ReadAddress(r io.Reader) (string, byte, net.IP, error) {
 	return net.JoinHostPort(host, strconv.Itoa(int(port))), addrType, ip, nil
 }
 
-// AppendAddress appends rawAddr in SOCKS5 address format to dst.
-// rawAddr must be "host:port".
-func AppendAddress(dst []byte, rawAddr string) ([]byte, error) {
+// WriteAddress 将地址写入 Writer (SOCKS5 格式)
+// 输入 rawAddr 为 "host:port"
+func WriteAddress(w io.Writer, rawAddr string) error {
 	host, portStr, err := net.SplitHostPort(rawAddr)
 	if err != nil {
-		return dst, err
+		return err
 	}
 	portInt, err := strconv.Atoi(portStr)
 	if err != nil || portInt < 0 || portInt > 65535 {
-		return dst, fmt.Errorf("invalid port: %q", portStr)
+		return fmt.Errorf("invalid port: %q", portStr)
 	}
 
 	if i := strings.IndexByte(host, '%'); i >= 0 {
@@ -109,39 +109,33 @@ func AppendAddress(dst []byte, rawAddr string) ([]byte, error) {
 	}
 	ip := net.ParseIP(host)
 
+	// 构建缓冲
+	buf := make([]byte, 0, 300)
+
 	if ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
-			dst = append(dst, AddrTypeIPv4)
-			dst = append(dst, ip4...)
+			buf = append(buf, AddrTypeIPv4)
+			buf = append(buf, ip4...)
 		} else {
 			ip16 := ip.To16()
 			if ip16 == nil {
-				return dst, fmt.Errorf("invalid ipv6: %q", host)
+				return fmt.Errorf("invalid ipv6: %q", host)
 			}
-			dst = append(dst, AddrTypeIPv6)
-			dst = append(dst, ip16...)
+			buf = append(buf, AddrTypeIPv6)
+			buf = append(buf, ip16...)
 		}
 	} else {
+		buf = append(buf, AddrTypeDomain)
 		if len(host) > 255 {
-			return dst, errors.New("domain too long")
+			return errors.New("domain too long")
 		}
-		dst = append(dst, AddrTypeDomain, byte(len(host)))
-		dst = append(dst, host...)
+		buf = append(buf, byte(len(host)))
+		buf = append(buf, []byte(host)...)
 	}
 
 	var portBytes [2]byte
 	binary.BigEndian.PutUint16(portBytes[:], uint16(portInt))
-	dst = append(dst, portBytes[:]...)
-	return dst, nil
-}
-
-// WriteAddress 将地址写入 Writer (SOCKS5 格式)
-// 输入 rawAddr 为 "host:port"
-func WriteAddress(w io.Writer, rawAddr string) error {
-	buf, err := AppendAddress(make([]byte, 0, 300), rawAddr)
-	if err != nil {
-		return err
-	}
+	buf = append(buf, portBytes[:]...)
 
 	_, err = w.Write(buf)
 	return err
