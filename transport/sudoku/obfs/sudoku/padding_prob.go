@@ -46,16 +46,3 @@ func pickPaddingThreshold(r randomSource, pMin, pMax int) uint64 {
 	u := uint64(r.Uint32())
 	return min + (u * (max - min) >> 32)
 }
-
-func shouldPad(r randomSource, threshold uint64) bool {
-	if threshold == 0 {
-		return false
-	}
-	if threshold >= probOne {
-		return true
-	}
-	if r == nil {
-		return false
-	}
-	return uint64(r.Uint32()) < threshold
-}

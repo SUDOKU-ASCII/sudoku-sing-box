@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 	"github.com/sagernet/sing-box/transport/sudoku/internal/config"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
@@ -54,6 +55,20 @@ func (c *connWithObfsMeta) SudokuUplinkPacked() bool {
 		return false
 	}
 	return c.uplinkPacked
+}
+
+func (c *connWithObfsMeta) CloseWrite() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseWrite(c.Conn)
+}
+
+func (c *connWithObfsMeta) CloseRead() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseRead(c.Conn)
 }
 
 func WrapConnWithObfsMeta(conn net.Conn, uplinkMode ObfsUplinkMode) net.Conn {
