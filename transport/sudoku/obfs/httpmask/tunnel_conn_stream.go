@@ -47,13 +47,14 @@ type streamConn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client     *http.Client
-	pushURL    string
-	pullURL    string
-	finURL     string
-	closeURL   string
-	headerHost string
-	auth       *tunnelAuth
+	client         *http.Client
+	pushURL        string
+	pullURL        string
+	initialPullURL string
+	finURL         string
+	closeURL       string
+	headerHost     string
+	auth           *tunnelAuth
 
 	early     *ClientEarlyHandshake
 	earlyDone chan error
@@ -104,20 +105,22 @@ func newPacketUpSession(serverAddress string, opts TunnelDialOptions) (*sessionD
 	}
 	query := "token=" + url.QueryEscape(token)
 	pullURL := (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/stream"), RawQuery: query}).String()
+	initialPullURL := pullURL
 	if opts.EarlyHandshake != nil && len(opts.EarlyHandshake.RequestPayload) > 0 {
-		pullURL, err = setEarlyDataQuery(pullURL, opts.EarlyHandshake.RequestPayload)
+		initialPullURL, err = setEarlyDataQuery(initialPullURL, opts.EarlyHandshake.RequestPayload)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return &sessionDialInfo{
-		client:     client,
-		pushURL:    (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query}).String(),
-		pullURL:    pullURL,
-		finURL:     (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query + "&fin=1"}).String(),
-		closeURL:   (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query + "&close=1"}).String(),
-		headerHost: headerHost,
-		auth:       auth,
+		client:         client,
+		pushURL:        (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query}).String(),
+		pullURL:        pullURL,
+		initialPullURL: initialPullURL,
+		finURL:         (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query + "&fin=1"}).String(),
+		closeURL:       (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query + "&close=1"}).String(),
+		headerHost:     headerHost,
+		auth:           auth,
 	}, nil
 }
 
@@ -205,15 +208,16 @@ func newStreamPacketConn(ctx context.Context, info *sessionDialInfo, opts Tunnel
 func newStreamConn(info *sessionDialInfo) *streamConn {
 	connCtx, cancel := context.WithCancel(context.Background())
 	return &streamConn{
-		ctx:        connCtx,
-		cancel:     cancel,
-		client:     info.client,
-		pushURL:    info.pushURL,
-		pullURL:    info.pullURL,
-		finURL:     info.finURL,
-		closeURL:   info.closeURL,
-		headerHost: info.headerHost,
-		auth:       info.auth,
+		ctx:            connCtx,
+		cancel:         cancel,
+		client:         info.client,
+		pushURL:        info.pushURL,
+		pullURL:        info.pullURL,
+		initialPullURL: info.initialPullURL,
+		finURL:         info.finURL,
+		closeURL:       info.closeURL,
+		headerHost:     info.headerHost,
+		auth:           info.auth,
 		queuedConn: queuedConn{
 			rxc:         make(chan []byte, queuedConnPayloadQueueDepth),
 			closed:      make(chan struct{}),
@@ -265,8 +269,9 @@ func (c *streamConn) pullLoop() {
 	)
 
 	var (
-		dialRetry int
-		backoff   = minBackoff
+		dialRetry      int
+		backoff        = minBackoff
+		initialPullURL = c.initialPullURL
 	)
 	buf := make([]byte, readChunkSize)
 	for {
@@ -276,8 +281,12 @@ func (c *streamConn) pullLoop() {
 		default:
 		}
 
+		pullURL := c.pullURL
+		if initialPullURL != "" {
+			pullURL = initialPullURL
+		}
 		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.pullURL, nil)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, pullURL, nil)
 		if err != nil {
 			cancel()
 			_ = c.Close()
@@ -317,6 +326,7 @@ func (c *streamConn) pullLoop() {
 			_ = c.Close()
 			return
 		}
+		initialPullURL = ""
 		c.signalEarly(c.handleEarlyResponse(resp.Header))
 
 		readAny := false

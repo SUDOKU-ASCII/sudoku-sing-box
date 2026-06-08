@@ -88,6 +88,11 @@ type tunnelSession struct {
 	pendingUpload map[uint64][]byte
 }
 
+type tunnelHTTPReject struct {
+	code int
+	body string
+}
+
 func NewTunnelServer(opts TunnelServerOptions) *TunnelServer {
 	mode := normalizeTunnelMode(opts.Mode)
 	if mode == TunnelModeLegacy {
@@ -440,9 +445,9 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 		// GET /stream?token=... is either old split-stream downlink or the
 		// packet-up downlink that creates the server-side tunnel.
 		if token != "" && path == "/stream" {
-			prepared, err := s.prepareEarlyHandshake(rawConn, req, headerBytes, buffered, u)
-			if err != nil {
-				return HandleDone, nil, err
+			prepared, reject := s.prepareEarlyHandshake(u)
+			if reject != nil {
+				return s.rejectOrReply(rawConn, headerBytes, buffered, reject.code, reject.body)
 			}
 			if startConn, ok := s.startPacketUpSession(token); ok {
 				outConn := net.Conn(startConn)
@@ -690,19 +695,17 @@ func (s *TunnelServer) sessionAuthorize(rawConn net.Conn, headerBytes, buffered,
 	return HandleStartTunnel, outConn, nil
 }
 
-func (s *TunnelServer) prepareEarlyHandshake(rawConn net.Conn, req *httpRequestHeader, headerBytes, buffered []byte, u *url.URL) (*PreparedServerEarlyHandshake, error) {
+func (s *TunnelServer) prepareEarlyHandshake(u *url.URL) (*PreparedServerEarlyHandshake, *tunnelHTTPReject) {
 	earlyPayload, err := parseEarlyDataQuery(u)
 	if err != nil {
-		_, _, rejectErr := s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusBadRequest, "bad request")
-		return nil, rejectErr
+		return nil, &tunnelHTTPReject{code: http.StatusBadRequest, body: "bad request"}
 	}
 	if len(earlyPayload) == 0 || s.earlyHandshake == nil || s.earlyHandshake.Prepare == nil {
 		return nil, nil
 	}
 	prepared, err := s.earlyHandshake.Prepare(earlyPayload)
 	if err != nil {
-		_, _, rejectErr := s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusNotFound, "not found")
-		return nil, rejectErr
+		return nil, &tunnelHTTPReject{code: http.StatusNotFound, body: "not found"}
 	}
 	return prepared, nil
 }

@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -897,6 +898,60 @@ func TestDialStream_UsesPacketUpWithoutAuthorize(t *testing.T) {
 	}
 }
 
+func TestDialStreamPacketUp_EarlyDataOnlyOnInitialPull(t *testing.T) {
+	queryCh := make(chan string, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/stream":
+			queryCh <- r.URL.RawQuery
+			w.Header().Set(tunnelEarlyDataHeader, base64.RawURLEncoding.EncodeToString([]byte("ok")))
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/upload":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := dialStream(ctx, srv.Listener.Addr().String(), TunnelDialOptions{
+		EarlyHandshake: &ClientEarlyHandshake{
+			RequestPayload: []byte("hello"),
+			HandleResponse: func(payload []byte) error {
+				if string(payload) != "ok" {
+					return fmt.Errorf("unexpected early response: %q", string(payload))
+				}
+				return nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("dialStream: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	var first, second string
+	select {
+	case first = <-queryCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for initial pull")
+	}
+	select {
+	case second = <-queryCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for retry pull")
+	}
+	if !strings.Contains(first, "ed=") {
+		t.Fatalf("initial pull did not carry early data: %q", first)
+	}
+	if strings.Contains(second, "ed=") {
+		t.Fatalf("retry pull replayed early data: first=%q second=%q", first, second)
+	}
+}
+
 func TestTunnelServer_Stream_PacketUp_PostBeforeGet(t *testing.T) {
 	srv := NewTunnelServer(TunnelServerOptions{
 		Mode:            "stream",
@@ -990,6 +1045,66 @@ func TestTunnelServer_Stream_PacketUp_PostBeforeGet(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timeout waiting for post response")
+	}
+}
+
+func TestTunnelServer_Stream_PacketUpEarlyRejectPassThrough(t *testing.T) {
+	srv := NewTunnelServer(TunnelServerOptions{
+		Mode:                "stream",
+		PassThroughOnReject: true,
+		EarlyHandshake: &TunnelServerEarlyHandshake{
+			Prepare: func([]byte) (*PreparedServerEarlyHandshake, error) {
+				return nil, errors.New("reject early")
+			},
+		},
+	})
+
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close() })
+
+	var (
+		res HandleResult
+		c   net.Conn
+		err error
+	)
+	done := make(chan struct{})
+	go func() {
+		res, c, err = srv.HandleConn(server)
+		close(done)
+	}()
+
+	req := "GET /stream?token=client-token&ed=YmFk HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"X-Sudoku-Tunnel: stream\r\n" +
+		"\r\n"
+	if _, err := io.WriteString(client, req); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for HandleConn")
+	}
+	if err != nil {
+		t.Fatalf("HandleConn error: %v", err)
+	}
+	if res != HandlePassThrough || c == nil {
+		t.Fatalf("unexpected result: res=%v conn=%v", res, c)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	rejected, ok := c.(interface{ IsHTTPMaskRejected() bool })
+	if !ok || !rejected.IsHTTPMaskRejected() {
+		t.Fatalf("expected rejected passthrough conn")
+	}
+	recorder, ok := c.(interface{ GetBufferedAndRecorded() []byte })
+	if !ok {
+		t.Fatalf("passthrough conn does not expose replay bytes")
+	}
+	replay := string(recorder.GetBufferedAndRecorded())
+	if !strings.Contains(replay, "GET /stream?token=client-token&ed=YmFk HTTP/1.1") {
+		t.Fatalf("missing replayed request line: %q", replay)
 	}
 }
 

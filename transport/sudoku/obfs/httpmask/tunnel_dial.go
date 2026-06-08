@@ -142,13 +142,14 @@ func parseEarlyDataQuery(u *url.URL) ([]byte, error) {
 }
 
 type sessionDialInfo struct {
-	client     *http.Client
-	pushURL    string
-	pullURL    string
-	finURL     string
-	closeURL   string
-	headerHost string
-	auth       *tunnelAuth
+	client         *http.Client
+	pushURL        string
+	pullURL        string
+	initialPullURL string
+	finURL         string
+	closeURL       string
+	headerHost     string
+	auth           *tunnelAuth
 }
 
 type transportKey struct {
