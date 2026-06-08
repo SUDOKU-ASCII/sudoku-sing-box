@@ -59,6 +59,8 @@ type streamConn struct {
 	early     *ClientEarlyHandshake
 	earlyDone chan error
 	earlyOnce sync.Once
+
+	prewarmDone chan struct{}
 }
 
 func (c *streamConn) Close() error {
@@ -70,15 +72,6 @@ func (c *streamConn) Close() error {
 
 	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModeStream, c.auth)
 	return nil
-}
-
-func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
-	info, err := dialSession(ctx, serverAddress, opts, TunnelModeStream)
-	if err != nil {
-		return nil, err
-	}
-
-	return newStreamSplitConn(info, opts)
 }
 
 func dialStreamPacketUp(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
@@ -124,42 +117,13 @@ func newPacketUpSession(serverAddress string, opts TunnelDialOptions) (*sessionD
 	}, nil
 }
 
-func newStreamSplitConn(info *sessionDialInfo, opts TunnelDialOptions) (net.Conn, error) {
-	c := newStreamConn(info)
-
-	go c.pullLoop()
-	go c.pushLoop()
-	outConn := net.Conn(c)
-	if opts.EarlyHandshake != nil && opts.EarlyHandshake.WrapConn != nil && (opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
-		upgraded, err := opts.EarlyHandshake.WrapConn(c)
-		if err != nil {
-			_ = c.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-		return outConn, nil
-	}
-	if opts.Upgrade != nil {
-		upgraded, err := opts.Upgrade(c)
-		if err != nil {
-			_ = c.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-	}
-	return outConn, nil
-}
-
 func newStreamPacketConn(ctx context.Context, info *sessionDialInfo, opts TunnelDialOptions) (net.Conn, error) {
 	c := newStreamConn(info)
 	if opts.EarlyHandshake != nil && len(opts.EarlyHandshake.RequestPayload) > 0 {
 		c.early = opts.EarlyHandshake
 		c.earlyDone = make(chan error, 1)
 	}
+	c.startPacketUploadPrewarm()
 
 	go c.pullLoop()
 	go c.pushLoop()
@@ -254,6 +218,58 @@ func (c *streamConn) handleEarlyResponse(h http.Header) error {
 		return err
 	}
 	return nil
+}
+
+func (c *streamConn) postPacketUpload(seq uint64, payload []byte, requestTimeout time.Duration) error {
+	reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, urlWithQueryValue(c.pushURL, "seq", strconv.FormatUint(seq, 10)), bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	}
+	req.Host = c.headerHost
+	applyTunnelHeaders(req.Header, c.headerHost, TunnelModeStream)
+	applyTunnelAuth(req, c.auth, TunnelModeStream, http.MethodPost, "/api/v1/upload")
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+	return nil
+}
+
+func (c *streamConn) startPacketUploadPrewarm() {
+	if c == nil || c.client == nil || c.pushURL == "" {
+		return
+	}
+	c.prewarmDone = make(chan struct{})
+	go func() {
+		defer close(c.prewarmDone)
+		_ = c.postPacketUpload(0, nil, 5*time.Second)
+	}()
+}
+
+func (c *streamConn) waitPacketUploadPrewarm(timeout time.Duration) {
+	if c == nil || c.prewarmDone == nil {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-c.prewarmDone:
+	case <-timer.C:
+	case <-c.closed:
+	}
 }
 
 func (c *streamConn) pullLoop() {
@@ -387,31 +403,10 @@ func (c *streamConn) pushLoop() {
 	)
 	defer timer.Stop()
 
-	post := func(seq uint64, payload []byte) error {
-		reqCtx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-		defer cancel()
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, urlWithQueryValue(c.pushURL, "seq", strconv.FormatUint(seq, 10)), bytes.NewReader(payload))
-		if err != nil {
-			return err
-		}
-		req.Host = c.headerHost
-		applyTunnelHeaders(req.Header, c.headerHost, TunnelModeStream)
-		applyTunnelAuth(req, c.auth, TunnelModeStream, http.MethodPost, "/api/v1/upload")
-		req.Header.Set("Content-Type", "application/octet-stream")
-
-		resp, err := c.client.Do(req)
-		if err != nil {
-			return err
-		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("bad status: %s", resp.Status)
-		}
-		return nil
-	}
-
 	postAsync := func(seq uint64, payload []byte) error {
+		if seq == 0 {
+			c.waitPacketUploadPrewarm(150 * time.Millisecond)
+		}
 		select {
 		case uploadSlots <- struct{}{}:
 		case <-c.closed:
@@ -422,7 +417,7 @@ func (c *streamConn) pushLoop() {
 			defer uploadWG.Done()
 			defer func() { <-uploadSlots }()
 			err := retryDial(c.closed, func() error { return io.ErrClosedPipe }, maxDialRetry, minBackoff, maxBackoff, func() error {
-				return post(seq, payload)
+				return c.postPacketUpload(seq, payload, requestTimeout)
 			})
 			if err != nil {
 				_ = c.Close()

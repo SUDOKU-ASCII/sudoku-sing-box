@@ -434,7 +434,7 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 
 	switch strings.ToUpper(req.method) {
 	case http.MethodGet:
-		// Stream Split Session: GET /session (no token) => token + start tunnel on a server-side pipe.
+		// Legacy stream authorization: GET /session (no token) => token + start tunnel on a server-side pipe.
 		if token == "" && path == "/session" {
 			earlyPayload, err := parseEarlyDataQuery(u)
 			if err != nil {
@@ -477,7 +477,7 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 		return s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusBadRequest, "bad request")
 
 	case http.MethodPost:
-		// Stream Split Session: POST /api/v1/upload?token=... => uplink push.
+		// Stream upload: POST /api/v1/upload?token=... => uplink push.
 		if token != "" && path == "/api/v1/upload" {
 			s.upsertPacketUpSession(token)
 			if closeFlag {
@@ -498,7 +498,8 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 				_ = rawConn.Close()
 				return HandleDone, nil, nil
 			}
-			return s.streamPush(rawConn, token, u.Query().Get("seq"), bodyReader)
+			seq := u.Query().Get("seq")
+			return s.streamPush(rawConn, token, seq, bodyReader, strings.TrimSpace(seq) != "" && requestWantsKeepAlive(req))
 		}
 		return s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusBadRequest, "bad request")
 
@@ -556,14 +557,36 @@ func writeTunnelResponseHeaderWithEarly(w io.Writer, earlyPayload []byte) error 
 }
 
 func writeSimpleHTTPResponse(w io.Writer, code int, body string) error {
+	return writeSimpleHTTPResponseWithConnection(w, code, body, "close")
+}
+
+func writeSimpleHTTPKeepAliveResponse(w io.Writer, code int, body string) error {
+	return writeSimpleHTTPResponseWithConnection(w, code, body, "keep-alive")
+}
+
+func writeSimpleHTTPResponseWithConnection(w io.Writer, code int, body string, connection string) error {
 	if body == "" {
 		body = http.StatusText(code)
 	}
 	body = strings.TrimRight(body, "\r\n")
 	_, err := io.WriteString(w,
-		fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-			code, http.StatusText(code), len(body), body))
+		fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: %s\r\n\r\n%s",
+			code, http.StatusText(code), len(body), connection, body))
 	return err
+}
+
+func requestWantsKeepAlive(req *httpRequestHeader) bool {
+	if req == nil {
+		return false
+	}
+	connection := strings.ToLower(req.headers["connection"])
+	if strings.Contains(connection, "close") {
+		return false
+	}
+	if strings.EqualFold(req.proto, "HTTP/1.1") {
+		return true
+	}
+	return strings.Contains(connection, "keep-alive")
 }
 
 func writeTokenHTTPResponse(w io.Writer, token string, earlyPayload []byte) error {
@@ -901,7 +924,7 @@ func (s *TunnelServer) pollPush(rawConn net.Conn, token string, body io.Reader) 
 	return HandleDone, nil, nil
 }
 
-func (s *TunnelServer) streamPush(rawConn net.Conn, token string, seqStr string, body io.Reader) (HandleResult, net.Conn, error) {
+func (s *TunnelServer) streamPush(rawConn net.Conn, token string, seqStr string, body io.Reader, keepAlive bool) (HandleResult, net.Conn, error) {
 	sess, ok := s.sessionGet(token)
 	if !ok {
 		_ = writeSimpleHTTPResponse(rawConn, http.StatusForbidden, "forbidden")
@@ -932,6 +955,24 @@ func (s *TunnelServer) streamPush(rawConn net.Conn, token string, seqStr string,
 		}
 	}
 
+	if keepAlive {
+		if err := writeSimpleHTTPKeepAliveResponse(rawConn, http.StatusOK, ""); err != nil {
+			_ = rawConn.Close()
+			return HandleDone, nil, nil
+		}
+		res, conn, err := s.HandleConn(rawConn)
+		if err != nil {
+			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+				_ = rawConn.Close()
+				return HandleDone, nil, nil
+			}
+			if errors.Is(err, io.EOF) {
+				_ = rawConn.Close()
+				return HandleDone, nil, nil
+			}
+		}
+		return res, conn, err
+	}
 	_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
 	_ = rawConn.Close()
 	return HandleDone, nil, nil
