@@ -1087,8 +1087,14 @@ func (s *TunnelServer) sessionPull(rawConn net.Conn, token string, keepalive boo
 		_ = sess.conn.SetReadDeadline(time.Now().Add(s.pullReadTimeout))
 		n, err := sess.conn.Read(buf)
 		if n > 0 {
-			_ = writePayload(cw, buf[:n])
-			_ = bw.Flush()
+			if writeErr := writePayload(cw, buf[:n]); writeErr != nil {
+				s.sessionClose(token)
+				return HandleDone, nil, nil
+			}
+			if flushErr := bw.Flush(); flushErr != nil {
+				s.sessionClose(token)
+				return HandleDone, nil, nil
+			}
 		}
 		if err == nil {
 			continue

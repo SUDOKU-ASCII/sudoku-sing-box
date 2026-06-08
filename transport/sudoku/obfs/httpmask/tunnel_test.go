@@ -1217,6 +1217,56 @@ func TestTunnelServer_Stream_PacketUp_KeepAliveUploadClientClose(t *testing.T) {
 	}
 }
 
+func TestTunnelServer_StreamPull_WriteFailureClosesSession(t *testing.T) {
+	srv := NewTunnelServer(TunnelServerOptions{
+		Mode:            "stream",
+		PullReadTimeout: 5 * time.Second,
+		SessionTTL:      2 * time.Second,
+	})
+
+	token := "pull-write-failure-token"
+	sess := srv.upsertPacketUpSession(token)
+	if sess == nil || sess.acceptConn == nil {
+		t.Fatalf("expected packet-up session")
+	}
+
+	pullClient, pullServer := net.Pipe()
+	t.Cleanup(func() { _ = pullClient.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := srv.streamPull(pullServer, token, nil)
+		done <- err
+	}()
+
+	resp, err := http.ReadResponse(bufio.NewReader(pullClient), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read pull response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull status=%s", resp.Status)
+	}
+	_ = pullClient.Close()
+
+	_ = sess.acceptConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := sess.acceptConn.Write([]byte("downlink")); err != nil {
+		t.Fatalf("write session payload: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("streamPull: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for streamPull")
+	}
+
+	if srv.sessionHas(token) {
+		t.Fatalf("session still exists after pull write failure")
+	}
+}
+
 func TestRetryableRequestError_WindowsConnectionAborted(t *testing.T) {
 	err := fmt.Errorf("read tcp 127.0.0.1:54478->127.0.0.1:54503: wsarecv: An established connection was aborted by the software in your host machine")
 	if !isRetryableRequestError(err) {
