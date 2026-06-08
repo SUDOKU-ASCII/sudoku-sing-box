@@ -142,7 +142,7 @@ func (c *pollConn) pullLoop() {
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			if isDialError(err) && dialRetry < maxDialRetry {
+			if (isDialError(err) || isRetryableRequestError(err)) && dialRetry < maxDialRetry {
 				dialRetry++
 				select {
 				case <-time.After(backoff):

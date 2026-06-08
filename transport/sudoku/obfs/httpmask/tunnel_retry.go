@@ -20,10 +20,13 @@ with this application without prior consent.
 package httpmask
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
 	"net/url"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +40,42 @@ func isDialError(err error) bool {
 		if opErr.Op == "dial" || opErr.Op == "connect" {
 			return true
 		}
+	}
+	return false
+}
+
+func isRetryableRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	errText := strings.ToLower(err.Error())
+	if strings.Contains(errText, "server closed idle connection") {
+		return true
+	}
+	if strings.Contains(errText, "connection was aborted by the software in your host machine") {
+		return true
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return isRetryableRequestError(urlErr.Err)
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout() || netErr.Temporary()
 	}
 	return false
 }
@@ -59,7 +98,7 @@ func retryDial(closed <-chan struct{}, closedErr func() error, maxRetry int, min
 	for tries := 0; ; tries++ {
 		if err := fn(); err == nil {
 			return nil
-		} else if isDialError(err) && tries < maxRetry {
+		} else if (isDialError(err) || isRetryableRequestError(err)) && tries < maxRetry {
 			select {
 			case <-time.After(backoff):
 			case <-closed:

@@ -1161,6 +1161,69 @@ func TestTunnelServer_Stream_PacketUp_KeepAliveUploadConnection(t *testing.T) {
 	}
 }
 
+func TestTunnelServer_Stream_PacketUp_KeepAliveUploadClientClose(t *testing.T) {
+	srv := NewTunnelServer(TunnelServerOptions{
+		Mode:            "stream",
+		PullReadTimeout: 50 * time.Millisecond,
+		SessionTTL:      2 * time.Second,
+	})
+
+	token := "keepalive-close-token"
+	postClient, postServer := net.Pipe()
+	t.Cleanup(func() { _ = postClient.Close() })
+
+	postDone := make(chan error, 1)
+	go func() {
+		res, _, err := srv.HandleConn(postServer)
+		if err != nil {
+			postDone <- err
+			return
+		}
+		if res != HandleDone {
+			postDone <- fmt.Errorf("unexpected post result: %v", res)
+			return
+		}
+		postDone <- nil
+	}()
+
+	postReader := bufio.NewReader(postClient)
+	_, _ = io.WriteString(postClient, fmt.Sprintf(
+		"POST /api/v1/upload?token=%s&seq=0 HTTP/1.1\r\n"+
+			"Host: example.com\r\n"+
+			"X-Sudoku-Tunnel: stream\r\n"+
+			"Content-Length: 0\r\n"+
+			"\r\n", token))
+	resp, err := http.ReadResponse(postReader, &http.Request{Method: http.MethodPost})
+	if err != nil {
+		t.Fatalf("read prewarm response: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prewarm status=%s", resp.Status)
+	}
+	if !strings.EqualFold(resp.Header.Get("Connection"), "keep-alive") {
+		t.Fatalf("prewarm did not keep connection alive: %q", resp.Header.Get("Connection"))
+	}
+
+	_ = postClient.Close()
+	select {
+	case err := <-postDone:
+		if err != nil {
+			t.Fatalf("post HandleConn: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for post HandleConn")
+	}
+}
+
+func TestRetryableRequestError_WindowsConnectionAborted(t *testing.T) {
+	err := fmt.Errorf("read tcp 127.0.0.1:54478->127.0.0.1:54503: wsarecv: An established connection was aborted by the software in your host machine")
+	if !isRetryableRequestError(err) {
+		t.Fatalf("expected Windows aborted connection to be retryable")
+	}
+}
+
 func TestTunnelServer_Stream_PacketUpEarlyRejectPassThrough(t *testing.T) {
 	srv := NewTunnelServer(TunnelServerOptions{
 		Mode:                "stream",

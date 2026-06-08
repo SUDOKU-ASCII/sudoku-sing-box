@@ -73,9 +73,6 @@ func (d *MuxDialer) Dial(destAddrStr string) (net.Conn, error) {
 	st := newMuxStream(sess, streamID)
 	sess.registerStream(st)
 
-	if d.deferInitialOpen() {
-		return newDeferredMuxOpenConn(st, addrBuf.Bytes()), nil
-	}
 	if err := sess.sendFrame(muxFrameOpen, streamID, addrBuf.Bytes()); err != nil {
 		st.closeNoSend(err)
 		sess.removeStream(streamID)

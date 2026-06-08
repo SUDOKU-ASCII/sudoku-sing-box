@@ -589,6 +589,20 @@ func requestWantsKeepAlive(req *httpRequestHeader) bool {
 	return strings.Contains(connection, "keep-alive")
 }
 
+func isKeepAliveCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return true
+	}
+	return isRetryableRequestError(err)
+}
+
 func writeTokenHTTPResponse(w io.Writer, token string, earlyPayload []byte) error {
 	token = strings.TrimRight(token, "\r\n")
 	body := "token=" + token
@@ -961,15 +975,9 @@ func (s *TunnelServer) streamPush(rawConn net.Conn, token string, seqStr string,
 			return HandleDone, nil, nil
 		}
 		res, conn, err := s.HandleConn(rawConn)
-		if err != nil {
-			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-				_ = rawConn.Close()
-				return HandleDone, nil, nil
-			}
-			if errors.Is(err, io.EOF) {
-				_ = rawConn.Close()
-				return HandleDone, nil, nil
-			}
+		if isKeepAliveCloseError(err) {
+			_ = rawConn.Close()
+			return HandleDone, nil, nil
 		}
 		return res, conn, err
 	}
