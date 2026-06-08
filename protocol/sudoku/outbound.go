@@ -98,7 +98,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	out.baseConf.DialContext = out.dialContext
 	out.baseConf.HTTPMaskTransportPool = out.httpMaskPool
 
-	if allowHTTPMaskMux(&out.baseConf) {
+	if allowSessionMux(&out.baseConf) {
 		out.muxClient, err = sudokut.NewMuxClient(&out.baseConf)
 		if err != nil {
 			return nil, err

@@ -22,20 +22,26 @@ package httpmask
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
 func dialStream(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
-	// "stream" mode uses split-stream to stay CDN-friendly by default.
-	return dialStreamSplit(ctx, serverAddress, opts)
+	// "stream" mode uses XHTTP-style packet-up: a long downlink GET plus
+	// packetized uplink POSTs keyed by a client-generated session id.
+	return dialStreamPacketUp(ctx, serverAddress, opts)
 }
 
-type streamSplitConn struct {
+type streamConn struct {
 	queuedConn
 
 	ctx    context.Context
@@ -48,9 +54,13 @@ type streamSplitConn struct {
 	closeURL   string
 	headerHost string
 	auth       *tunnelAuth
+
+	early     *ClientEarlyHandshake
+	earlyDone chan error
+	earlyOnce sync.Once
 }
 
-func (c *streamSplitConn) Close() error {
+func (c *streamConn) Close() error {
 	_ = c.closeWithError(io.ErrClosedPipe)
 
 	if c.cancel != nil {
@@ -67,26 +77,52 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 		return nil, err
 	}
 
-	connCtx, cancel := context.WithCancel(context.Background())
-	c := &streamSplitConn{
-		ctx:        connCtx,
-		cancel:     cancel,
-		client:     info.client,
-		pushURL:    info.pushURL,
-		pullURL:    info.pullURL,
-		finURL:     info.finURL,
-		closeURL:   info.closeURL,
-		headerHost: info.headerHost,
-		auth:       info.auth,
-		queuedConn: queuedConn{
-			rxc:         make(chan []byte, queuedConnPayloadQueueDepth),
-			closed:      make(chan struct{}),
-			writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
-			writeClosed: make(chan struct{}),
-			localAddr:   &net.TCPAddr{},
-			remoteAddr:  &net.TCPAddr{},
-		},
+	return newStreamSplitConn(info, opts)
+}
+
+func dialStreamPacketUp(ctx context.Context, serverAddress string, opts TunnelDialOptions) (net.Conn, error) {
+	info, err := newPacketUpSession(serverAddress, opts)
+	if err != nil {
+		return nil, err
 	}
+
+	return newStreamPacketConn(ctx, info, opts)
+}
+
+func newPacketUpSession(serverAddress string, opts TunnelDialOptions) (*sessionDialInfo, error) {
+	scheme, urlHost, dialAddr, serverName, err := normalizeHTTPDialTarget(serverAddress, opts.TLSEnabled, opts.HostOverride)
+	if err != nil {
+		return nil, err
+	}
+	headerHost := canonicalHeaderHost(urlHost, scheme)
+	auth := newTunnelAuth(opts.AuthKey, 0)
+	client := newHTTPClient(urlHost, dialAddr, serverName, scheme, 32, multiplexEnabled(opts.Multiplex), opts.TransportPool, opts.DialContext)
+
+	token, err := newSessionToken()
+	if err != nil {
+		return nil, err
+	}
+	query := "token=" + url.QueryEscape(token)
+	pullURL := (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/stream"), RawQuery: query}).String()
+	if opts.EarlyHandshake != nil && len(opts.EarlyHandshake.RequestPayload) > 0 {
+		pullURL, err = setEarlyDataQuery(pullURL, opts.EarlyHandshake.RequestPayload)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &sessionDialInfo{
+		client:     client,
+		pushURL:    (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query}).String(),
+		pullURL:    pullURL,
+		finURL:     (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query + "&fin=1"}).String(),
+		closeURL:   (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: query + "&close=1"}).String(),
+		headerHost: headerHost,
+		auth:       auth,
+	}, nil
+}
+
+func newStreamSplitConn(info *sessionDialInfo, opts TunnelDialOptions) (net.Conn, error) {
+	c := newStreamConn(info)
 
 	go c.pullLoop()
 	go c.pushLoop()
@@ -115,7 +151,108 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 	return outConn, nil
 }
 
-func (c *streamSplitConn) pullLoop() {
+func newStreamPacketConn(ctx context.Context, info *sessionDialInfo, opts TunnelDialOptions) (net.Conn, error) {
+	c := newStreamConn(info)
+	if opts.EarlyHandshake != nil && len(opts.EarlyHandshake.RequestPayload) > 0 {
+		c.early = opts.EarlyHandshake
+		c.earlyDone = make(chan error, 1)
+	}
+
+	go c.pullLoop()
+	go c.pushLoop()
+
+	outConn := net.Conn(c)
+	if c.earlyDone != nil {
+		select {
+		case err := <-c.earlyDone:
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+		case <-ctx.Done():
+			_ = c.Close()
+			return nil, ctx.Err()
+		}
+		if opts.EarlyHandshake.WrapConn != nil && (opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
+			upgraded, err := opts.EarlyHandshake.WrapConn(c)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			if upgraded != nil {
+				outConn = upgraded
+			}
+			return outConn, nil
+		}
+	}
+	if opts.Upgrade != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = c.SetReadDeadline(deadline)
+		}
+		upgraded, err := opts.Upgrade(c)
+		_ = c.SetReadDeadline(time.Time{})
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		if upgraded != nil {
+			outConn = upgraded
+		}
+	}
+	return outConn, nil
+}
+
+func newStreamConn(info *sessionDialInfo) *streamConn {
+	connCtx, cancel := context.WithCancel(context.Background())
+	return &streamConn{
+		ctx:        connCtx,
+		cancel:     cancel,
+		client:     info.client,
+		pushURL:    info.pushURL,
+		pullURL:    info.pullURL,
+		finURL:     info.finURL,
+		closeURL:   info.closeURL,
+		headerHost: info.headerHost,
+		auth:       info.auth,
+		queuedConn: queuedConn{
+			rxc:         make(chan []byte, queuedConnPayloadQueueDepth),
+			closed:      make(chan struct{}),
+			writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
+			writeClosed: make(chan struct{}),
+			localAddr:   &net.TCPAddr{},
+			remoteAddr:  &net.TCPAddr{},
+		},
+	}
+}
+
+func (c *streamConn) signalEarly(err error) {
+	if c == nil || c.earlyDone == nil {
+		return
+	}
+	c.earlyOnce.Do(func() {
+		c.earlyDone <- err
+	})
+}
+
+func (c *streamConn) handleEarlyResponse(h http.Header) error {
+	if c == nil || c.early == nil || c.early.HandleResponse == nil {
+		return nil
+	}
+	val := strings.TrimSpace(h.Get(tunnelEarlyDataHeader))
+	if val == "" {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(val)
+	if err != nil {
+		return fmt.Errorf("decode early response failed: %w", err)
+	}
+	if err := c.early.HandleResponse(payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *streamConn) pullLoop() {
 	const (
 		// requestTimeout must be long enough for continuous high-throughput streams (e.g. mux + large downloads).
 		// If it is too short, the client cancels the response mid-body and corrupts the byte stream.
@@ -166,6 +303,7 @@ func (c *streamSplitConn) pullLoop() {
 				}
 				continue
 			}
+			c.signalEarly(err)
 			_ = c.Close()
 			return
 		}
@@ -173,11 +311,13 @@ func (c *streamSplitConn) pullLoop() {
 		backoff = minBackoff
 
 		if resp.StatusCode != http.StatusOK {
+			c.signalEarly(fmt.Errorf("stream pull bad status: %s", resp.Status))
 			_ = resp.Body.Close()
 			cancel()
 			_ = c.Close()
 			return
 		}
+		c.signalEarly(c.handleEarlyResponse(resp.Header))
 
 		readAny := false
 		for {
@@ -217,10 +357,11 @@ func (c *streamSplitConn) pullLoop() {
 	}
 }
 
-func (c *streamSplitConn) pushLoop() {
+func (c *streamConn) pushLoop() {
 	const (
 		maxBatchBytes  = 256 * 1024
-		flushInterval  = 5 * time.Millisecond
+		flushInterval  = 2 * time.Millisecond
+		maxUploadPosts = 32
 		requestTimeout = 20 * time.Second
 		maxDialRetry   = 12
 		minBackoff     = 10 * time.Millisecond
@@ -228,20 +369,19 @@ func (c *streamSplitConn) pushLoop() {
 	)
 
 	var (
-		buf   bytes.Buffer
-		timer = time.NewTimer(flushInterval)
+		buf         bytes.Buffer
+		timer       = time.NewTimer(flushInterval)
+		nextSeq     uint64
+		uploadSlots = make(chan struct{}, maxUploadPosts)
+		uploadWG    sync.WaitGroup
 	)
 	defer timer.Stop()
 
-	flush := func() error {
-		if buf.Len() == 0 {
-			return nil
-		}
-
-		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.pushURL, bytes.NewReader(buf.Bytes()))
+	post := func(seq uint64, payload []byte) error {
+		reqCtx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, urlWithQueryValue(c.pushURL, "seq", strconv.FormatUint(seq, 10)), bytes.NewReader(payload))
 		if err != nil {
-			cancel()
 			return err
 		}
 		req.Host = c.headerHost
@@ -251,22 +391,58 @@ func (c *streamSplitConn) pushLoop() {
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			cancel()
 			return err
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
 		_ = resp.Body.Close()
-		cancel()
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("bad status: %s", resp.Status)
 		}
-
-		buf.Reset()
 		return nil
 	}
 
-	flushWithRetry := func() error {
-		return retryDial(c.closed, func() error { return io.ErrClosedPipe }, maxDialRetry, minBackoff, maxBackoff, flush)
+	postAsync := func(seq uint64, payload []byte) error {
+		select {
+		case uploadSlots <- struct{}{}:
+		case <-c.closed:
+			return io.ErrClosedPipe
+		}
+		uploadWG.Add(1)
+		go func() {
+			defer uploadWG.Done()
+			defer func() { <-uploadSlots }()
+			err := retryDial(c.closed, func() error { return io.ErrClosedPipe }, maxDialRetry, minBackoff, maxBackoff, func() error {
+				return post(seq, payload)
+			})
+			if err != nil {
+				_ = c.Close()
+			}
+		}()
+		return nil
+	}
+
+	flush := func() error {
+		if buf.Len() == 0 {
+			return nil
+		}
+		payload := append([]byte(nil), buf.Bytes()...)
+		buf.Reset()
+		seq := nextSeq
+		nextSeq++
+		return postAsync(seq, payload)
+	}
+
+	waitUploads := func() {
+		done := make(chan struct{})
+		go func() {
+			uploadWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(requestTimeout):
+			_ = c.Close()
+		}
 	}
 	resetTimer(timer, flushInterval)
 
@@ -274,14 +450,15 @@ func (c *streamSplitConn) pushLoop() {
 		select {
 		case b, ok := <-c.writeCh:
 			if !ok {
-				_ = flushWithRetry()
+				_ = flush()
+				waitUploads()
 				return
 			}
 			if len(b) == 0 {
 				continue
 			}
 			if buf.Len()+len(b) > maxBatchBytes {
-				if err := flushWithRetry(); err != nil {
+				if err := flush(); err != nil {
 					_ = c.Close()
 					return
 				}
@@ -289,14 +466,14 @@ func (c *streamSplitConn) pushLoop() {
 			}
 			_, _ = buf.Write(b)
 			if buf.Len() >= maxBatchBytes {
-				if err := flushWithRetry(); err != nil {
+				if err := flush(); err != nil {
 					_ = c.Close()
 					return
 				}
 				resetTimer(timer, flushInterval)
 			}
 		case <-timer.C:
-			if err := flushWithRetry(); err != nil {
+			if err := flush(); err != nil {
 				_ = c.Close()
 				return
 			}
@@ -310,21 +487,30 @@ func (c *streamSplitConn) pushLoop() {
 						continue
 					}
 					if buf.Len()+len(b) > maxBatchBytes {
-						if err := flushWithRetry(); err != nil {
+						if err := flush(); err != nil {
 							_ = c.Close()
 							return
 						}
 					}
 					_, _ = buf.Write(b)
 				default:
-					_ = flushWithRetry()
+					_ = flush()
+					waitUploads()
 					bestEffortCloseSession(c.client, c.finURL, c.headerHost, TunnelModeStream, c.auth)
 					return
 				}
 			}
 		case <-c.closed:
-			_ = flushWithRetry()
+			_ = flush()
 			return
 		}
 	}
+}
+
+func urlWithQueryValue(rawURL, key, value string) string {
+	sep := "?"
+	if strings.Contains(rawURL, "?") {
+		sep = "&"
+	}
+	return rawURL + sep + url.QueryEscape(key) + "=" + url.QueryEscape(value)
 }

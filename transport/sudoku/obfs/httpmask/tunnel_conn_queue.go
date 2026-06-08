@@ -22,6 +22,7 @@ package httpmask
 import (
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -44,9 +45,20 @@ type queuedConn struct {
 	closeErr   error
 	localAddr  net.Addr
 	remoteAddr net.Addr
+
+	deadlineOnce  sync.Once
+	readDeadline  pipeDeadline
+	writeDeadline pipeDeadline
 }
 
 const queuedConnPayloadQueueDepth = 64
+
+func (c *queuedConn) initDeadlines() {
+	c.deadlineOnce.Do(func() {
+		c.readDeadline = makePipeDeadline()
+		c.writeDeadline = makePipeDeadline()
+	})
+}
 
 func (c *queuedConn) CloseWrite() error {
 	if c == nil || c.writeClosed == nil {
@@ -90,11 +102,14 @@ func (c *queuedConn) closedErr() error {
 }
 
 func (c *queuedConn) Read(b []byte) (n int, err error) {
+	c.initDeadlines()
 	if len(c.readBuf) == 0 {
 		select {
 		case c.readBuf = <-c.rxc:
 		case <-c.closed:
 			return 0, c.closedErr()
+		case <-c.readDeadline.wait():
+			return 0, os.ErrDeadlineExceeded
 		}
 	}
 	n = copy(b, c.readBuf)
@@ -106,11 +121,15 @@ func (c *queuedConn) Write(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	c.initDeadlines()
 	c.mu.Lock()
 	select {
 	case <-c.closed:
 		c.mu.Unlock()
 		return 0, c.closedErr()
+	case <-c.writeDeadline.wait():
+		c.mu.Unlock()
+		return 0, os.ErrDeadlineExceeded
 	default:
 	}
 	if c.writeClosed != nil {
@@ -118,6 +137,9 @@ func (c *queuedConn) Write(b []byte) (n int, err error) {
 		case <-c.writeClosed:
 			c.mu.Unlock()
 			return 0, io.ErrClosedPipe
+		case <-c.writeDeadline.wait():
+			c.mu.Unlock()
+			return 0, os.ErrDeadlineExceeded
 		default:
 		}
 	}
@@ -131,6 +153,8 @@ func (c *queuedConn) Write(b []byte) (n int, err error) {
 			return len(b), nil
 		case <-c.closed:
 			return 0, c.closedErr()
+		case <-c.writeDeadline.wait():
+			return 0, os.ErrDeadlineExceeded
 		}
 	}
 	select {
@@ -140,12 +164,29 @@ func (c *queuedConn) Write(b []byte) (n int, err error) {
 		return 0, c.closedErr()
 	case <-c.writeClosed:
 		return 0, io.ErrClosedPipe
+	case <-c.writeDeadline.wait():
+		return 0, os.ErrDeadlineExceeded
 	}
 }
 
 func (c *queuedConn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *queuedConn) RemoteAddr() net.Addr { return c.remoteAddr }
 
-func (c *queuedConn) SetDeadline(time.Time) error      { return nil }
-func (c *queuedConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *queuedConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *queuedConn) SetDeadline(t time.Time) error {
+	c.initDeadlines()
+	c.readDeadline.set(t)
+	c.writeDeadline.set(t)
+	return nil
+}
+
+func (c *queuedConn) SetReadDeadline(t time.Time) error {
+	c.initDeadlines()
+	c.readDeadline.set(t)
+	return nil
+}
+
+func (c *queuedConn) SetWriteDeadline(t time.Time) error {
+	c.initDeadlines()
+	c.writeDeadline.set(t)
+	return nil
+}

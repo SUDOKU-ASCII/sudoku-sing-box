@@ -83,14 +83,6 @@ func applyProtocolTables(cfg *sudokut.ProtocolConfig, tables []*sudokuo.Table) {
 	cfg.Tables = tables
 }
 
-func allowHTTPMaskMux(cfg *sudokut.ProtocolConfig) bool {
-	if cfg == nil || cfg.DisableHTTPMask || !strings.EqualFold(strings.TrimSpace(cfg.HTTPMaskMultiplex), "on") {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
-	case "stream", "poll", "auto", "ws":
-		return true
-	default:
-		return false
-	}
+func allowSessionMux(cfg *sudokut.ProtocolConfig) bool {
+	return cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.HTTPMaskMultiplex), "on")
 }

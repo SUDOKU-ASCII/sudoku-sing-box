@@ -785,6 +785,214 @@ func startRawTunnelServer(t testing.TB, srv *TunnelServer) (addr string, stop fu
 	return ln.Addr().String(), stop, tch
 }
 
+type recordingConn struct {
+	net.Conn
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *recordingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		_, _ = c.buf.Write(p[:n])
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *recordingConn) firstRequestLine() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	line, _, _ := strings.Cut(c.buf.String(), "\r\n")
+	return line
+}
+
+func TestDialStream_UsesPacketUpWithoutAuthorize(t *testing.T) {
+	srv := NewTunnelServer(TunnelServerOptions{
+		Mode:            "stream",
+		PullReadTimeout: 2 * time.Second,
+		SessionTTL:      2 * time.Second,
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	reqLineCh := make(chan string, 4)
+	tunnelCh := make(chan net.Conn, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			raw, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				rec := &recordingConn{Conn: conn}
+				res, c, err := srv.HandleConn(rec)
+				reqLineCh <- rec.firstRequestLine()
+				if err != nil {
+					_ = conn.Close()
+					return
+				}
+				if res == HandleStartTunnel && c != nil {
+					select {
+					case tunnelCh <- c:
+					default:
+						_ = c.Close()
+					}
+				}
+			}(raw)
+		}
+	}()
+	defer func() {
+		_ = ln.Close()
+		<-done
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := dialStream(ctx, ln.Addr().String(), TunnelDialOptions{})
+	if err != nil {
+		t.Fatalf("dialStream: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	var firstLine string
+	select {
+	case firstLine = <-reqLineCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for first request")
+	}
+	if strings.Contains(firstLine, "/session") {
+		t.Fatalf("stream dial used authorize request: %q", firstLine)
+	}
+	if !strings.Contains(firstLine, "/stream?") {
+		t.Fatalf("stream dial did not start downlink stream first: %q", firstLine)
+	}
+
+	var tunnel net.Conn
+	select {
+	case tunnel = <-tunnelCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for server tunnel conn")
+	}
+	t.Cleanup(func() { _ = tunnel.Close() })
+
+	payload := []byte("hello")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	_ = tunnel.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(tunnel, got); err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("server payload mismatch: got=%q want=%q", string(got), string(payload))
+	}
+}
+
+func TestTunnelServer_Stream_PacketUp_PostBeforeGet(t *testing.T) {
+	srv := NewTunnelServer(TunnelServerOptions{
+		Mode:            "stream",
+		PullReadTimeout: 50 * time.Millisecond,
+		SessionTTL:      2 * time.Second,
+	})
+
+	token := "client-generated-token"
+	payload := "abc"
+
+	postClient, postServer := net.Pipe()
+	t.Cleanup(func() { _ = postClient.Close() })
+	postDone := make(chan error, 1)
+	go func() {
+		res, _, err := srv.HandleConn(postServer)
+		if err != nil {
+			postDone <- err
+			return
+		}
+		if res != HandleDone {
+			postDone <- fmt.Errorf("unexpected post result: %v", res)
+			return
+		}
+		postDone <- nil
+	}()
+	postResp := make(chan string, 1)
+	go func() {
+		_, _ = io.WriteString(postClient, fmt.Sprintf(
+			"POST /api/v1/upload?token=%s HTTP/1.1\r\n"+
+				"Host: example.com\r\n"+
+				"X-Sudoku-Tunnel: stream\r\n"+
+				"Content-Length: %d\r\n"+
+				"\r\n"+
+				"%s", token, len(payload), payload))
+		raw, _ := io.ReadAll(postClient)
+		postResp <- string(raw)
+	}()
+
+	getClient, getServer := net.Pipe()
+	t.Cleanup(func() { _ = getClient.Close() })
+	getDone := make(chan struct{})
+	var (
+		res HandleResult
+		c   net.Conn
+		err error
+	)
+	go func() {
+		res, c, err = srv.HandleConn(getServer)
+		close(getDone)
+	}()
+	_, _ = io.WriteString(getClient, fmt.Sprintf(
+		"GET /stream?token=%s HTTP/1.1\r\n"+
+			"Host: example.com\r\n"+
+			"X-Sudoku-Tunnel: stream\r\n"+
+			"\r\n", token))
+
+	select {
+	case <-getDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for get HandleConn")
+	}
+	if err != nil {
+		t.Fatalf("get HandleConn: %v", err)
+	}
+	if res != HandleStartTunnel || c == nil {
+		t.Fatalf("unexpected get result: res=%v conn=%v", res, c)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	got := make([]byte, len(payload))
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatalf("read packet-up payload: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("packet-up payload mismatch: got=%q want=%q", string(got), payload)
+	}
+
+	select {
+	case err := <-postDone:
+		if err != nil {
+			t.Fatalf("post HandleConn: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for post HandleConn")
+	}
+	select {
+	case resp := <-postResp:
+		if !strings.Contains(resp, "200 OK") {
+			t.Fatalf("unexpected post response: %q", resp)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for post response")
+	}
+}
+
 func TestDialStreamSplit_CloseWrite_SendsFIN(t *testing.T) {
 	srv := NewTunnelServer(TunnelServerOptions{
 		Mode:            "auto",

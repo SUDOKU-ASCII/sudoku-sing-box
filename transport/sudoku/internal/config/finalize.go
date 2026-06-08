@@ -49,13 +49,8 @@ func normalizeHTTPMaskMode(mode string) string {
 	}
 }
 
-func normalizeHTTPMaskMultiplex(disableHTTPMask bool, mode string) string {
-	if disableHTTPMask {
-		return "off"
-	}
+func normalizeMultiplex(mode string) string {
 	switch normalizeLower(mode) {
-	case "", "off":
-		return "off"
 	case "auto":
 		return "auto"
 	case "on":
@@ -63,6 +58,15 @@ func normalizeHTTPMaskMultiplex(disableHTTPMask bool, mode string) string {
 	default:
 		return "off"
 	}
+}
+
+func firstMultiplexMode(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return normalizeMultiplex(v)
+		}
+	}
+	return "off"
 }
 
 func normalizeSuspiciousAction(action string) string {
@@ -141,7 +145,9 @@ func (c *Config) Finalize() error {
 	}
 
 	c.HTTPMask.Mode = normalizeHTTPMaskMode(c.HTTPMask.Mode)
-	c.HTTPMask.Multiplex = normalizeHTTPMaskMultiplex(c.HTTPMask.Disable, c.HTTPMask.Multiplex)
+	muxMode := c.MultiplexMode()
+	c.Multiplex = muxMode
+	c.HTTPMask.Multiplex = muxMode
 	c.SuspiciousAction = normalizeSuspiciousAction(c.SuspiciousAction)
 	c.HTTPMask.Host = strings.TrimSpace(c.HTTPMask.Host)
 	c.HTTPMask.PathRoot = strings.TrimSpace(c.HTTPMask.PathRoot)
@@ -248,6 +254,17 @@ func (c *Config) HTTPMaskTunnelEnabled() bool {
 	}
 }
 
+func (c *Config) MultiplexMode() string {
+	if c == nil {
+		return "off"
+	}
+	return firstMultiplexMode(c.HTTPMask.Multiplex, c.Multiplex)
+}
+
+func (c *Config) SessionMuxEnabled() bool {
+	return c.MultiplexMode() == "on"
+}
+
 func (c *Config) HTTPMaskSessionMuxEnabled() bool {
-	return c.HTTPMaskTunnelEnabled() && c.HTTPMask.Multiplex == "on"
+	return c.SessionMuxEnabled()
 }

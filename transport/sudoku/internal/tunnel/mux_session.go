@@ -27,6 +27,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/transport/sudoku/connutil"
@@ -54,7 +55,10 @@ const (
 type muxSession struct {
 	conn net.Conn
 
-	writeMu sync.Mutex
+	writeMu           sync.Mutex
+	closeFrameDelay   time.Duration
+	closeFrameCh      chan uint32
+	lastPriorityWrite atomic.Int64
 
 	streamsMu sync.Mutex
 	streams   map[uint32]*muxStream
@@ -74,6 +78,7 @@ func newMuxSession(conn net.Conn, onOpen func(stream *muxStream, payload []byte)
 		closed:  make(chan struct{}),
 		onOpen:  onOpen,
 	}
+	s.lastPriorityWrite.Store(time.Now().UnixNano())
 	go s.readLoop()
 	return s
 }
@@ -179,7 +184,145 @@ func (s *muxSession) sendFrame(frameType byte, streamID uint32, payload []byte) 
 			return err
 		}
 	}
+	if frameType != muxFrameClose {
+		s.lastPriorityWrite.Store(time.Now().UnixNano())
+	}
 	return nil
+}
+
+func appendMuxFrame(dst []byte, frameType byte, streamID uint32, payload []byte) []byte {
+	var header [muxHeaderSize]byte
+	header[0] = frameType
+	binary.BigEndian.PutUint32(header[1:5], streamID)
+	binary.BigEndian.PutUint32(header[5:9], uint32(len(payload)))
+	dst = append(dst, header[:]...)
+	return append(dst, payload...)
+}
+
+func (s *muxSession) sendOpenAndData(streamID uint32, openPayload, firstData []byte) error {
+	if s.isClosed() {
+		return s.closedErr()
+	}
+	if len(openPayload) > muxMaxFrameSize {
+		return fmt.Errorf("mux payload too large: %d", len(openPayload))
+	}
+
+	size := muxHeaderSize + len(openPayload)
+	for p := firstData; len(p) > 0; {
+		chunk := p
+		if len(chunk) > muxMaxDataPayload {
+			chunk = p[:muxMaxDataPayload]
+		}
+		size += muxHeaderSize + len(chunk)
+		p = p[len(chunk):]
+	}
+	payload := make([]byte, 0, size)
+	payload = appendMuxFrame(payload, muxFrameOpen, streamID, openPayload)
+	for p := firstData; len(p) > 0; {
+		chunk := p
+		if len(chunk) > muxMaxDataPayload {
+			chunk = p[:muxMaxDataPayload]
+		}
+		payload = appendMuxFrame(payload, muxFrameData, streamID, chunk)
+		p = p[len(chunk):]
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := connutil.WriteFull(s.conn, payload); err != nil {
+		s.closeWithError(err)
+		return err
+	}
+	s.lastPriorityWrite.Store(time.Now().UnixNano())
+	return nil
+}
+
+func (s *muxSession) queueCloseFrame(streamID uint32) {
+	if s.closeFrameDelay <= 0 || s.closeFrameCh == nil {
+		_ = s.sendFrame(muxFrameClose, streamID, nil)
+		return
+	}
+	select {
+	case s.closeFrameCh <- streamID:
+	case <-s.closed:
+	default:
+		go func() {
+			select {
+			case s.closeFrameCh <- streamID:
+			case <-s.closed:
+			}
+		}()
+	}
+}
+
+func (s *muxSession) enableDelayedClose(delay time.Duration) {
+	if delay <= 0 || s.closeFrameCh != nil {
+		return
+	}
+	s.closeFrameDelay = delay
+	s.closeFrameCh = make(chan uint32, 1024)
+	go s.closeFrameLoop()
+}
+
+func (s *muxSession) closeFrameLoop() {
+	var (
+		pending []uint32
+		timer   *time.Timer
+		timerC  <-chan time.Time
+	)
+	stopTimer := func() {
+		if timer != nil {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		timerC = nil
+	}
+	resetTimer := func(d time.Duration) {
+		if d < 0 {
+			d = 0
+		}
+		if timer == nil {
+			timer = time.NewTimer(d)
+		} else {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(d)
+		}
+		timerC = timer.C
+	}
+	defer stopTimer()
+
+	for {
+		select {
+		case id := <-s.closeFrameCh:
+			pending = append(pending, id)
+			if timerC == nil {
+				resetTimer(s.closeFrameDelay)
+			}
+		case <-timerC:
+			last := time.Unix(0, s.lastPriorityWrite.Load())
+			if idle := time.Since(last); idle < s.closeFrameDelay {
+				resetTimer(s.closeFrameDelay - idle)
+				continue
+			}
+			ids := pending
+			pending = nil
+			stopTimer()
+			for _, id := range ids {
+				_ = s.sendFrame(muxFrameClose, id, nil)
+			}
+		case <-s.closed:
+			return
+		}
+	}
 }
 
 func (s *muxSession) sendReset(streamID uint32, msg string) {
@@ -409,8 +552,8 @@ func (c *muxStream) Close() error {
 	c.cond.Broadcast()
 	c.mu.Unlock()
 
-	_ = c.session.sendFrame(muxFrameClose, c.id, nil)
 	c.session.removeStream(c.id)
+	c.session.queueCloseFrame(c.id)
 	return nil
 }
 
@@ -445,4 +588,98 @@ func (c *muxStream) enqueue(payload []byte) {
 	}
 	c.cond.Broadcast()
 	c.mu.Unlock()
+}
+
+type deferredMuxOpenConn struct {
+	*muxStream
+
+	mu          sync.Mutex
+	openPayload []byte
+	openCh      chan struct{}
+	opened      bool
+	openErr     error
+}
+
+func newDeferredMuxOpenConn(st *muxStream, openPayload []byte) net.Conn {
+	return &deferredMuxOpenConn{
+		muxStream:   st,
+		openPayload: append([]byte(nil), openPayload...),
+		openCh:      make(chan struct{}),
+	}
+}
+
+func (c *deferredMuxOpenConn) ensureOpenLocked(firstPayload []byte) error {
+	if c.opened {
+		return c.openErr
+	}
+	c.opened = true
+	defer close(c.openCh)
+	c.openErr = c.session.sendOpenAndData(c.id, c.openPayload, firstPayload)
+	c.openPayload = nil
+	return c.openErr
+}
+
+func (c *deferredMuxOpenConn) ensureOpen() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ensureOpenLocked(nil)
+}
+
+func (c *deferredMuxOpenConn) waitForFirstWrite() error {
+	timer := time.NewTimer(deferredOpenReadGrace)
+	defer timer.Stop()
+	select {
+	case <-c.openCh:
+		c.mu.Lock()
+		err := c.openErr
+		c.mu.Unlock()
+		return err
+	case <-timer.C:
+		return c.ensureOpen()
+	}
+}
+
+func (c *deferredMuxOpenConn) Read(p []byte) (int, error) {
+	if err := c.waitForFirstWrite(); err != nil {
+		return 0, err
+	}
+	return c.muxStream.Read(p)
+}
+
+func (c *deferredMuxOpenConn) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	c.mu.Lock()
+	if !c.opened {
+		err := c.ensureOpenLocked(p)
+		c.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+	err := c.openErr
+	c.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return c.muxStream.Write(p)
+}
+
+func (c *deferredMuxOpenConn) Close() error {
+	c.mu.Lock()
+	opened := c.opened
+	if !c.opened {
+		c.opened = true
+		c.openPayload = nil
+		close(c.openCh)
+	}
+	c.mu.Unlock()
+	if opened {
+		return c.muxStream.Close()
+	}
+	c.muxStream.closeNoSend(io.ErrClosedPipe)
+	c.session.removeStream(c.id)
+	return nil
 }

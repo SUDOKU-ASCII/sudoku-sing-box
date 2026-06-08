@@ -25,14 +25,15 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/transport/sudoku/internal/protocol"
 )
 
 // MuxDialer multiplexes multiple target connections over a single upgraded Sudoku tunnel.
 //
-// It is intended to reduce per-connection RTT when using HTTPMask tunnel modes by keeping one long-lived
-// tunnel and opening lightweight sub-streams for each destination.
+// It keeps one long-lived Sudoku tunnel and opens lightweight sub-streams for
+// each destination, regardless of whether the outer transport is raw TCP or HTTPMask.
 type MuxDialer struct {
 	BaseDialer
 
@@ -72,6 +73,9 @@ func (d *MuxDialer) Dial(destAddrStr string) (net.Conn, error) {
 	st := newMuxStream(sess, streamID)
 	sess.registerStream(st)
 
+	if d.deferInitialOpen() {
+		return newDeferredMuxOpenConn(st, addrBuf.Bytes()), nil
+	}
 	if err := sess.sendFrame(muxFrameOpen, streamID, addrBuf.Bytes()); err != nil {
 		st.closeNoSend(err)
 		sess.removeStream(streamID)
@@ -110,22 +114,12 @@ func (d *MuxDialer) getOrCreateSession() (*muxSession, error) {
 		d.mu.Unlock()
 		return nil, fmt.Errorf("missing config")
 	}
-	if !d.Config.HTTPMaskTunnelEnabled() {
+	if !d.Config.SessionMuxEnabled() {
 		d.mu.Lock()
 		d.creating = false
 		d.cond.Broadcast()
 		d.mu.Unlock()
-		if d.Config.HTTPMask.Disable {
-			return nil, fmt.Errorf("mux requires httpmask.disable=false")
-		}
-		return nil, fmt.Errorf("mux requires httpmask.mode=stream/poll/auto/ws (got %q)", d.Config.HTTPMask.Mode)
-	}
-	if d.Config.HTTPMask.Multiplex != "on" {
-		d.mu.Lock()
-		d.creating = false
-		d.cond.Broadcast()
-		d.mu.Unlock()
-		return nil, fmt.Errorf("mux requires httpmask.multiplex=on (got %q)", d.Config.HTTPMask.Multiplex)
+		return nil, fmt.Errorf("mux requires multiplex=on (got %q)", d.Config.MultiplexMode())
 	}
 
 	baseConn, err := d.dialBase()
@@ -148,6 +142,9 @@ func (d *MuxDialer) getOrCreateSession() (*muxSession, error) {
 
 	d.mu.Lock()
 	sess := newMuxSession(baseConn, nil)
+	if d.deferInitialOpen() {
+		sess.enableDelayedClose(time.Second)
+	}
 	d.session = sess
 	d.creating = false
 	d.cond.Broadcast()
