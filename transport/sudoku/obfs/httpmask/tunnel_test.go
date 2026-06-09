@@ -1267,6 +1267,69 @@ func TestTunnelServer_StreamPull_WriteFailureClosesSession(t *testing.T) {
 	}
 }
 
+func TestTunnelServer_StreamPull_ActiveDownlinkRefreshesSessionTTL(t *testing.T) {
+	srv := NewTunnelServer(TunnelServerOptions{
+		Mode:            "stream",
+		PullReadTimeout: time.Second,
+		SessionTTL:      80 * time.Millisecond,
+	})
+
+	token := "active-downlink-token"
+	sess := srv.upsertPacketUpSession(token)
+	if sess == nil || sess.acceptConn == nil {
+		t.Fatalf("expected packet-up session")
+	}
+
+	pullClient, pullServer := net.Pipe()
+	t.Cleanup(func() { _ = pullClient.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := srv.streamPull(pullServer, token, nil)
+		done <- err
+	}()
+
+	resp, err := http.ReadResponse(bufio.NewReader(pullClient), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read pull response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull status=%s", resp.Status)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	for i := 0; i < 6; i++ {
+		payload := []byte{byte('a' + i)}
+		_ = sess.acceptConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := sess.acceptConn.Write(payload); err != nil {
+			t.Fatalf("write active payload %d: %v", i, err)
+		}
+		_ = pullClient.SetReadDeadline(time.Now().Add(2 * time.Second))
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(resp.Body, got); err != nil {
+			t.Fatalf("read active payload %d: %v", i, err)
+		}
+		if string(got) != string(payload) {
+			t.Fatalf("payload %d mismatch: got=%q want=%q", i, string(got), string(payload))
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if !srv.sessionHas(token) {
+		t.Fatalf("active session was reaped")
+	}
+
+	_ = pullClient.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("streamPull: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for streamPull")
+	}
+}
+
 func TestRetryableRequestError_WindowsConnectionAborted(t *testing.T) {
 	err := fmt.Errorf("read tcp 127.0.0.1:54478->127.0.0.1:54503: wsarecv: An established connection was aborted by the software in your host machine")
 	if !isRetryableRequestError(err) {

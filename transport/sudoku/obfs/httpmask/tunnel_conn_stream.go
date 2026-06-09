@@ -274,14 +274,11 @@ func (c *streamConn) waitPacketUploadPrewarm(timeout time.Duration) {
 
 func (c *streamConn) pullLoop() {
 	const (
-		// requestTimeout must be long enough for continuous high-throughput streams (e.g. mux + large downloads).
-		// If it is too short, the client cancels the response mid-body and corrupts the byte stream.
-		requestTimeout = 2 * time.Minute
-		readChunkSize  = 32 * 1024
-		idleBackoff    = 25 * time.Millisecond
-		maxDialRetry   = 12
-		minBackoff     = 10 * time.Millisecond
-		maxBackoff     = 250 * time.Millisecond
+		readChunkSize = 32 * 1024
+		idleBackoff   = 25 * time.Millisecond
+		maxDialRetry  = 12
+		minBackoff    = 10 * time.Millisecond
+		maxBackoff    = 250 * time.Millisecond
 	)
 
 	var (
@@ -301,10 +298,10 @@ func (c *streamConn) pullLoop() {
 		if initialPullURL != "" {
 			pullURL = initialPullURL
 		}
-		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, pullURL, nil)
+		// Keep the streaming response tied only to the tunnel lifetime. A per-request
+		// timeout here cancels active large downloads mid-body and corrupts mux streams.
+		req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, pullURL, nil)
 		if err != nil {
-			cancel()
 			_ = c.Close()
 			return
 		}
@@ -314,7 +311,6 @@ func (c *streamConn) pullLoop() {
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			cancel()
 			if (isDialError(err) || isRetryableRequestError(err)) && dialRetry < maxDialRetry {
 				dialRetry++
 				select {
@@ -338,7 +334,6 @@ func (c *streamConn) pullLoop() {
 		if resp.StatusCode != http.StatusOK {
 			c.signalEarly(fmt.Errorf("stream pull bad status: %s", resp.Status))
 			_ = resp.Body.Close()
-			cancel()
 			_ = c.Close()
 			return
 		}
@@ -356,13 +351,11 @@ func (c *streamConn) pullLoop() {
 				case c.rxc <- payload:
 				case <-c.closed:
 					_ = resp.Body.Close()
-					cancel()
 					return
 				}
 			}
 			if rerr != nil {
 				_ = resp.Body.Close()
-				cancel()
 				if errors.Is(rerr, io.EOF) {
 					// Long-poll ended; retry.
 					break
@@ -371,7 +364,6 @@ func (c *streamConn) pullLoop() {
 				return
 			}
 		}
-		cancel()
 		if !readAny {
 			// Avoid tight loop if the server replied quickly with an empty body.
 			select {

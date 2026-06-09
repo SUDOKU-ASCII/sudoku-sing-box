@@ -855,6 +855,17 @@ func (s *TunnelServer) sessionGet(token string) (*tunnelSession, bool) {
 	return sess, true
 }
 
+func (s *TunnelServer) sessionTouch(token string) {
+	if token == "" {
+		return
+	}
+	s.mu.Lock()
+	if sess, ok := s.sessions[token]; ok {
+		sess.lastActive = time.Now()
+	}
+	s.mu.Unlock()
+}
+
 func (s *TunnelServer) sessionClose(token string) {
 	s.mu.Lock()
 	sess, ok := s.sessions[token]
@@ -1087,6 +1098,7 @@ func (s *TunnelServer) sessionPull(rawConn net.Conn, token string, keepalive boo
 		_ = sess.conn.SetReadDeadline(time.Now().Add(s.pullReadTimeout))
 		n, err := sess.conn.Read(buf)
 		if n > 0 {
+			s.sessionTouch(token)
 			if writeErr := writePayload(cw, buf[:n]); writeErr != nil {
 				s.sessionClose(token)
 				return HandleDone, nil, nil
