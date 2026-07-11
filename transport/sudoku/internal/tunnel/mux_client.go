@@ -40,7 +40,9 @@ func NewMuxClient(conn net.Conn) (*MuxClient, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("nil conn")
 	}
-	return &MuxClient{sess: newMuxSession(conn, nil)}, nil
+	sess := newMuxSession(conn, nil)
+	sess.startKeepalive(muxKeepaliveInterval)
+	return &MuxClient{sess: sess}, nil
 }
 
 // Dial opens a new logical stream to destAddrStr (host:port).

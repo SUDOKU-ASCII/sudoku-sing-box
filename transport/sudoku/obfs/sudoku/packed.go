@@ -280,10 +280,10 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 		}
 	}
 
-	// 3. Fast batch processing (Fast Path) — process 12 bytes at a time → 16 encoded groups
+	// 3. Unroll four 3-byte blocks. This is measurably faster with the default
+	// padding range than a single 3-byte loop.
 	for i+11 < n {
-		// Process 4 batches, each of 3 bytes
-		for batch := 0; batch < 4; batch++ {
+		for range 4 {
 			b1, b2, b3 := p[i], p[i+1], p[i+2]
 			i += 3
 
@@ -299,7 +299,7 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 		}
 	}
 
-	// 4. Process remaining 3-byte blocks
+	// 4. Process remaining complete 3-byte blocks.
 	for i+2 < n {
 		b1, b2, b3 := p[i], p[i+1], p[i+2]
 		i += 3
@@ -315,7 +315,7 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 		out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g4)
 	}
 
-	// 5. Tail processing (Tail Path) — handle remaining 1 or 2 bytes
+	// 5. Tail processing — handle the remaining 1 or 2 bytes.
 	for ; i < n; i++ {
 		b := p[i]
 		pc.bitBuf = (pc.bitBuf << 8) | uint64(b)
@@ -332,7 +332,7 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 		}
 	}
 
-	// 6. Flush residual bits
+	// 6. Flush residual bits.
 	if pc.bitCount > 0 {
 		group := byte(pc.bitBuf << (6 - pc.bitCount))
 		pc.bitBuf = 0

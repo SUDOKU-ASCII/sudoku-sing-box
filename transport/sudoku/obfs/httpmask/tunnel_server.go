@@ -77,9 +77,18 @@ type TunnelServer struct {
 }
 
 type tunnelSession struct {
-	conn       net.Conn
-	lastActive time.Time
+	conn           net.Conn
+	lastActive     time.Time
+	uplinkClosed   bool
+	downlinkClosed bool
 }
+
+type sessionDirection uint8
+
+const (
+	sessionUplink sessionDirection = iota
+	sessionDownlink
+)
 
 func NewTunnelServer(opts TunnelServerOptions) *TunnelServer {
 	mode := normalizeTunnelMode(opts.Mode)
@@ -523,9 +532,6 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 	case http.MethodPost:
 		// Stream Split Session: POST /api/v1/upload?token=... => uplink push.
 		if token != "" && path == "/api/v1/upload" {
-			if s.passThroughOnReject && !s.sessionHas(token) {
-				return s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusNotFound, "not found")
-			}
 			if closeFlag {
 				s.sessionClose(token)
 				_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
@@ -537,6 +543,9 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 				_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
 				_ = rawConn.Close()
 				return HandleDone, nil, nil
+			}
+			if s.passThroughOnReject && !s.sessionHas(token) {
+				return s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusNotFound, "not found")
 			}
 			bodyReader, err := newRequestBodyReader(newPreBufferedConn(rawConn, buffered), req.headers)
 			if err != nil {
@@ -614,6 +623,20 @@ func writeTunnelResponseHeader(w io.Writer) error {
 	return err
 }
 
+func writeSessionPullResponseHeader(w io.Writer) error {
+	_, err := io.WriteString(w,
+		"HTTP/1.1 200 OK\r\n"+
+			"Content-Type: application/octet-stream\r\n"+
+			"Transfer-Encoding: chunked\r\n"+
+			"Trailer: "+tunnelStreamEOFHeader+"\r\n"+
+			"Cache-Control: no-store\r\n"+
+			"Pragma: no-cache\r\n"+
+			"Connection: close\r\n"+
+			"X-Accel-Buffering: no\r\n"+
+			"\r\n")
+	return err
+}
+
 func writeSimpleHTTPResponse(w io.Writer, code int, body string) error {
 	if body == "" {
 		body = http.StatusText(code)
@@ -682,9 +705,6 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, head
 		if token == "" {
 			return s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusBadRequest, "missing token")
 		}
-		if s.passThroughOnReject && !s.sessionHas(token) {
-			return s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusNotFound, "not found")
-		}
 		if closeFlag {
 			s.sessionClose(token)
 			_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
@@ -696,6 +716,9 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, head
 			_ = writeSimpleHTTPResponse(rawConn, http.StatusOK, "")
 			_ = rawConn.Close()
 			return HandleDone, nil, nil
+		}
+		if s.passThroughOnReject && !s.sessionHas(token) {
+			return s.rejectOrReply(rawConn, headerBytes, buffered, http.StatusNotFound, "not found")
 		}
 		bodyReader, err := newRequestBodyReader(newPreBufferedConn(rawConn, buffered), req.headers)
 		if err != nil {
@@ -829,15 +852,40 @@ func (s *TunnelServer) sessionClose(token string) {
 }
 
 func (s *TunnelServer) sessionCloseWrite(token string) {
-	sess, ok := s.sessionGet(token)
-	if !ok || sess == nil || sess.conn == nil {
+	s.sessionHalfClose(token, sessionUplink)
+}
+
+func (s *TunnelServer) sessionHalfClose(token string, direction sessionDirection) {
+	var (
+		conn       net.Conn
+		closeWrite bool
+	)
+
+	s.mu.Lock()
+	sess, ok := s.sessions[token]
+	if !ok {
+		s.mu.Unlock()
 		return
 	}
-	if cw, ok := sess.conn.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-		return
+	sess.lastActive = time.Now()
+	switch direction {
+	case sessionUplink:
+		if !sess.uplinkClosed {
+			sess.uplinkClosed = true
+			closeWrite = true
+		}
+	case sessionDownlink:
+		sess.downlinkClosed = true
 	}
-	_ = sess.conn.Close()
+	if sess.uplinkClosed && sess.downlinkClosed {
+		delete(s.sessions, token)
+	}
+	conn = sess.conn
+	s.mu.Unlock()
+
+	if closeWrite {
+		_ = connutil.TryCloseWrite(conn)
+	}
 }
 
 func (s *TunnelServer) pollPush(rawConn net.Conn, token string, body io.Reader) (HandleResult, net.Conn, error) {
@@ -855,8 +903,7 @@ func (s *TunnelServer) pollPush(rawConn net.Conn, token string, body io.Reader) 
 		return HandleDone, nil, nil
 	}
 
-	lines := bytes.Split(payload, []byte{'\n'})
-	for _, line := range lines {
+	for line := range bytes.SplitSeq(payload, []byte{'\n'}) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
@@ -954,15 +1001,19 @@ func (s *TunnelServer) sessionPull(rawConn net.Conn, token string, keepalive boo
 		return HandleDone, nil, nil
 	}
 
-	if err := writeTunnelResponseHeader(rawConn); err != nil {
+	if err := writeSessionPullResponseHeader(rawConn); err != nil {
 		_ = rawConn.Close()
 		return HandleDone, nil, err
 	}
 
 	bw := bufio.NewWriterSize(rawConn, 32*1024)
 	cw := httputil.NewChunkedWriter(bw)
+	streamEOF := false
 	defer func() {
 		_ = cw.Close()
+		if streamEOF {
+			_, _ = fmt.Fprintf(bw, "%s: 1\r\n", tunnelStreamEOFHeader)
+		}
 		_, _ = bw.WriteString("\r\n")
 		_ = bw.Flush()
 		_ = rawConn.Close()
@@ -973,8 +1024,14 @@ func (s *TunnelServer) sessionPull(rawConn net.Conn, token string, keepalive boo
 		_ = sess.conn.SetReadDeadline(time.Now().Add(s.pullReadTimeout))
 		n, err := sess.conn.Read(buf)
 		if n > 0 {
-			_ = writePayload(cw, buf[:n])
-			_ = bw.Flush()
+			if writeErr := writePayload(cw, buf[:n]); writeErr != nil {
+				s.sessionClose(token)
+				return HandleDone, nil, nil
+			}
+			if flushErr := bw.Flush(); flushErr != nil {
+				s.sessionClose(token)
+				return HandleDone, nil, nil
+			}
 		}
 		if err == nil {
 			continue
@@ -987,7 +1044,9 @@ func (s *TunnelServer) sessionPull(rawConn net.Conn, token string, keepalive boo
 			}
 			return HandleDone, nil, nil
 		}
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		if errors.Is(err, io.EOF) {
+			streamEOF = true
+			s.sessionHalfClose(token, sessionDownlink)
 			return HandleDone, nil, nil
 		}
 		s.sessionClose(token)

@@ -50,6 +50,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 
 	defaultConf := sudokut.DefaultConfig()
 	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
+	multiplex := resolveMultiplex(defaultConf.Multiplex, options.Multiplex, options.HTTPMaskMultiplex)
 
 	protoConf := sudokut.ProtocolConfig{
 		Key:                     options.Key,
@@ -57,12 +58,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		PaddingMin:              paddingMin,
 		PaddingMax:              paddingMax,
 		EnablePureDownlink:      resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink),
+		Multiplex:               multiplex,
 		HandshakeTimeoutSeconds: defaultConf.HandshakeTimeoutSeconds,
 		SuspiciousAction:        defaultConf.SuspiciousAction,
 		FallbackAddress:         options.FallbackAddress,
 		DisableHTTPMask:         options.DisableHTTPMask,
 		HTTPMaskMode:            resolveHTTPMaskMode(defaultConf.HTTPMaskMode, options.HTTPMaskMode, ""),
-		HTTPMaskMultiplex:       resolveConfigString(defaultConf.HTTPMaskMultiplex, options.HTTPMaskMultiplex),
+		HTTPMaskMultiplex:       options.HTTPMaskMultiplex,
 		HTTPMaskPathRoot:        options.HTTPMaskPathRoot,
 	}
 	if options.AEADMethod != "" {
@@ -126,7 +128,7 @@ func (h *Inbound) Close() error {
 	return common.Close(h.listener, common.PtrOrNil(h.tunnelSrv), common.PtrOrNil(h.reverse))
 }
 
-func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	sessionConn, session, targetAddr, userHash, payload, handled, err := h.tunnelSrv.HandleConnSessionAutoWithUserHash(conn)
 	if err != nil {
 		var suspErr *sudokut.SuspiciousError

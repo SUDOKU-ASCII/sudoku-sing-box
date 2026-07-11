@@ -48,11 +48,28 @@ func NewMuxClient(cfg *ProtocolConfig) (*MuxClient, error) {
 	return &MuxClient{dialer: &internaltunnel.MuxDialer{BaseDialer: *newBaseDialer(context.Background(), cfg)}}, nil
 }
 
-func (c *MuxClient) Dial(_ context.Context, targetAddr string) (net.Conn, error) {
+func (c *MuxClient) Dial(ctx context.Context, targetAddr string) (net.Conn, error) {
 	if c == nil || c.dialer == nil {
 		return nil, fmt.Errorf("nil mux client")
 	}
-	return c.dialer.Dial(targetAddr)
+	return c.dialer.DialContext(ctx, targetAddr)
+}
+
+func (c *MuxClient) Warm(ctx context.Context) error {
+	if c == nil || c.dialer == nil {
+		return fmt.Errorf("nil mux client")
+	}
+	return c.dialer.Warm(ctx)
+}
+
+func (c *MuxClient) Maintain(ctx context.Context, notify func(error)) {
+	if c == nil || c.dialer == nil {
+		if notify != nil {
+			notify(fmt.Errorf("nil mux client"))
+		}
+		return
+	}
+	c.dialer.Maintain(ctx, notify)
 }
 
 func (c *MuxClient) Close() error {

@@ -129,3 +129,71 @@ func TestLoadHTTPMaskPathRoot(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadMultiplexCompatibility(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		extraJSON  string
+		wantMux    string
+		wantSess   bool
+		wantTunnel bool
+	}{
+		{
+			name: "top-level-raw-tcp-session-mux",
+			extraJSON: `"multiplex": "on",
+				"httpmask": {"disable": true}`,
+			wantMux:  "on",
+			wantSess: true,
+		},
+		{
+			name:       "legacy-httpmask-auto",
+			extraJSON:  `"httpmask": {"mode": "stream", "multiplex": "auto"}`,
+			wantMux:    "auto",
+			wantTunnel: true,
+		},
+		{
+			name: "legacy-location-wins-when-both-are-set",
+			extraJSON: `"multiplex": "on",
+				"httpmask": {"mode": "stream", "multiplex": "auto"}`,
+			wantMux:    "auto",
+			wantTunnel: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			path := filepath.Join(tmpDir, "cfg.json")
+
+			data := fmt.Sprintf(`{
+				"mode": "client",
+				"local_port": 8080,
+				"server_address": "1.1.1.1:443",
+				"key": "k",
+				"aead": "none",
+				%s,
+				"rule_urls": ["global"]
+			}`, tc.extraJSON)
+
+			if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+				t.Fatalf("write file: %v", err)
+			}
+
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load error: %v", err)
+			}
+			if cfg.MultiplexMode() != tc.wantMux || cfg.Multiplex != tc.wantMux || cfg.HTTPMask.Multiplex != tc.wantMux {
+				t.Fatalf("multiplex mismatch: mode=%q top=%q httpmask=%q want %q", cfg.MultiplexMode(), cfg.Multiplex, cfg.HTTPMask.Multiplex, tc.wantMux)
+			}
+			if cfg.SessionMuxEnabled() != tc.wantSess {
+				t.Fatalf("session mux mismatch: got %v want %v", cfg.SessionMuxEnabled(), tc.wantSess)
+			}
+			if cfg.HTTPMaskTunnelEnabled() != tc.wantTunnel {
+				t.Fatalf("httpmask tunnel mismatch: got %v want %v", cfg.HTTPMaskTunnelEnabled(), tc.wantTunnel)
+			}
+		})
+	}
+}

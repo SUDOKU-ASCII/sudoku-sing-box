@@ -37,7 +37,13 @@ type queuedConn struct {
 	writeCh chan []byte
 	// writeClosed is closed by CloseWrite to stop accepting new payloads.
 	// When closed, Write returns io.ErrClosedPipe, but Read is unaffected.
-	writeClosed chan struct{}
+	writeClosed   chan struct{}
+	writeGate     sync.RWMutex
+	writeDone     chan struct{}
+	writeDoneOnce sync.Once
+	writeErr      error
+	readEOF       chan struct{}
+	readEOFOnce   sync.Once
 
 	mu         sync.Mutex
 	readBuf    []byte
@@ -48,16 +54,71 @@ type queuedConn struct {
 
 const queuedConnPayloadQueueDepth = 64
 
+func newQueuedConn() queuedConn {
+	return queuedConn{
+		rxc:         make(chan []byte, queuedConnPayloadQueueDepth),
+		closed:      make(chan struct{}),
+		writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
+		writeClosed: make(chan struct{}),
+		writeDone:   make(chan struct{}),
+		readEOF:     make(chan struct{}),
+		localAddr:   &net.TCPAddr{},
+		remoteAddr:  &net.TCPAddr{},
+	}
+}
+
 func (c *queuedConn) CloseWrite() error {
 	if c == nil || c.writeClosed == nil {
 		return nil
 	}
-	c.mu.Lock()
+	c.writeGate.Lock()
 	if !isClosedPipeChan(c.writeClosed) {
 		close(c.writeClosed)
 	}
+	c.writeGate.Unlock()
+
+	writeDone := c.writeDone
+	closed := c.closed
+	if writeDone == nil {
+		return nil
+	}
+	select {
+	case <-writeDone:
+		return c.completedWriteErr()
+	default:
+	}
+	select {
+	case <-writeDone:
+		return c.completedWriteErr()
+	case <-closed:
+		return c.closedErr()
+	}
+}
+
+func (c *queuedConn) completedWriteErr() error {
+	c.mu.Lock()
+	err := c.writeErr
 	c.mu.Unlock()
-	return nil
+	return err
+}
+
+func (c *queuedConn) completeWrite(err error) {
+	if c == nil || c.writeDone == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.writeErr == nil {
+		c.writeErr = err
+	}
+	c.mu.Unlock()
+	c.writeDoneOnce.Do(func() { close(c.writeDone) })
+}
+
+func (c *queuedConn) markReadEOF() {
+	if c == nil || c.readEOF == nil {
+		return
+	}
+	c.readEOFOnce.Do(func() { close(c.readEOF) })
 }
 
 func (c *queuedConn) closeWithError(err error) error {
@@ -93,6 +154,18 @@ func (c *queuedConn) Read(b []byte) (n int, err error) {
 	if len(c.readBuf) == 0 {
 		select {
 		case c.readBuf = <-c.rxc:
+		default:
+		}
+	}
+	if len(c.readBuf) == 0 {
+		select {
+		case c.readBuf = <-c.rxc:
+		case <-c.readEOF:
+			select {
+			case c.readBuf = <-c.rxc:
+			default:
+				return 0, io.EOF
+			}
 		case <-c.closed:
 			return 0, c.closedErr()
 		}
@@ -106,22 +179,6 @@ func (c *queuedConn) Write(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	c.mu.Lock()
-	select {
-	case <-c.closed:
-		c.mu.Unlock()
-		return 0, c.closedErr()
-	default:
-	}
-	if c.writeClosed != nil {
-		select {
-		case <-c.writeClosed:
-			c.mu.Unlock()
-			return 0, io.ErrClosedPipe
-		default:
-		}
-	}
-	c.mu.Unlock()
 
 	payload := make([]byte, len(b))
 	copy(payload, b)
@@ -133,13 +190,24 @@ func (c *queuedConn) Write(b []byte) (n int, err error) {
 			return 0, c.closedErr()
 		}
 	}
+
+	c.writeGate.RLock()
+	defer c.writeGate.RUnlock()
+	select {
+	case <-c.closed:
+		return 0, c.closedErr()
+	default:
+	}
+	select {
+	case <-c.writeClosed:
+		return 0, io.ErrClosedPipe
+	default:
+	}
 	select {
 	case c.writeCh <- payload:
 		return len(b), nil
 	case <-c.closed:
 		return 0, c.closedErr()
-	case <-c.writeClosed:
-		return 0, io.ErrClosedPipe
 	}
 }
 

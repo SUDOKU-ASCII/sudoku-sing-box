@@ -26,6 +26,7 @@ type ProtocolConfig struct {
 	EnablePureDownlink bool
 
 	TargetAddress string
+	Multiplex     string
 
 	HandshakeTimeoutSeconds int
 
@@ -95,10 +96,11 @@ func (c *ProtocolConfig) Validate() error {
 		return fmt.Errorf("invalid http_mask_mode: %s, must be one of: legacy, stream, poll, auto, ws", c.HTTPMaskMode)
 	}
 
-	switch strings.ToLower(strings.TrimSpace(c.HTTPMaskMultiplex)) {
-	case "", "off", "auto", "on":
-	default:
-		return fmt.Errorf("invalid http_mask_multiplex: %s, must be one of: off, auto, on", c.HTTPMaskMultiplex)
+	if err := validateMultiplexMode("multiplex", c.Multiplex); err != nil {
+		return err
+	}
+	if err := validateMultiplexMode("http_mask_multiplex", c.HTTPMaskMultiplex); err != nil {
+		return err
 	}
 
 	if v := strings.TrimSpace(c.HTTPMaskPathRoot); v != "" {
@@ -144,7 +146,32 @@ func DefaultConfig() *ProtocolConfig {
 		HandshakeTimeoutSeconds: 5,
 		SuspiciousAction:        "fallback",
 		HTTPMaskMode:            "legacy",
-		HTTPMaskMultiplex:       "off",
+		Multiplex:               "off",
+	}
+}
+
+func (c *ProtocolConfig) MultiplexMode() string {
+	if c == nil {
+		return "off"
+	}
+	for _, mode := range []string{c.HTTPMaskMultiplex, c.Multiplex} {
+		if mode = strings.TrimSpace(mode); mode != "" {
+			return strings.ToLower(mode)
+		}
+	}
+	return "off"
+}
+
+func (c *ProtocolConfig) SessionMuxEnabled() bool {
+	return c.MultiplexMode() == "on"
+}
+
+func validateMultiplexMode(name, mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "off", "auto", "on":
+		return nil
+	default:
+		return fmt.Errorf("invalid %s: %s, must be one of: off, auto, on", name, mode)
 	}
 }
 

@@ -37,6 +37,7 @@ func dialStream(ctx context.Context, serverAddress string, opts TunnelDialOption
 
 type streamSplitConn struct {
 	queuedConn
+	readiness *tunnelReadiness
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -48,15 +49,18 @@ type streamSplitConn struct {
 	closeURL   string
 	headerHost string
 	auth       *tunnelAuth
+	waitSpare  func(context.Context) error
 }
 
 func (c *streamSplitConn) Close() error {
-	_ = c.closeWithError(io.ErrClosedPipe)
+	return c.closeWithError(io.ErrClosedPipe)
+}
 
+func (c *streamSplitConn) closeWithError(err error) error {
+	_ = c.queuedConn.closeWithError(err)
 	if c.cancel != nil {
 		c.cancel()
 	}
-
 	bestEffortCloseSession(c.client, c.closeURL, c.headerHost, TunnelModeStream, c.auth)
 	return nil
 }
@@ -71,6 +75,7 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 	c := &streamSplitConn{
 		ctx:        connCtx,
 		cancel:     cancel,
+		readiness:  newTunnelReadiness(),
 		client:     info.client,
 		pushURL:    info.pushURL,
 		pullURL:    info.pullURL,
@@ -78,53 +83,26 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 		closeURL:   info.closeURL,
 		headerHost: info.headerHost,
 		auth:       info.auth,
-		queuedConn: queuedConn{
-			rxc:         make(chan []byte, queuedConnPayloadQueueDepth),
-			closed:      make(chan struct{}),
-			writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
-			writeClosed: make(chan struct{}),
-			localAddr:   &net.TCPAddr{},
-			remoteAddr:  &net.TCPAddr{},
-		},
+		queuedConn: newQueuedConn(),
 	}
 
+	c.waitSpare = configureSplitPreconnect(connCtx, info, opts.Multiplex, c.closed)
 	go c.pullLoop()
 	go c.pushLoop()
-	outConn := net.Conn(c)
-	if opts.EarlyHandshake != nil && opts.EarlyHandshake.WrapConn != nil && (opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
-		upgraded, err := opts.EarlyHandshake.WrapConn(c)
-		if err != nil {
-			_ = c.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-		return outConn, nil
-	}
-	if opts.Upgrade != nil {
-		upgraded, err := opts.Upgrade(c)
-		if err != nil {
-			_ = c.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-	}
-	return outConn, nil
+	return finishTunnelDial(c, opts, c.waitReady)
+}
+
+func (c *streamSplitConn) waitReady(ctx context.Context) error {
+	return waitSplitTunnelReady(ctx, c.readiness, c.closed, c.closedErr, c.waitSpare)
 }
 
 func (c *streamSplitConn) pullLoop() {
 	const (
-		// requestTimeout must be long enough for continuous high-throughput streams (e.g. mux + large downloads).
-		// If it is too short, the client cancels the response mid-body and corrupts the byte stream.
-		requestTimeout = 2 * time.Minute
-		readChunkSize  = 32 * 1024
-		idleBackoff    = 25 * time.Millisecond
-		maxDialRetry   = 12
-		minBackoff     = 10 * time.Millisecond
-		maxBackoff     = 250 * time.Millisecond
+		readChunkSize = 32 * 1024
+		idleBackoff   = 25 * time.Millisecond
+		maxDialRetry  = 12
+		minBackoff    = 10 * time.Millisecond
+		maxBackoff    = 250 * time.Millisecond
 	)
 
 	var (
@@ -139,7 +117,9 @@ func (c *streamSplitConn) pullLoop() {
 		default:
 		}
 
-		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
+		// The server ends an idle pull after PullReadTimeout. A fixed client
+		// lifetime would instead cancel healthy continuous downloads mid-stream.
+		reqCtx, cancel := context.WithCancel(c.ctx)
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.pullURL, nil)
 		if err != nil {
 			cancel()
@@ -149,11 +129,14 @@ func (c *streamSplitConn) pullLoop() {
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModeStream)
 		applyTunnelAuth(req, c.auth, TunnelModeStream, http.MethodGet, "/stream")
+		// Stream pulls are long-lived and the raw server closes the carrier after
+		// the terminal chunk. Do not race that close against transport reuse.
+		req.Close = true
 
 		resp, err := c.client.Do(req)
 		if err != nil {
 			cancel()
-			if isDialError(err) && dialRetry < maxDialRetry {
+			if (isDialError(err) || isRetryableHTTPTransportError(err)) && dialRetry < maxDialRetry {
 				dialRetry++
 				select {
 				case <-time.After(backoff):
@@ -178,6 +161,7 @@ func (c *streamSplitConn) pullLoop() {
 			_ = c.Close()
 			return
 		}
+		c.readiness.markPullReady()
 
 		readAny := false
 		for {
@@ -198,6 +182,10 @@ func (c *streamSplitConn) pullLoop() {
 				_ = resp.Body.Close()
 				cancel()
 				if errors.Is(rerr, io.EOF) {
+					if resp.Trailer.Get(tunnelStreamEOFHeader) == "1" {
+						c.markReadEOF()
+						return
+					}
 					// Long-poll ended; retry.
 					break
 				}
@@ -228,10 +216,17 @@ func (c *streamSplitConn) pushLoop() {
 	)
 
 	var (
-		buf   bytes.Buffer
-		timer = time.NewTimer(flushInterval)
+		buf      bytes.Buffer
+		timer    = time.NewTimer(flushInterval)
+		writeErr error
 	)
 	defer timer.Stop()
+	defer func() { c.completeWrite(writeErr) }()
+
+	fail := func(err error) {
+		writeErr = err
+		_ = c.closeWithError(err)
+	}
 
 	flush := func() error {
 		if buf.Len() == 0 {
@@ -262,42 +257,54 @@ func (c *streamSplitConn) pushLoop() {
 		}
 
 		buf.Reset()
+		c.readiness.markPushReady()
 		return nil
 	}
 
 	flushWithRetry := func() error {
-		return retryDial(c.closed, func() error { return io.ErrClosedPipe }, maxDialRetry, minBackoff, maxBackoff, flush)
+		return retryDial(c.closed, c.closedErr, maxDialRetry, minBackoff, maxBackoff, flush)
 	}
 	resetTimer(timer, flushInterval)
 
+	enqueue := func(b []byte) error {
+		for len(b) > 0 {
+			space := maxBatchBytes - buf.Len()
+			if space == 0 {
+				if err := flushWithRetry(); err != nil {
+					return err
+				}
+				resetTimer(timer, flushInterval)
+				space = maxBatchBytes
+			}
+			if len(b) < space {
+				space = len(b)
+			}
+			_, _ = buf.Write(b[:space])
+			b = b[space:]
+		}
+		return nil
+	}
+
 	for {
 		select {
-		case b, ok := <-c.writeCh:
-			if !ok {
-				_ = flushWithRetry()
-				return
-			}
+		case b := <-c.writeCh:
 			if len(b) == 0 {
 				continue
 			}
-			if buf.Len()+len(b) > maxBatchBytes {
-				if err := flushWithRetry(); err != nil {
-					_ = c.Close()
-					return
-				}
-				resetTimer(timer, flushInterval)
+			if err := enqueue(b); err != nil {
+				fail(fmt.Errorf("stream push flush failed: %w", err))
+				return
 			}
-			_, _ = buf.Write(b)
 			if buf.Len() >= maxBatchBytes {
 				if err := flushWithRetry(); err != nil {
-					_ = c.Close()
+					fail(fmt.Errorf("stream push flush failed: %w", err))
 					return
 				}
 				resetTimer(timer, flushInterval)
 			}
 		case <-timer.C:
 			if err := flushWithRetry(); err != nil {
-				_ = c.Close()
+				fail(fmt.Errorf("stream push flush failed: %w", err))
 				return
 			}
 			resetTimer(timer, flushInterval)
@@ -309,21 +316,24 @@ func (c *streamSplitConn) pushLoop() {
 					if len(b) == 0 {
 						continue
 					}
-					if buf.Len()+len(b) > maxBatchBytes {
-						if err := flushWithRetry(); err != nil {
-							_ = c.Close()
-							return
-						}
+					if err := enqueue(b); err != nil {
+						fail(fmt.Errorf("stream push flush failed: %w", err))
+						return
 					}
-					_, _ = buf.Write(b)
 				default:
-					_ = flushWithRetry()
-					bestEffortCloseSession(c.client, c.finURL, c.headerHost, TunnelModeStream, c.auth)
+					if err := flushWithRetry(); err != nil {
+						fail(fmt.Errorf("stream push flush failed: %w", err))
+						return
+					}
+					if err := sendSessionControl(c.client, c.finURL, c.headerHost, TunnelModeStream, c.auth); err != nil {
+						fail(fmt.Errorf("stream FIN failed: %w", err))
+						return
+					}
 					return
 				}
 			}
 		case <-c.closed:
-			_ = flushWithRetry()
+			writeErr = c.closedErr()
 			return
 		}
 	}

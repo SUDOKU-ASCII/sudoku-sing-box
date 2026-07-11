@@ -15,14 +15,14 @@
   "custom_table": "",
   "custom_tables": [],
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "http_mask_strategy": "random",
   "httpmask": {
     "disable": false,
     "mode": "legacy",
     "tls": false,
     "host": "",
-    "path_root": "",
-    "multiplex": "off"
+    "path_root": ""
   },
   "reverse": {
     "client_id": "client-a",
@@ -128,15 +128,17 @@ Available values:
 * `poll` (real HTTP polling tunnel)
 * `auto` (try stream then fall back to poll)
 
-#### httpmask.multiplex
+#### multiplex
 
-Multiplex behavior when `httpmask.mode` is `stream`/`poll`/`auto`.
+Sudoku session multiplex and HTTPMask transport reuse mode.
 
 Available values:
 
-* `off` (disable transport reuse and mux)
-* `auto` (reuse underlying HTTP connections across tunnel dials; HTTP/2 can multiplex them)
-* `on` (single tunnel, multi-target mux inside one HTTPMask tunnel; reduces per-connection RTT)
+* `off` (disable session mux and HTTPMask transport reuse)
+* `auto` (reuse underlying HTTP connections across HTTPMask tunnel dials)
+* `on` (reuse one raw TCP or HTTPMask Sudoku session for multiple target streams)
+
+The legacy `httpmask.multiplex` and flat `http_mask_multiplex` fields are still accepted. When both a legacy field and `multiplex` are set, the legacy value takes precedence.
 
 #### httpmask.tls
 

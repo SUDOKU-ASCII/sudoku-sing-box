@@ -33,6 +33,7 @@ import (
 
 type pollConn struct {
 	queuedConn
+	readiness *tunnelReadiness
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -44,6 +45,7 @@ type pollConn struct {
 	closeURL   string
 	headerHost string
 	auth       *tunnelAuth
+	waitSpare  func(context.Context) error
 }
 
 func (c *pollConn) closeWithError(err error) error {
@@ -69,6 +71,7 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 	c := &pollConn{
 		ctx:        connCtx,
 		cancel:     cancel,
+		readiness:  newTunnelReadiness(),
 		client:     info.client,
 		pushURL:    info.pushURL,
 		pullURL:    info.pullURL,
@@ -76,41 +79,17 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 		closeURL:   info.closeURL,
 		headerHost: info.headerHost,
 		auth:       info.auth,
-		queuedConn: queuedConn{
-			rxc:         make(chan []byte, queuedConnPayloadQueueDepth),
-			closed:      make(chan struct{}),
-			writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
-			writeClosed: make(chan struct{}),
-			localAddr:   &net.TCPAddr{},
-			remoteAddr:  &net.TCPAddr{},
-		},
+		queuedConn: newQueuedConn(),
 	}
 
+	c.waitSpare = configureSplitPreconnect(connCtx, info, opts.Multiplex, c.closed)
 	go c.pullLoop()
 	go c.pushLoop()
-	outConn := net.Conn(c)
-	if opts.EarlyHandshake != nil && opts.EarlyHandshake.WrapConn != nil && (opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
-		upgraded, err := opts.EarlyHandshake.WrapConn(c)
-		if err != nil {
-			_ = c.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-		return outConn, nil
-	}
-	if opts.Upgrade != nil {
-		upgraded, err := opts.Upgrade(c)
-		if err != nil {
-			_ = c.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-	}
-	return outConn, nil
+	return finishTunnelDial(c, opts, c.waitReady)
+}
+
+func (c *pollConn) waitReady(ctx context.Context) error {
+	return waitSplitTunnelReady(ctx, c.readiness, c.closed, c.closedErr, c.waitSpare)
 }
 
 func (c *pollConn) pullLoop() {
@@ -139,10 +118,13 @@ func (c *pollConn) pullLoop() {
 		req.Host = c.headerHost
 		applyTunnelHeaders(req.Header, c.headerHost, TunnelModePoll)
 		applyTunnelAuth(req, c.auth, TunnelModePoll, http.MethodGet, "/stream")
+		// Each poll response ends its carrier, even when the server advertises
+		// keep-alive for compatibility. Keep it out of the shared idle pool.
+		req.Close = true
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			if isDialError(err) && dialRetry < maxDialRetry {
+			if (isDialError(err) || isRetryableHTTPTransportError(err)) && dialRetry < maxDialRetry {
 				dialRetry++
 				select {
 				case <-time.After(backoff):
@@ -166,21 +148,23 @@ func (c *pollConn) pullLoop() {
 			_ = c.closeWithError(fmt.Errorf("poll pull bad status: %s", resp.Status))
 			return
 		}
+		c.readiness.markPullReady()
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
+			line := scanner.Bytes()
+			if len(line) == 0 {
 				continue
 			}
-			payload, err := base64.StdEncoding.DecodeString(line)
+			payload := make([]byte, base64.StdEncoding.DecodedLen(len(line)))
+			n, err := base64.StdEncoding.Decode(payload, line)
 			if err != nil {
 				_ = resp.Body.Close()
 				_ = c.closeWithError(fmt.Errorf("poll pull decode failed: %w", err))
 				return
 			}
 			select {
-			case c.rxc <- payload:
+			case c.rxc <- payload[:n]:
 			case <-c.closed:
 				_ = resp.Body.Close()
 				return
@@ -189,6 +173,10 @@ func (c *pollConn) pullLoop() {
 		_ = resp.Body.Close()
 		if err := scanner.Err(); err != nil {
 			_ = c.closeWithError(fmt.Errorf("poll pull scan failed: %w", err))
+			return
+		}
+		if resp.Trailer.Get(tunnelStreamEOFHeader) == "1" {
+			c.markReadEOF()
 			return
 		}
 	}
@@ -208,8 +196,15 @@ func (c *pollConn) pushLoop() {
 		buf        bytes.Buffer
 		pendingRaw int
 		timer      = time.NewTimer(flushInterval)
+		writeErr   error
 	)
 	defer timer.Stop()
+	defer func() { c.completeWrite(writeErr) }()
+
+	fail := func(err error) {
+		writeErr = err
+		_ = c.closeWithError(err)
+	}
 
 	flush := func() error {
 		if buf.Len() == 0 {
@@ -241,6 +236,7 @@ func (c *pollConn) pushLoop() {
 
 		buf.Reset()
 		pendingRaw = 0
+		c.readiness.markPushReady()
 		return nil
 	}
 
@@ -264,10 +260,11 @@ func (c *pollConn) pushLoop() {
 				}
 			}
 
-			tmp := make([]byte, encLen)
+			buf.Grow(encLen + 1)
+			tmp := buf.AvailableBuffer()[:encLen]
 			base64.StdEncoding.Encode(tmp, chunk)
-			buf.Write(tmp)
-			buf.WriteByte('\n')
+			tmp = append(tmp, '\n')
+			_, _ = buf.Write(tmp)
 			pendingRaw += len(chunk)
 		}
 		return nil
@@ -275,30 +272,26 @@ func (c *pollConn) pushLoop() {
 
 	for {
 		select {
-		case b, ok := <-c.writeCh:
-			if !ok {
-				_ = flushWithRetry()
-				return
-			}
+		case b := <-c.writeCh:
 			if len(b) == 0 {
 				continue
 			}
 
 			if err := enqueue(b); err != nil {
-				_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
+				fail(fmt.Errorf("poll push flush failed: %w", err))
 				return
 			}
 
 			if pendingRaw >= maxBatchBytes {
 				if err := flushWithRetry(); err != nil {
-					_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
+					fail(fmt.Errorf("poll push flush failed: %w", err))
 					return
 				}
 				resetTimer(timer, flushInterval)
 			}
 		case <-timer.C:
 			if err := flushWithRetry(); err != nil {
-				_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
+				fail(fmt.Errorf("poll push flush failed: %w", err))
 				return
 			}
 			resetTimer(timer, flushInterval)
@@ -311,17 +304,23 @@ func (c *pollConn) pushLoop() {
 						continue
 					}
 					if err := enqueue(b); err != nil {
-						_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
+						fail(fmt.Errorf("poll push flush failed: %w", err))
 						return
 					}
 				default:
-					_ = flushWithRetry()
-					bestEffortCloseSession(c.client, c.finURL, c.headerHost, TunnelModePoll, c.auth)
+					if err := flushWithRetry(); err != nil {
+						fail(fmt.Errorf("poll push flush failed: %w", err))
+						return
+					}
+					if err := sendSessionControl(c.client, c.finURL, c.headerHost, TunnelModePoll, c.auth); err != nil {
+						fail(fmt.Errorf("poll FIN failed: %w", err))
+						return
+					}
 					return
 				}
 			}
 		case <-c.closed:
-			_ = flushWithRetry()
+			writeErr = c.closedErr()
 			return
 		}
 	}

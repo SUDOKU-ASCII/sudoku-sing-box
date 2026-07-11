@@ -47,7 +47,7 @@ type shortLinkPayload struct {
 	HTTPMaskMode    string `json:"hm,omitempty"` // "legacy" / "stream" / "poll" / "auto" / "ws"
 	HTTPMaskTLS     bool   `json:"ht,omitempty"` // enable HTTPS (when false/omitted, use plain HTTP)
 	HTTPMaskHost    string `json:"hh,omitempty"` // override HTTP Host/SNI in tunnel modes
-	HTTPMaskMux     string `json:"hx,omitempty"` // "off" / "auto" / "on"
+	HTTPMaskMux     string `json:"hx,omitempty"` // "auto" for HTTPMask reuse; "on" enables session mux
 	HTTPMaskPath    string `json:"hy,omitempty"` // optional first-level path root prefix
 }
 
@@ -100,7 +100,7 @@ func BuildShortLinkFromConfig(cfg *Config, advertiseHost string) (string, error)
 	if strings.TrimSpace(cfg.HTTPMask.PathRoot) != "" {
 		payload.HTTPMaskPath = strings.TrimSpace(cfg.HTTPMask.PathRoot)
 	}
-	muxMode := strings.ToLower(strings.TrimSpace(cfg.HTTPMask.Multiplex))
+	muxMode := cfg.MultiplexMode()
 	if muxMode != "" && muxMode != "off" {
 		payload.HTTPMaskMux = muxMode
 	}

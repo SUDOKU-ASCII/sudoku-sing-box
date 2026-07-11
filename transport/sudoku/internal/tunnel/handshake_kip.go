@@ -98,10 +98,6 @@ func KIPHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUs
 	return sh.SelectedFeats, nil
 }
 
-func ClientHandshake(conn net.Conn, cfg *config.Config, table *sudoku.Table, privateKey []byte) (net.Conn, error) {
-	return ClientHandshakeWithUplinkMode(conn, cfg, table, privateKey, ObfsUplinkPure, 0, false)
-}
-
 func ClientHandshakeWithUplinkMode(conn net.Conn, cfg *config.Config, table *sudoku.Table, privateKey []byte, uplinkMode ObfsUplinkMode, tableHint uint32, hasTableHint bool) (net.Conn, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("nil config")

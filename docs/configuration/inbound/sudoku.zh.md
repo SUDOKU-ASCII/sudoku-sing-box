@@ -15,14 +15,14 @@
   "custom_table": "",
   "custom_tables": [],
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "handshake_timeout": 5,
   "fallback_address": "127.0.0.1:80",
   "suspicious_action": "fallback",
   "httpmask": {
     "disable": false,
     "mode": "legacy",
-    "path_root": "",
-    "multiplex": "off"
+    "path_root": ""
   },
   "reverse": {
     "listen": "127.0.0.1:8081"
@@ -129,15 +129,17 @@ HTTP 伪装模式。
 * `poll`（真实 HTTP 轮询隧道）
 * `auto`（同时接受 stream 与 poll）
 
-#### httpmask.multiplex
+#### multiplex
 
-客户端在 `httpmask.mode` 为 `stream`/`poll`/`auto` 时的复用行为。
+Sudoku 会话多路复用与 HTTPMask 传输复用模式。
 
 可选值：
 
-* `off`
-* `auto`
-* `on`
+* `off`（禁用会话多路复用与 HTTPMask 传输复用）
+* `auto`（在多个 HTTPMask 隧道拨号间复用底层 HTTP 连接）
+* `on`（在一个原始 TCP 或 HTTPMask Sudoku 会话中复用多个目标流）
+
+仍兼容旧字段 `httpmask.multiplex` 和平铺字段 `http_mask_multiplex`。同时设置旧字段与 `multiplex` 时，旧字段优先。
 
 #### httpmask.path_root
 

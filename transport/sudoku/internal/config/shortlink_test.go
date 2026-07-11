@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -157,6 +158,57 @@ func TestShortLinkRoundTrip_DirectionalASCII(t *testing.T) {
 	}
 	if len(decoded.CustomTables) != len(cfg.CustomTables) {
 		t.Fatalf("custom tables length mismatch, got %d", len(decoded.CustomTables))
+	}
+}
+
+func TestShortLinkUsesLegacyMuxField(t *testing.T) {
+	cfg := &Config{
+		Mode:               "client",
+		LocalPort:          1081,
+		ServerAddress:      "edge.example.net:443",
+		Key:                "deadbeef",
+		AEAD:               "aes-128-gcm",
+		ASCII:              "prefer_entropy",
+		EnablePureDownlink: true,
+		Multiplex:          "on",
+		HTTPMask: HTTPMaskConfig{
+			Disable: true,
+			Mode:    "legacy",
+		},
+	}
+
+	link, err := BuildShortLinkFromConfig(cfg, "")
+	if err != nil {
+		t.Fatalf("BuildShortLinkFromConfig error: %v", err)
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(link, "sudoku://"))
+	if err != nil {
+		t.Fatalf("decode link: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload["hx"] != "on" {
+		t.Fatalf("legacy mux field mismatch, got %#v", payload["hx"])
+	}
+	if _, ok := payload["multiplex"]; ok {
+		t.Fatalf("short link should not add a top-level multiplex field")
+	}
+
+	decoded, err := BuildConfigFromShortLink(link)
+	if err != nil {
+		t.Fatalf("BuildConfigFromShortLink error: %v", err)
+	}
+	if decoded.MultiplexMode() != "on" || !decoded.SessionMuxEnabled() {
+		t.Fatalf("decoded mux mismatch: mode=%q enabled=%v", decoded.MultiplexMode(), decoded.SessionMuxEnabled())
+	}
+	if decoded.HTTPMask.Multiplex != "on" {
+		t.Fatalf("decoded legacy mux location mismatch, got %q", decoded.HTTPMask.Multiplex)
+	}
+	if !decoded.HTTPMask.Disable {
+		t.Fatalf("disable http mask mismatch, got %v", decoded.HTTPMask.Disable)
 	}
 }
 

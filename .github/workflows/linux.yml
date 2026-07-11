@@ -1,19 +1,18 @@
 name: Build Linux Packages
 
 on:
-  #push:
-  #  branches:
-  #    - stable
-  #    - testing
   workflow_dispatch:
     inputs:
       version:
         description: "Version name"
         required: true
         type: string
-  release:
-    types:
-      - published
+
+permissions:
+  contents: read
+
+env:
+  NAME: sing-box
 
 jobs:
   calculate_version:
@@ -22,27 +21,10 @@ jobs:
     outputs:
       version: ${{ steps.outputs.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
-        with:
-          fetch-depth: 0
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ~1.25.10
-      - name: Check input version
-        if: github.event_name == 'workflow_dispatch'
-        run: |-
-          echo "version=${{ inputs.version }}"
-          echo "version=${{ inputs.version }}" >> "$GITHUB_ENV"
-      - name: Calculate version
-        if: github.event_name != 'workflow_dispatch'
-        run: |-
-          go run -v ./cmd/internal/read_tag --ci --nightly
       - name: Set outputs
         id: outputs
         run: |-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
   build:
     name: Build binary
     runs-on: ubuntu-latest
@@ -113,10 +95,6 @@ jobs:
           set -xeuo pipefail
           cd ~/cronet-go
           go run ./cmd/build-naive --target=linux/${{ matrix.arch }} --libc=musl env >> $GITHUB_ENV
-      - name: Set tag
-        run: |-
-          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
-          git tag v${{ needs.calculate_version.outputs.version }} -f
       - name: Set build tags
         run: |
           set -xeuo pipefail
@@ -162,8 +140,6 @@ jobs:
       - name: Set mtime
         run: |-
           TZ=UTC touch -t '197001010000' dist/sing-box
-      - name: Detect track
-        run: bash .github/detect_track.sh
       - name: Set version
         run: |-
           PKG_VERSION="${{ needs.calculate_version.outputs.version }}"
@@ -214,30 +190,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.legacy_go && '-legacy' || '' }}
+          name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}
           path: "dist"
-  upload:
-    name: Upload builds
-    runs-on: ubuntu-latest
-    needs:
-      - calculate_version
-      - build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
-        with:
-          fetch-depth: 0
-      - name: Set tag
-        run: |-
-          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
-          git tag v${{ needs.calculate_version.outputs.version }} -f
-          echo "VERSION=${{ needs.calculate_version.outputs.version }}" >> "$GITHUB_ENV"
-      - name: Download builds
-        uses: actions/download-artifact@v5
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Publish packages
-        if: github.event_name != 'push'
-        run: |-
-          ls dist | xargs -I {} curl -F "package=@dist/{}" https://${{ secrets.FURY_TOKEN }}@push.fury.io/sagernet/

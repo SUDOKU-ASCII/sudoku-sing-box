@@ -50,6 +50,7 @@ type SudokuInboundOptions struct {
 	CustomTable        string                `json:"custom_table,omitempty"`
 	CustomTables       []string              `json:"custom_tables,omitempty"`
 	EnablePureDownlink *bool                 `json:"enable_pure_downlink,omitempty"`
+	Multiplex          string                `json:"multiplex,omitempty"`
 	HandshakeTimeout   int                   `json:"handshake_timeout,omitempty"`
 	FallbackAddress    string                `json:"fallback_address,omitempty"`
 	SuspiciousAction   string                `json:"suspicious_action,omitempty"`
@@ -72,6 +73,7 @@ type SudokuOutboundOptions struct {
 	CustomTable        string                `json:"custom_table,omitempty"`
 	CustomTables       []string              `json:"custom_tables,omitempty"`
 	EnablePureDownlink *bool                 `json:"enable_pure_downlink,omitempty"`
+	Multiplex          string                `json:"multiplex,omitempty"`
 	DisableHTTPMask    bool                  `json:"disable_http_mask,omitempty"`
 	HTTPMaskMode       string                `json:"http_mask_mode,omitempty"`
 	HTTPMaskMultiplex  string                `json:"http_mask_multiplex,omitempty"`

@@ -15,14 +15,14 @@
   "custom_table": "",
   "custom_tables": [],
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "handshake_timeout": 5,
   "fallback_address": "127.0.0.1:80",
   "suspicious_action": "fallback",
   "httpmask": {
     "disable": false,
     "mode": "legacy",
-    "path_root": "",
-    "multiplex": "off"
+    "path_root": ""
   },
   "reverse": {
     "listen": "127.0.0.1:8081"
@@ -129,15 +129,17 @@ Available values:
 * `poll` (real HTTP polling tunnel)
 * `auto` (accept stream and poll)
 
-#### httpmask.multiplex
+#### multiplex
 
-Client-side multiplex behavior for `httpmask.mode` `stream`/`poll`/`auto`.
+Sudoku session multiplex and HTTPMask transport reuse mode.
 
 Available values:
 
-* `off`
-* `auto`
-* `on`
+* `off` (disable session mux and HTTPMask transport reuse)
+* `auto` (reuse underlying HTTP connections across HTTPMask tunnel dials)
+* `on` (reuse one raw TCP or HTTPMask Sudoku session for multiple target streams)
+
+The legacy `httpmask.multiplex` and flat `http_mask_multiplex` fields are still accepted. When both a legacy field and `multiplex` are set, the legacy value takes precedence.
 
 #### httpmask.path_root
 

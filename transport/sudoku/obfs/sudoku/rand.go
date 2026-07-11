@@ -25,12 +25,6 @@ import (
 	"time"
 )
 
-type randomSource interface {
-	Uint32() uint32
-	Uint64() uint64
-	Intn(n int) int
-}
-
 type sudokuRand struct {
 	state      uint64
 	cached     uint32

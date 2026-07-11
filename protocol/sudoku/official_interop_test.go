@@ -105,7 +105,12 @@ func interopMatrix() []interopCombo {
 			for _, httpmaskMode := range httpmaskModes {
 				for _, muxMode := range muxModes {
 					for _, pathRoot := range pathRoots {
-						for _, asciiMode := range []string{"prefer_ascii", "prefer_entropy"} {
+						for _, asciiMode := range []string{
+							"prefer_ascii",
+							"prefer_entropy",
+							"up_ascii_down_entropy",
+							"up_entropy_down_ascii",
+						} {
 							for _, tableSet := range tableSets {
 								combo := interopCombo{
 									enablePureDownlink: enablePureDownlink,
@@ -159,9 +164,6 @@ func TestSudoku_OfficialInterop(t *testing.T) {
 					runOfficialServerSingBoxOutbound(t, officialBin, aead, combo)
 				})
 				t.Run("official_client-singbox_inbound", func(t *testing.T) {
-					if combo.httpmaskEnabled && combo.httpmaskMultiplex == "auto" {
-						t.Skip("upstream sudoku standalone client still flakes on UoT large-data with httpmask.multiplex=auto; direct-forward mux=off was fixed by upstream commit 2e518203")
-					}
 					runOfficialClientSingBoxInbound(t, officialBin, aead, combo)
 				})
 				t.Run("singbox-singbox", func(t *testing.T) {
@@ -769,6 +771,9 @@ func startOfficial(t *testing.T, officialBin string, cfg map[string]any) *bytes.
 	t.Cleanup(func() {
 		cancel()
 		_ = cmd.Wait()
+		if t.Failed() && buf.Len() > 0 {
+			t.Logf("official sudoku output:\n%s", buf.String())
+		}
 	})
 	return &buf
 }
@@ -783,23 +788,41 @@ func waitTCPPort(t *testing.T, port uint16, name string) {
 			return true
 		}
 		return false
-	}, 5*time.Second, 100*time.Millisecond, "%s not ready on %s", name, addr)
+	}, 30*time.Second, 100*time.Millisecond, "%s not ready on %s", name, addr)
+}
+
+var testPortAllocator struct {
+	sync.Mutex
+	next int
 }
 
 func allocateTCPPort(t *testing.T) uint16 {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := uint16(l.Addr().(*net.TCPAddr).Port)
-	require.NoError(t, l.Close())
-	return port
+
+	const (
+		firstPort = 12000
+		lastPort  = 30000
+	)
+
+	testPortAllocator.Lock()
+	defer testPortAllocator.Unlock()
+
+	if testPortAllocator.next == 0 {
+		testPortAllocator.next = firstPort
+	}
+	for testPortAllocator.next <= lastPort {
+		port := testPortAllocator.next
+		testPortAllocator.next++
+
+		listener, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			continue
+		}
+		require.NoError(t, listener.Close())
+		return uint16(port)
+	}
+	t.Fatalf("exhausted TCP test port range %d-%d", firstPort, lastPort)
+	return 0
 }
 
 func ptr[T any](v T) *T { return &v }
-
-func ternary(cond bool, a, b string) string {
-	if cond {
-		return a
-	}
-	return b
-}

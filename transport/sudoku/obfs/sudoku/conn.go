@@ -32,8 +32,8 @@ import (
 
 const (
 	IOBufferSize           = 32 * 1024
-	PackedIOBufferSize     = 64 * 1024
-	PackedDecodeBufferSize = 96 * 1024
+	PackedIOBufferSize     = 32 * 1024
+	PackedDecodeBufferSize = 32 * 1024
 )
 
 const minDecodeReadSize = 64

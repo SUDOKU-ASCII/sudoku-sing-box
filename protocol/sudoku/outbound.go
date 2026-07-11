@@ -34,6 +34,8 @@ type Outbound struct {
 	baseConf     sudokut.ProtocolConfig
 	httpMaskPool *sudokut.HTTPMaskTransportPool
 	muxClient    *sudokut.MuxClient
+	muxCancel    context.CancelFunc
+	muxDone      chan struct{}
 	reverse      *reverseClient
 }
 
@@ -62,6 +64,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	defaultConf := sudokut.DefaultConfig()
 	paddingMin, paddingMax := resolvePadding(defaultConf.PaddingMin, defaultConf.PaddingMax, options.PaddingMin, options.PaddingMax)
+	multiplex := resolveMultiplex(defaultConf.Multiplex, options.Multiplex, options.HTTPMaskMultiplex)
 
 	baseConf := sudokut.ProtocolConfig{
 		ServerAddress:      net.JoinHostPort(options.Server, strconv.Itoa(int(options.ServerPort))),
@@ -70,10 +73,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		PaddingMin:         paddingMin,
 		PaddingMax:         paddingMax,
 		EnablePureDownlink: resolveBool(defaultConf.EnablePureDownlink, options.EnablePureDownlink),
+		Multiplex:          multiplex,
 		DisableHTTPMask:    options.DisableHTTPMask,
 		HTTPMaskMode:       resolveHTTPMaskMode(defaultConf.HTTPMaskMode, options.HTTPMaskMode, options.HTTPMaskStrategy),
 		HTTPMaskTLSEnabled: options.HTTPMaskTLS,
-		HTTPMaskMultiplex:  resolveConfigString(defaultConf.HTTPMaskMultiplex, options.HTTPMaskMultiplex),
+		HTTPMaskMultiplex:  options.HTTPMaskMultiplex,
 		HTTPMaskHost:       options.HTTPMaskHost,
 		HTTPMaskPathRoot:   options.HTTPMaskPathRoot,
 	}
@@ -98,7 +102,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	out.baseConf.DialContext = out.dialContext
 	out.baseConf.HTTPMaskTransportPool = out.httpMaskPool
 
-	if allowHTTPMaskMux(&out.baseConf) {
+	if allowSessionMux(&out.baseConf) {
 		out.muxClient, err = sudokut.NewMuxClient(&out.baseConf)
 		if err != nil {
 			return nil, err
@@ -125,10 +129,18 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 }
 
 func (h *Outbound) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart || h.reverse == nil {
+	if stage != adapter.StartStateStart {
 		return nil
 	}
-	go h.serveReverse()
+	if h.muxClient != nil {
+		muxCtx, cancel := context.WithCancel(h.ctx)
+		h.muxCancel = cancel
+		h.muxDone = make(chan struct{})
+		go h.maintainMux(muxCtx)
+	}
+	if h.reverse != nil {
+		go h.serveReverse()
+	}
 	return nil
 }
 
@@ -140,7 +152,35 @@ func (h *Outbound) Close() error {
 	if h.reverse != nil {
 		h.reverse.once.Do(func() { close(h.reverse.done) })
 	}
-	return common.Close(common.PtrOrNil(h.muxClient), common.PtrOrNil(h.httpMaskPool))
+	if h.muxCancel != nil {
+		h.muxCancel()
+	}
+	err := common.Close(common.PtrOrNil(h.muxClient))
+	if h.muxDone != nil {
+		<-h.muxDone
+	}
+	return E.Errors(err, common.Close(common.PtrOrNil(h.httpMaskPool)))
+}
+
+func (h *Outbound) maintainMux(ctx context.Context) {
+	defer close(h.muxDone)
+	ready := false
+	failureReported := false
+	h.muxClient.Maintain(ctx, func(err error) {
+		if err == nil {
+			if !ready {
+				h.logger.InfoContext(h.ctx, "Sudoku mux warm session ready")
+			}
+			ready = true
+			failureReported = false
+			return
+		}
+		if !failureReported {
+			h.logger.WarnContext(h.ctx, E.Cause(err, "Sudoku mux warm session unavailable"))
+		}
+		ready = false
+		failureReported = true
+	})
 }
 
 func (h *Outbound) serveReverse() {

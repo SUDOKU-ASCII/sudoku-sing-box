@@ -36,6 +36,7 @@ type Config struct {
 	CustomTable        string         `json:"custom_table"`         // Optional: defines X/P/V layout, e.g. "xpxvvpvv"
 	CustomTables       []string       `json:"custom_tables"`        // Optional: rotate among multiple X/P/V layouts
 	EnablePureDownlink bool           `json:"enable_pure_downlink"` // Enable pure Sudoku downlink; false uses bandwidth-optimized packed encoding
+	Multiplex          string         `json:"multiplex"`            // "off", "auto", or "on"; same setting as httpmask.multiplex for compatibility
 	HTTPMask           HTTPMaskConfig `json:"httpmask"`
 
 	Reverse *ReverseConfig `json:"reverse,omitempty"`

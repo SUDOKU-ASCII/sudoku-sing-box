@@ -14,13 +14,6 @@ func resolveTableType(ascii string) string {
 	return "prefer_ascii"
 }
 
-func resolveConfigString(defaultVal, opt string) string {
-	if opt != "" {
-		return opt
-	}
-	return defaultVal
-}
-
 func resolvePadding(defaultMin, defaultMax int, minOpt, maxOpt *int) (min, max int) {
 	min, max = defaultMin, defaultMax
 	if minOpt != nil {
@@ -55,6 +48,15 @@ func resolveHTTPMaskMode(defaultMode, optMode, strategy string) string {
 	return defaultMode
 }
 
+func resolveMultiplex(defaultMode, topLevel, legacy string) string {
+	for _, mode := range []string{legacy, topLevel, defaultMode} {
+		if mode = strings.TrimSpace(mode); mode != "" {
+			return strings.ToLower(mode)
+		}
+	}
+	return "off"
+}
+
 func buildProtocolTables(key, ascii, customTable string, customTables []string, clientSeed bool) ([]*sudokuo.Table, error) {
 	if clientSeed {
 		key = sudokut.ClientAEADSeed(key)
@@ -83,14 +85,6 @@ func applyProtocolTables(cfg *sudokut.ProtocolConfig, tables []*sudokuo.Table) {
 	cfg.Tables = tables
 }
 
-func allowHTTPMaskMux(cfg *sudokut.ProtocolConfig) bool {
-	if cfg == nil || cfg.DisableHTTPMask || !strings.EqualFold(strings.TrimSpace(cfg.HTTPMaskMultiplex), "on") {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMode)) {
-	case "stream", "poll", "auto", "ws":
-		return true
-	default:
-		return false
-	}
+func allowSessionMux(cfg *sudokut.ProtocolConfig) bool {
+	return cfg != nil && cfg.SessionMuxEnabled()
 }

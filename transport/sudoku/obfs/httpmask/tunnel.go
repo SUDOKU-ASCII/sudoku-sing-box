@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 )
 
 type TunnelMode string
@@ -136,6 +138,20 @@ type earlyHandshakeConn struct {
 	uplinkPacked bool
 }
 
+func (c *earlyHandshakeConn) CloseWrite() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseWrite(c.Conn)
+}
+
+func (c *earlyHandshakeConn) CloseRead() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseRead(c.Conn)
+}
+
 func (c *earlyHandshakeConn) HTTPMaskEarlyHandshakeUserHash() string {
 	if c == nil {
 		return ""
@@ -212,29 +228,7 @@ func DialTunnel(ctx context.Context, serverAddress string, opts TunnelDialOption
 		if err != nil {
 			return nil, err
 		}
-		outConn := net.Conn(c)
-		if opts.EarlyHandshake != nil && opts.EarlyHandshake.WrapConn != nil && (opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
-			upgraded, err := opts.EarlyHandshake.WrapConn(c)
-			if err != nil {
-				_ = c.Close()
-				return nil, err
-			}
-			if upgraded != nil {
-				outConn = upgraded
-			}
-			return outConn, nil
-		}
-		if opts.Upgrade != nil {
-			upgraded, err := opts.Upgrade(c)
-			if err != nil {
-				_ = c.Close()
-				return nil, err
-			}
-			if upgraded != nil {
-				outConn = upgraded
-			}
-		}
-		return outConn, nil
+		return finishTunnelDial(c, opts, nil)
 	case TunnelModeAuto:
 		// "stream" can hang on some CDNs that buffer uploads until request body completes.
 		// Keep it on a short leash so we can fall back to poll within the caller's deadline.
@@ -258,6 +252,33 @@ var (
 	dialStreamFn = dialStream
 	dialPollFn   = dialPoll
 )
+
+func finishTunnelDial(raw net.Conn, opts TunnelDialOptions, waitReady func(context.Context) error) (net.Conn, error) {
+	outConn := raw
+	if opts.EarlyHandshake != nil && opts.EarlyHandshake.WrapConn != nil &&
+		(opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
+		upgraded, err := opts.EarlyHandshake.WrapConn(raw)
+		if err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		if upgraded != nil {
+			outConn = upgraded
+		}
+		return wrapReadyTunnelConn(outConn, waitReady), nil
+	}
+	if opts.Upgrade != nil {
+		upgraded, err := opts.Upgrade(raw)
+		if err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		if upgraded != nil {
+			outConn = upgraded
+		}
+	}
+	return wrapReadyTunnelConn(outConn, waitReady), nil
+}
 
 func applyTunnelHeaders(h http.Header, host string, mode TunnelMode) {
 	r := rngPool.Get().(*mrand.Rand)

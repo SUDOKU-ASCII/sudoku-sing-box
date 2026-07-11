@@ -1,20 +1,18 @@
 name: Publish Docker Images
 
 on:
-  #push:
-  #  branches:
-  #    - stable
-  #    - testing
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       tag:
         description: "The tag version you want to build"
 
+permissions:
+  contents: read
+  packages: write
+
 env:
-  REGISTRY_IMAGE: ghcr.io/sagernet/sing-box
+  REGISTRY_IMAGE: ghcr.io/sudoku-ascii/sudoku-sing-box
+  DOCKER_TAG: latest
 
 jobs:
   build_binary:
@@ -244,7 +242,6 @@ jobs:
           if-no-files-found: error
           retention-days: 1
   merge:
-    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     needs:
       - build_docker
@@ -264,8 +261,6 @@ jobs:
         with:
           ref: ${{ steps.ref.outputs.ref }}
           fetch-depth: 0
-      - name: Detect track
-        run: bash .github/detect_track.sh
       - name: Download digests
         uses: actions/download-artifact@v5
         with:
@@ -281,7 +276,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create manifest list and push
-        if: github.event_name != 'push'
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
@@ -289,7 +283,6 @@ jobs:
             -t "${{ env.REGISTRY_IMAGE }}:${{ steps.ref.outputs.ref }}" \
             $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
       - name: Inspect image
-        if: github.event_name != 'push'
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ env.DOCKER_TAG }}
           docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.ref.outputs.ref }}

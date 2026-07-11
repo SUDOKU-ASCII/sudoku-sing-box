@@ -262,7 +262,7 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
 	if err != nil {
 		common.Close(source, destination)
-	} else if duplexDst, isDuplex := destination.(N.WriteCloser); isDuplex {
+	} else if duplexDst, isDuplex := common.Cast[N.WriteCloser](destination); isDuplex {
 		err = duplexDst.CloseWrite()
 		if err != nil {
 			common.Close(source, destination)

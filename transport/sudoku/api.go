@@ -58,6 +58,7 @@ func toInternalConfig(cfg *ProtocolConfig) *internalconfig.Config {
 	if cfg == nil {
 		return nil
 	}
+	multiplex := cfg.MultiplexMode()
 	return &internalconfig.Config{
 		ServerAddress:      cfg.ServerAddress,
 		Key:                cfg.Key,
@@ -65,6 +66,7 @@ func toInternalConfig(cfg *ProtocolConfig) *internalconfig.Config {
 		PaddingMin:         cfg.PaddingMin,
 		PaddingMax:         cfg.PaddingMax,
 		EnablePureDownlink: cfg.EnablePureDownlink,
+		Multiplex:          multiplex,
 		SuspiciousAction:   cfg.SuspiciousAction,
 		FallbackAddr:       cfg.FallbackAddress,
 		HTTPMask: internalconfig.HTTPMaskConfig{
@@ -73,7 +75,7 @@ func toInternalConfig(cfg *ProtocolConfig) *internalconfig.Config {
 			TLS:       cfg.HTTPMaskTLSEnabled,
 			Host:      cfg.HTTPMaskHost,
 			PathRoot:  cfg.HTTPMaskPathRoot,
-			Multiplex: strings.ToLower(strings.TrimSpace(cfg.HTTPMaskMultiplex)),
+			Multiplex: multiplex,
 		},
 	}
 }

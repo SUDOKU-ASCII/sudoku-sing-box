@@ -20,10 +20,13 @@ with this application without prior consent.
 package httpmask
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
 	"net/url"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -39,6 +42,27 @@ func isDialError(err error) bool {
 		}
 	}
 	return false
+}
+
+func isRetryableHTTPTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return isRetryableHTTPTransportError(urlErr.Err)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "server closed idle connection") {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
 }
 
 func resetTimer(t *time.Timer, d time.Duration) {
