@@ -27,6 +27,8 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.VMessOutboundOptions](registry, C.TypeVMess, NewOutbound)
 }
 
+var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
 	logger          logger.ContextLogger
@@ -105,7 +107,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	return outbound, nil
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) MultiplexEnabled() bool {
+	return h.multiplexDialer != nil
+}
+
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	if h.transport != nil {
 		h.transport.Close()
 	}

@@ -73,11 +73,22 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}, nil
 }
 
-func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers http.Header) (*WebsocketConn, error) {
+func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
 	if err != nil {
 		return nil, err
 	}
+	if c.maxEarlyData > 0 {
+		return &EarlyWebsocketConn{Client: c, rawConn: conn, create: make(chan struct{})}, nil
+	}
+	websocketConn, err := c.upgrade(conn, &c.requestURL, c.headers)
+	if err != nil {
+		return nil, err
+	}
+	return websocketConn, nil
+}
+
+func (c *Client) upgrade(conn net.Conn, requestURL *url.URL, headers http.Header) (*WebsocketConn, error) {
 	var deadlineConn net.Conn
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		deadlineConn = deadline.NewConn(conn)
@@ -93,29 +104,19 @@ func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers h
 	reader, _, err := ws.Dialer{Header: ws.HandshakeHeaderHTTP(headers), Protocols: protocols}.Upgrade(deadlineConn, requestURL)
 	deadlineConn.SetDeadline(time.Time{})
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 	if reader != nil {
 		buffer := buf.NewSize(reader.Buffered())
 		_, err = buffer.ReadFullFrom(reader, buffer.Len())
 		if err != nil {
+			conn.Close()
 			return nil, err
 		}
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
 	return NewConn(conn, nil, ws.StateClientSide), nil
-}
-
-func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
-	if c.maxEarlyData <= 0 {
-		conn, err := c.dialContext(ctx, &c.requestURL, c.headers)
-		if err != nil {
-			return nil, err
-		}
-		return conn, nil
-	} else {
-		return &EarlyWebsocketConn{Client: c, ctx: ctx, create: make(chan struct{})}, nil
-	}
 }
 
 func (c *Client) Close() error {

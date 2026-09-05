@@ -11,18 +11,17 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/common/observable"
 )
 
-var _ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
-
 type HistoryStorage struct {
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
-	updateHook   *observable.Subscriber[struct{}]
+	updateHooks  []*observable.Subscriber[struct{}]
 }
 
 func NewHistoryStorage() *HistoryStorage {
@@ -31,8 +30,16 @@ func NewHistoryStorage() *HistoryStorage {
 	}
 }
 
-func (s *HistoryStorage) SetHook(hook *observable.Subscriber[struct{}]) {
-	s.updateHook = hook
+func (s *HistoryStorage) AddUpdateHook(hook *observable.Subscriber[struct{}]) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.updateHooks = append(s.updateHooks, hook)
+}
+
+func (s *HistoryStorage) NotifyUpdated() {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	s.notifyUpdated()
 }
 
 func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
@@ -59,8 +66,7 @@ func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTes
 }
 
 func (s *HistoryStorage) notifyUpdated() {
-	updateHook := s.updateHook
-	if updateHook != nil {
+	for _, updateHook := range s.updateHooks {
 		updateHook.Emit(struct{}{})
 	}
 }
@@ -68,11 +74,22 @@ func (s *HistoryStorage) notifyUpdated() {
 func (s *HistoryStorage) Close() error {
 	s.access.Lock()
 	defer s.access.Unlock()
-	s.updateHook = nil
+	s.updateHooks = nil
 	return nil
 }
 
-func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
+func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
+	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
+	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
+		_, err := urlTest(ctx, link, detour)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return urlTest(ctx, link, detour)
+}
+
+func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}

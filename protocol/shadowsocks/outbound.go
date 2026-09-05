@@ -26,6 +26,8 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.ShadowsocksOutboundOptions](registry, C.TypeShadowsocks, NewOutbound)
 }
 
+var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
 	logger          logger.ContextLogger
@@ -124,7 +126,11 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	}
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) MultiplexEnabled() bool {
+	return h.multiplexDialer != nil
+}
+
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	if h.multiplexDialer != nil {
 		h.multiplexDialer.Reset()
 	}
