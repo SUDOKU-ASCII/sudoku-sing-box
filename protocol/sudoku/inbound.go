@@ -128,7 +128,7 @@ func (h *Inbound) Close() error {
 	return common.Close(h.listener, common.PtrOrNil(h.tunnelSrv), common.PtrOrNil(h.reverse))
 }
 
-func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	sessionConn, session, targetAddr, userHash, payload, handled, err := h.tunnelSrv.HandleConnSessionAutoWithUserHash(conn)
 	if err != nil {
 		var suspErr *sudokut.SuspiciousError
