@@ -290,13 +290,7 @@ type preconnectDialer struct {
 	pool        *preparedConnPool
 }
 
-func newPreconnectDialer(
-	urlHost string,
-	dialAddr string,
-	serverName string,
-	tlsConfig *tls.Config,
-	dialContext func(context.Context, string, string) (net.Conn, error),
-) *preconnectDialer {
+func newPreconnectDialer(urlHost, dialAddr, serverName string, tlsConfig *tls.Config, dialContext func(context.Context, string, string) (net.Conn, error)) *preconnectDialer {
 	return &preconnectDialer{
 		urlHost:     urlHost,
 		dialAddr:    dialAddr,

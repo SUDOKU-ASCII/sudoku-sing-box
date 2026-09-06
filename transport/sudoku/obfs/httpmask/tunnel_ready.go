@@ -22,7 +22,6 @@ package httpmask
 import (
 	"context"
 	"net"
-	"strings"
 	"sync"
 
 	"github.com/sagernet/sing-box/transport/sudoku/connutil"
@@ -73,37 +72,6 @@ func (r *tunnelReadiness) wait(ctx context.Context, closed <-chan struct{}, clos
 	return nil
 }
 
-func configureSplitPreconnect(
-	ctx context.Context,
-	info *sessionDialInfo,
-	multiplex string,
-	closed <-chan struct{},
-) func(context.Context) error {
-	if info == nil || info.tunnelClient == nil || !strings.EqualFold(strings.TrimSpace(multiplex), "on") {
-		return nil
-	}
-	go info.tunnelClient.maintainPreconnect(ctx, info.pushURL, 1)
-	return func(ctx context.Context) error {
-		return info.tunnelClient.waitPreconnect(ctx, closed, info.pushURL, 1)
-	}
-}
-
-func waitSplitTunnelReady(
-	ctx context.Context,
-	readiness *tunnelReadiness,
-	closed <-chan struct{},
-	closedErr func() error,
-	waitSpare func(context.Context) error,
-) error {
-	if err := readiness.wait(ctx, closed, closedErr); err != nil {
-		return err
-	}
-	if waitSpare != nil {
-		return waitSpare(ctx)
-	}
-	return nil
-}
-
 type readyTunnelConn struct {
 	net.Conn
 	waitReady func(context.Context) error
@@ -142,8 +110,7 @@ func wrapReadyTunnelConn(conn net.Conn, waitReady func(context.Context) error) n
 }
 
 // WaitTunnelReady waits for a split HTTP tunnel's downlink and first upload.
-// Native mux sessions also wait for a spare upload connection. Other
-// transports are ready when DialTunnel returns and complete immediately.
+// Other transports are ready when DialTunnel returns and complete immediately.
 func WaitTunnelReady(ctx context.Context, conn net.Conn) error {
 	if ready, ok := conn.(tunnelReadyConn); ok {
 		return ready.waitHTTPMaskReady(ctx)

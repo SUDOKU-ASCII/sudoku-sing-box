@@ -83,8 +83,8 @@ type TunnelDialOptions struct {
 	// PathRoot is an optional first-level path prefix for all HTTP tunnel endpoints.
 	// Example: "aabbcc" => "/aabbcc/session", "/aabbcc/api/v1/upload", ...
 	PathRoot string
-	// AuthKey enables short-term HMAC auth for HTTP tunnel requests (anti-probing).
-	// When set (non-empty), each HTTP request carries an Authorization bearer token derived from AuthKey.
+	// AuthKey enables the optional WebSocket HMAC anti-probing layer. Stream and
+	// poll sessions authenticate with the Sudoku handshake and replay guard.
 	AuthKey string
 	// Upgrade optionally wraps the raw tunnel conn and/or writes a small prelude before DialTunnel returns.
 	// It is called with the raw tunnel conn; if it returns a non-nil conn, that conn is returned by DialTunnel.
@@ -99,10 +99,10 @@ type TunnelDialOptions struct {
 	// Multiplex controls whether DialTunnel reuses underlying HTTP connections (keep-alive / h2).
 	// Values: "off" disables global reuse; "auto"/"on" enables it. Empty defaults to "auto".
 	Multiplex string
-	// TransportPool optionally scopes HTTP transport reuse to a caller-owned pool.
-	// When nil, multiplexing falls back to the package-global transport cache.
+	// TransportPool scopes HTTP transport reuse to a caller-owned pool.
+	// When nil, multiplexing uses the package-global cache.
 	TransportPool *TransportPool
-	// DialContext optionally overrides how the HTTP tunnel dials raw TCP/TLS connections.
+	// DialContext overrides raw TCP/TLS dialing when supplied by the embedding client.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
@@ -228,7 +228,29 @@ func DialTunnel(ctx context.Context, serverAddress string, opts TunnelDialOption
 		if err != nil {
 			return nil, err
 		}
-		return finishTunnelDial(c, opts, nil)
+		outConn := net.Conn(c)
+		if opts.EarlyHandshake != nil && opts.EarlyHandshake.WrapConn != nil && (opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
+			upgraded, err := opts.EarlyHandshake.WrapConn(c)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			if upgraded != nil {
+				outConn = upgraded
+			}
+			return outConn, nil
+		}
+		if opts.Upgrade != nil {
+			upgraded, err := opts.Upgrade(c)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			if upgraded != nil {
+				outConn = upgraded
+			}
+		}
+		return outConn, nil
 	case TunnelModeAuto:
 		// "stream" can hang on some CDNs that buffer uploads until request body completes.
 		// Keep it on a short leash so we can fall back to poll within the caller's deadline.
@@ -252,33 +274,6 @@ var (
 	dialStreamFn = dialStream
 	dialPollFn   = dialPoll
 )
-
-func finishTunnelDial(raw net.Conn, opts TunnelDialOptions, waitReady func(context.Context) error) (net.Conn, error) {
-	outConn := raw
-	if opts.EarlyHandshake != nil && opts.EarlyHandshake.WrapConn != nil &&
-		(opts.EarlyHandshake.Ready == nil || opts.EarlyHandshake.Ready()) {
-		upgraded, err := opts.EarlyHandshake.WrapConn(raw)
-		if err != nil {
-			_ = raw.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-		return wrapReadyTunnelConn(outConn, waitReady), nil
-	}
-	if opts.Upgrade != nil {
-		upgraded, err := opts.Upgrade(raw)
-		if err != nil {
-			_ = raw.Close()
-			return nil, err
-		}
-		if upgraded != nil {
-			outConn = upgraded
-		}
-	}
-	return wrapReadyTunnelConn(outConn, waitReady), nil
-}
 
 func applyTunnelHeaders(h http.Header, host string, mode TunnelMode) {
 	r := rngPool.Get().(*mrand.Rand)
