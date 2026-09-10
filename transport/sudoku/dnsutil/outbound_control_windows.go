@@ -27,10 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"unsafe"
 )
-
-const envOutboundIfIndex = "SUDOKU_OUTBOUND_IFINDEX"
 
 const (
 	ipUnicastIf   = 31
@@ -54,7 +51,7 @@ func platformOutboundControl() func(network, address string, c syscall.RawConn) 
 			err4 := outboundBind4(handle, ifIndex)
 			err6 := outboundBind6(handle, ifIndex)
 			if err4 != nil && err6 != nil {
-				if strings.HasSuffix(network, "6") || strings.Contains(address, ":") {
+				if outboundIPv6(network, address) {
 					inner = err6
 				} else {
 					inner = err4
@@ -72,7 +69,7 @@ func platformOutboundControl() func(network, address string, c syscall.RawConn) 
 func outboundBind4(handle syscall.Handle, ifaceIdx int) error {
 	var bytes [4]byte
 	binary.BigEndian.PutUint32(bytes[:], uint32(ifaceIdx))
-	idx := *(*uint32)(unsafe.Pointer(&bytes[0]))
+	idx := binary.NativeEndian.Uint32(bytes[:])
 	return syscall.SetsockoptInt(handle, syscall.IPPROTO_IP, ipUnicastIf, int(idx))
 }
 

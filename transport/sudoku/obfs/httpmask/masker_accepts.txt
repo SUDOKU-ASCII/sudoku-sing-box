@@ -1,4 +1,0 @@
-text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
-application/json, text/plain, */*
-application/octet-stream
-*/*

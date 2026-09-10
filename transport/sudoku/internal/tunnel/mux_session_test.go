@@ -20,11 +20,14 @@ with this application without prior consent.
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -52,6 +55,29 @@ func TestMuxSession_KeepaliveUsesV047CompatibleFrame(t *testing.T) {
 	}
 	if payloadLen := binary.BigEndian.Uint32(header[5:9]); payloadLen != 0 {
 		t.Fatalf("keepalive payload length = %d, want 0", payloadLen)
+	}
+}
+
+func TestMuxSession_RespondsToPing(t *testing.T) {
+	clientConn, peerConn := net.Pipe()
+	session := newMuxSession(clientConn, nil)
+	t.Cleanup(func() {
+		session.closeWithError(net.ErrClosed)
+		_ = peerConn.Close()
+	})
+
+	var ping [muxHeaderSize]byte
+	ping[0] = muxFramePing
+	if _, err := peerConn.Write(ping[:]); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	_ = peerConn.SetReadDeadline(time.Now().Add(time.Second))
+	var pong [muxHeaderSize]byte
+	if _, err := io.ReadFull(peerConn, pong[:]); err != nil {
+		t.Fatalf("read pong: %v", err)
+	}
+	if pong[0] != muxFramePong || binary.BigEndian.Uint32(pong[1:]) != 0 || binary.BigEndian.Uint32(pong[5:]) != 0 {
+		t.Fatalf("unexpected pong frame: %x", pong)
 	}
 }
 
@@ -122,12 +148,12 @@ func TestMuxStream_EnqueueRejectsOverflow(t *testing.T) {
 	payload := make([]byte, muxMaxDataPayload)
 
 	for queued := 0; queued < muxMaxQueuedBytesPerStream; queued += len(payload) {
-		if err := st.enqueue(payload); err != nil {
+		if err := st.enqueue(&muxChunk{data: payload}); err != nil {
 			t.Fatalf("enqueue within limit: %v", err)
 		}
 	}
 
-	if err := st.enqueue(payload); !errors.Is(err, errMuxReceiveQueueFull) {
+	if err := st.enqueue(&muxChunk{data: payload}); !errors.Is(err, errMuxReceiveQueueFull) {
 		t.Fatalf("enqueue overflow error = %v, want %v", err, errMuxReceiveQueueFull)
 	}
 
@@ -135,7 +161,7 @@ func TestMuxStream_EnqueueRejectsOverflow(t *testing.T) {
 	if _, err := io.ReadFull(st, buf); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if err := st.enqueue(payload); err != nil {
+	if err := st.enqueue(&muxChunk{data: payload}); err != nil {
 		t.Fatalf("enqueue after consuming capacity: %v", err)
 	}
 }
@@ -145,13 +171,13 @@ func TestMuxStream_EnqueueAfterCloseDoesNotBlock(t *testing.T) {
 	payload := make([]byte, muxMaxDataPayload)
 
 	for queued := 0; queued < muxMaxQueuedBytesPerStream; queued += len(payload) {
-		if err := st.enqueue(payload); err != nil {
+		if err := st.enqueue(&muxChunk{data: payload}); err != nil {
 			t.Fatalf("enqueue within limit: %v", err)
 		}
 	}
 
 	st.closeNoSend(io.ErrClosedPipe)
-	if err := st.enqueue(payload); err != nil {
+	if err := st.enqueue(&muxChunk{data: payload}); err != nil {
 		t.Fatalf("enqueue after close: %v", err)
 	}
 }
@@ -280,5 +306,64 @@ func TestMuxStream_CloseWritePreservesResponse(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not finish half-closed exchange")
+	}
+}
+
+func TestMuxSession_ConcurrentStreamsRemainOrdered(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	serverSession := newMuxSession(serverConn, func(stream *muxStream, _ []byte) {
+		_, _ = io.Copy(stream, stream)
+		_ = stream.CloseWrite()
+	})
+	clientSession := newMuxSession(clientConn, nil)
+	t.Cleanup(func() {
+		clientSession.closeWithError(net.ErrClosed)
+		serverSession.closeWithError(net.ErrClosed)
+	})
+
+	const streamCount = 32
+	var wg sync.WaitGroup
+	errCh := make(chan error, streamCount)
+	for i := 0; i < streamCount; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			st, err := openMuxStream(clientSession, []byte(fmt.Sprintf("target-%d", i)))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer st.Close()
+			payload := bytes.Repeat([]byte{byte(i)}, 96*1024+17)
+			if _, err := st.Write(payload); err != nil {
+				errCh <- err
+				return
+			}
+			closeWriter, ok := st.(interface{ CloseWrite() error })
+			if !ok {
+				errCh <- errors.New("mux stream does not support CloseWrite")
+				return
+			}
+			if err := closeWriter.CloseWrite(); err != nil {
+				errCh <- err
+				return
+			}
+			got, err := io.ReadAll(st)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if !bytes.Equal(got, payload) {
+				errCh <- fmt.Errorf("stream %d payload mismatch: got %d bytes, want %d", i, len(got), len(payload))
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

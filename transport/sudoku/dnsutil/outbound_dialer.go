@@ -30,6 +30,10 @@ import (
 
 const (
 	envOutboundDisable = "SUDOKU_OUTBOUND_DISABLE"
+	envOutboundMark    = "SUDOKU_OUTBOUND_MARK"
+	envOutboundSrcIP   = "SUDOKU_OUTBOUND_SRC_IP"
+	envOutboundIface   = "SUDOKU_OUTBOUND_IFACE"
+	envOutboundIfIndex = "SUDOKU_OUTBOUND_IFINDEX"
 )
 
 var (
@@ -71,12 +75,7 @@ func shouldApplyOutboundControl(network string, address string) bool {
 		return false
 	}
 
-	host := address
-	if h, _, err := net.SplitHostPort(address); err == nil && strings.TrimSpace(h) != "" {
-		host = h
-	}
-	host = strings.TrimPrefix(host, "[")
-	host = strings.TrimSuffix(host, "]")
+	host := outboundHost(address)
 	if host == "" {
 		return true
 	}
@@ -92,4 +91,34 @@ func shouldApplyOutboundControl(network string, address string) bool {
 		return false
 	}
 	return true
+}
+
+func outboundHost(address string) string {
+	if host, _, err := net.SplitHostPort(address); err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(address, "["), "]")
+}
+
+func outboundIPv6(network, address string) bool {
+	if strings.HasSuffix(network, "6") {
+		return true
+	}
+	if strings.HasSuffix(network, "4") {
+		return false
+	}
+	return strings.Contains(outboundHost(address), ":")
+}
+
+// outboundSourceIPs is shared by the platforms supporting source binding.
+// Loopback and malformed values keep the historical disabled behavior.
+func outboundSourceIPs() (src4 *[4]byte, src6 *[16]byte) {
+	ip := net.ParseIP(strings.TrimSpace(os.Getenv(envOutboundSrcIP)))
+	if ip == nil || ip.IsLoopback() {
+		return nil, nil
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return (*[4]byte)(v4), nil
+	}
+	return nil, (*[16]byte)(ip.To16())
 }

@@ -23,8 +23,6 @@ import (
 	"io"
 	"net"
 	"sync"
-
-	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 )
 
 // DownlinkWriter encodes payload bytes with the selected downlink codec.
@@ -86,7 +84,6 @@ func newSudokuDataWriter(writer io.Writer, table *Table, rng *sudokuRand, pMin, 
 		table:            table,
 		rng:              rng,
 		paddingThreshold: pickPaddingThreshold(rng, pMin, pMax),
-		writeBuf:         make([]byte, 0, 4096),
 	}
 }
 
@@ -100,78 +97,8 @@ func (w *sudokuDataWriter) Write(p []byte) (int, error) {
 	if w.table == nil || w.table.layout == nil || w.rng == nil {
 		return 0, io.ErrClosedPipe
 	}
-	w.writeBuf = encodeSudokuPayload(w.writeBuf[:0], w.table, w.rng, w.paddingThreshold, p)
-	return len(p), connutil.WriteFull(w.writer, w.writeBuf)
-}
-
-func encodeSudokuPayload(dst []byte, table *Table, rng *sudokuRand, paddingThreshold uint64, p []byte) []byte {
-	if len(p) == 0 {
-		return dst[:0]
-	}
-	if paddingThreshold == 0 {
-		return encodeSudokuPayloadNoPadding(dst, table, rng, p)
-	}
-
-	outCapacity := len(p)*6 + 1
-	if cap(dst) < outCapacity {
-		dst = make([]byte, 0, outCapacity)
-	}
-	out := dst[:0]
-	pads := table.PaddingPool
-	padLen := len(pads)
-
-	if paddingThreshold >= probOne {
-		for _, b := range p {
-			out = append(out, pads[rng.Intn(padLen)])
-
-			puzzles := table.EncodeTable[b]
-			puzzle := puzzles[rng.Intn(len(puzzles))]
-
-			perm := perm4[rng.Intn(len(perm4))]
-			for _, idx := range perm {
-				out = append(out, pads[rng.Intn(padLen)], puzzle[idx])
-			}
-		}
-
-		out = append(out, pads[rng.Intn(padLen)])
-		return out
-	}
-
-	for _, b := range p {
-		if uint64(rng.Uint32()) < paddingThreshold {
-			out = append(out, pads[rng.Intn(padLen)])
-		}
-
-		puzzles := table.EncodeTable[b]
-		puzzle := puzzles[rng.Intn(len(puzzles))]
-
-		perm := perm4[rng.Intn(len(perm4))]
-		for _, idx := range perm {
-			if uint64(rng.Uint32()) < paddingThreshold {
-				out = append(out, pads[rng.Intn(padLen)])
-			}
-			out = append(out, puzzle[idx])
-		}
-	}
-
-	if uint64(rng.Uint32()) < paddingThreshold {
-		out = append(out, pads[rng.Intn(padLen)])
-	}
-	return out
-}
-
-func encodeSudokuPayloadNoPadding(dst []byte, table *Table, rng *sudokuRand, p []byte) []byte {
-	outCapacity := len(p) * 4
-	if cap(dst) < outCapacity {
-		dst = make([]byte, 0, outCapacity)
-	}
-	out := dst[:0]
-
-	for _, b := range p {
-		puzzles := table.EncodeTable[b]
-		puzzle := puzzles[rng.Intn(len(puzzles))]
-		perm := perm4[rng.Intn(len(perm4))]
-		out = append(out, puzzle[perm[0]], puzzle[perm[1]], puzzle[perm[2]], puzzle[perm[3]])
-	}
-	return out
+	var n int
+	var err error
+	w.writeBuf, n, err = writeSudokuPayload(w.writer, w.writeBuf, w.table, w.rng, w.paddingThreshold, p)
+	return n, err
 }

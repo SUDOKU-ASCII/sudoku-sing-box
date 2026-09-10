@@ -19,6 +19,8 @@ with this application without prior consent.
 */
 package connutil
 
+import "github.com/sagernet/sing/common"
+
 // CloseReader is implemented by conns that support half-close on the read side.
 type CloseReader interface {
 	CloseRead() error
@@ -38,7 +40,7 @@ func TryCloseRead(target any) error {
 	if target == nil {
 		return nil
 	}
-	if cr, ok := target.(CloseReader); ok {
+	if cr, ok := common.Cast[CloseReader](target); ok {
 		return cr.CloseRead()
 	}
 	return nil
@@ -51,7 +53,9 @@ func TryCloseWrite(target any) error {
 	if target == nil {
 		return nil
 	}
-	if cw, ok := target.(CloseWriter); ok {
+	// sing-box wrappers expose their underlying connection through Upstream.
+	// Preserve TCP half-close through tracking and accounting wrappers too.
+	if cw, ok := common.Cast[CloseWriter](target); ok {
 		return cw.CloseWrite()
 	}
 	if c, ok := target.(closer); ok {

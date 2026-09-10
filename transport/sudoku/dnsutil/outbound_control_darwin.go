@@ -25,56 +25,20 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-const envOutboundIface = "SUDOKU_OUTBOUND_IFACE"
-const envOutboundSrcIP = "SUDOKU_OUTBOUND_SRC_IP"
-
-var (
-	darwinOutboundOnce sync.Once
-	darwinOutboundIf   int
-	darwinOutboundSrc4 *[4]byte
-	darwinOutboundSrc6 *[16]byte
-)
-
-func darwinOutboundInterfaceIndex() int {
-	darwinOutboundOnce.Do(func() {
-		src := strings.TrimSpace(os.Getenv(envOutboundSrcIP))
-		if src != "" {
-			if ip := net.ParseIP(src); ip != nil && !ip.IsLoopback() {
-				if ip4 := ip.To4(); ip4 != nil {
-					var b [4]byte
-					copy(b[:], ip4)
-					darwinOutboundSrc4 = &b
-				} else if ip16 := ip.To16(); ip16 != nil {
-					var b [16]byte
-					copy(b[:], ip16)
-					darwinOutboundSrc6 = &b
-				}
-			}
-		}
-
-		name := strings.TrimSpace(os.Getenv(envOutboundIface))
-		if name == "" {
-			return
-		}
-		ifi, err := net.InterfaceByName(name)
-		if err != nil || ifi == nil || ifi.Index <= 0 {
-			return
-		}
-		darwinOutboundIf = ifi.Index
-	})
-	return darwinOutboundIf
-}
-
+// The common dialer caches this closure; no second platform-level cache is needed.
 func platformOutboundControl() func(network, address string, c syscall.RawConn) error {
-	ifIndex := darwinOutboundInterfaceIndex()
-	src4 := darwinOutboundSrc4
-	src6 := darwinOutboundSrc6
+	src4, src6 := outboundSourceIPs()
+	ifIndex := 0
+	if name := strings.TrimSpace(os.Getenv(envOutboundIface)); name != "" {
+		if iface, err := net.InterfaceByName(name); err == nil && iface.Index > 0 {
+			ifIndex = iface.Index
+		}
+	}
 	if ifIndex <= 0 && src4 == nil && src6 == nil {
 		return nil
 	}
@@ -83,20 +47,7 @@ func platformOutboundControl() func(network, address string, c syscall.RawConn) 
 		var inner error
 		if err := c.Control(func(fd uintptr) {
 			fdInt := int(fd)
-			isV6 := strings.HasSuffix(network, "6")
-			if !isV6 {
-				host := address
-				if h, _, err := net.SplitHostPort(address); err == nil && strings.TrimSpace(h) != "" {
-					host = h
-				}
-				host = strings.TrimPrefix(host, "[")
-				host = strings.TrimSuffix(host, "]")
-				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-					isV6 = true
-				} else if strings.Count(host, ":") > 1 {
-					isV6 = true
-				}
-			}
+			isV6 := outboundIPv6(network, address)
 
 			if ifIndex > 0 {
 				var errBound error

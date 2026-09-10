@@ -128,8 +128,8 @@ func TestPackedConn_SmallReadDoesNotOverDecode(t *testing.T) {
 		t.Fatalf("small read: %v", err)
 	}
 
-	if pending := reader.pendingData.available(); pending > minDecodeReadSize {
-		t.Fatalf("small read decoded too much pending data: %d", pending)
+	if reader.reader.Buffered() == 0 {
+		t.Fatal("small read consumed the entire wire buffer")
 	}
 }
 

@@ -1,3 +1,0 @@
-gzip, deflate, br
-gzip, deflate
-br, gzip, deflate

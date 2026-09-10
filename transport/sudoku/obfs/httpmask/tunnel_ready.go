@@ -21,6 +21,7 @@ package httpmask
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 
@@ -75,6 +76,20 @@ func (r *tunnelReadiness) wait(ctx context.Context, closed <-chan struct{}, clos
 type readyTunnelConn struct {
 	net.Conn
 	waitReady func(context.Context) error
+}
+
+func (c *readyTunnelConn) WriteTo(w io.Writer) (int64, error) {
+	if c == nil || c.Conn == nil {
+		return 0, net.ErrClosed
+	}
+	return connutil.Copy(w, c.Conn)
+}
+
+func (c *readyTunnelConn) WriteBuffers(buffers net.Buffers) (int64, error) {
+	if c == nil || c.Conn == nil {
+		return 0, net.ErrClosed
+	}
+	return connutil.WriteBuffers(c.Conn, buffers)
 }
 
 func (c *readyTunnelConn) CloseWrite() error {

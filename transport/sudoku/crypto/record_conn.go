@@ -87,9 +87,10 @@ type RecordConn struct {
 	recvSeq         uint64
 	recvInitialized bool
 
-	readFrame []byte
-	readPlain []byte
-	readOff   int
+	readLength [2]byte // Guarded by readMu; avoids a heap allocation per record.
+	readFrame  []byte
+	readPlain  []byte
+	readOff    int
 
 	// writeFrame is a reusable buffer for [len||header||ciphertext] on the wire.
 	// Guarded by writeMu.
@@ -316,12 +317,35 @@ func (c *RecordConn) Write(p []byte) (int, error) {
 	if c.method == "none" {
 		return c.Conn.Write(p)
 	}
+	n, err := c.writeBuffers(net.Buffers{p})
+	return int(n), err
+}
 
+// WriteBuffers writes the concatenation of buffers as one plaintext stream.
+// It coalesces small headers with their payload without an intermediate buffer.
+// Neither the slices nor their contents are modified or retained after return.
+func (c *RecordConn) WriteBuffers(buffers net.Buffers) (int64, error) {
+	if c == nil || c.Conn == nil {
+		return 0, net.ErrClosed
+	}
+	if c.method == "none" {
+		return connutil.WriteBuffers(c.Conn, buffers)
+	}
+	return c.writeBuffers(buffers)
+}
+
+func (c *RecordConn) writeBuffers(buffers net.Buffers) (int64, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	total := 0
-	for len(p) > 0 {
+	var total int64
+	offset := 0
+	for len(buffers) > 0 {
+		if offset == len(buffers[0]) {
+			buffers = buffers[1:]
+			offset = 0
+			continue
+		}
 		if c.sendAEAD == nil || c.sendAEADEpoch != c.sendEpoch {
 			a, _, err := c.newAEADFor(c.keys.baseSend, c.sendEpoch)
 			if err != nil {
@@ -336,17 +360,10 @@ func (c *RecordConn) Write(p []byte) (int, error) {
 		if maxPlain <= 0 {
 			return total, errors.New("frame size too small")
 		}
-		n := len(p)
-		if n > maxPlain {
-			n = maxPlain
+		n := min(len(buffers[0])-offset, maxPlain)
+		for i := 1; n < maxPlain && i < len(buffers); i++ {
+			n += min(len(buffers[i]), maxPlain-n)
 		}
-		chunk := p[:n]
-		p = p[n:]
-
-		var header [recordHeaderSize]byte
-		binary.BigEndian.PutUint32(header[:4], c.sendEpoch)
-		binary.BigEndian.PutUint64(header[4:], c.sendSeq)
-		c.sendSeq++
 
 		cipherLen := n + aead.Overhead()
 		bodyLen := recordHeaderSize + cipherLen
@@ -359,16 +376,39 @@ func (c *RecordConn) Write(p []byte) (int, error) {
 		}
 		frame := c.writeFrame[:frameLen]
 		binary.BigEndian.PutUint16(frame[:2], uint16(bodyLen))
-		copy(frame[2:2+recordHeaderSize], header[:])
+		header := frame[2 : 2+recordHeaderSize]
+		binary.BigEndian.PutUint32(header[:4], c.sendEpoch)
+		binary.BigEndian.PutUint64(header[4:], c.sendSeq)
+		c.sendSeq++
 
 		dst := frame[2+recordHeaderSize : 2+recordHeaderSize : frameLen]
-		_ = aead.Seal(dst[:0], header[:], chunk, header[:])
+		chunk := buffers[0][offset:]
+		if len(chunk) >= n {
+			// The common Write path seals directly from the caller's slice.
+			chunk = chunk[:n]
+			offset += n
+		} else {
+			// Gather only records that cross slice boundaries, using the final
+			// frame storage itself. Seal supports this exact in-place overlap.
+			chunk = dst[:n]
+			copied := 0
+			for copied < n {
+				used := copy(chunk[copied:], buffers[0][offset:])
+				copied += used
+				offset += used
+				if offset == len(buffers[0]) {
+					buffers = buffers[1:]
+					offset = 0
+				}
+			}
+		}
+		_ = aead.Seal(dst[:0], header, chunk, header)
 
 		if err := connutil.WriteFull(c.Conn, frame); err != nil {
 			return total, err
 		}
 
-		total += n
+		total += int64(n)
 		if err := c.maybeBumpSendEpochLocked(n); err != nil {
 			return total, err
 		}
@@ -390,15 +430,20 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
+	return c.readLocked(p)
+}
+
+// readLocked keeps a record in readFrame when p is too small (including nil).
+// Read and WriteTo share authentication, ordering and key-update handling here.
+func (c *RecordConn) readLocked(p []byte) (int, error) {
 	if c.hasPendingPlainLocked() {
 		return c.drainPlainLocked(p), nil
 	}
 
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(c.Conn, lenBuf[:]); err != nil {
+	if _, err := io.ReadFull(c.Conn, c.readLength[:]); err != nil {
 		return 0, err
 	}
-	bodyLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+	bodyLen := int(binary.BigEndian.Uint16(c.readLength[:]))
 	if bodyLen < recordHeaderSize {
 		return 0, errors.New("frame too short")
 	}
@@ -446,7 +491,15 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	}
 	aead := c.recvAEAD
 
-	plaintext, err := aead.Open(ciphertext[:0], header, ciphertext, header)
+	// Decrypt directly into a sufficiently large caller buffer. Small reads keep
+	// plaintext in readFrame until the caller has consumed the whole record.
+	plainSize := len(ciphertext) - aead.Overhead()
+	direct := plainSize >= 0 && len(p) >= plainSize
+	dst := ciphertext[:0]
+	if direct {
+		dst = p[:0]
+	}
+	plaintext, err := aead.Open(dst, header, ciphertext, header)
 	if err != nil {
 		return 0, fmt.Errorf("decryption failed: epoch=%d seq=%d: %w", epoch, seq, err)
 	}
@@ -454,6 +507,9 @@ func (c *RecordConn) Read(p []byte) (int, error) {
 	c.recvSeq = seq + 1
 	c.recvInitialized = true
 
+	if direct {
+		return len(plaintext), nil
+	}
 	c.readPlain = plaintext
 	c.readOff = 0
 	return c.drainPlainLocked(p), nil

@@ -1,3 +1,0 @@
-application/octet-stream
-application/x-protobuf
-application/json

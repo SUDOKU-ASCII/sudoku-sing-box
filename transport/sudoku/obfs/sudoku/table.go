@@ -178,23 +178,13 @@ func packHintsToKey(hints [4]byte) uint32 {
 }
 
 func packHintBytes(h0, h1, h2, h3 byte) uint32 {
-	// Sorting network for 4 elements (Bubble sort unrolled)
-	// Swap if a > b
-	if h0 > h1 {
-		h0, h1 = h1, h0
-	}
-	if h2 > h3 {
-		h2, h3 = h3, h2
-	}
-	if h0 > h2 {
-		h0, h2 = h2, h0
-	}
-	if h1 > h3 {
-		h1, h3 = h3, h1
-	}
-	if h1 > h2 {
-		h1, h2 = h2, h1
-	}
-
-	return uint32(h0)<<24 | uint32(h1)<<16 | uint32(h2)<<8 | uint32(h3)
+	// Sort using word-sized min/max so the compiler can use conditional moves.
+	// Byte-sized comparisons otherwise need unpredictable branches on hint order.
+	a, b, c, d := uint32(h0), uint32(h1), uint32(h2), uint32(h3)
+	a, b = min(a, b), max(a, b)
+	c, d = min(c, d), max(c, d)
+	a, c = min(a, c), max(a, c)
+	b, d = min(b, d), max(b, d)
+	b, c = min(b, c), max(b, c)
+	return a<<24 | b<<16 | c<<8 | d
 }

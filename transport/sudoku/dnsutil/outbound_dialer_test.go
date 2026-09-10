@@ -19,7 +19,55 @@ with this application without prior consent.
 */
 package dnsutil
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
+
+func TestOutboundSocketFamily(t *testing.T) {
+	for _, tc := range []struct {
+		network, address string
+		v6               bool
+	}{
+		{"tcp", "1.1.1.1:443", false},
+		{"tcp", "example.org:443", false},
+		{"tcp", "[2001:db8::1]:443", true},
+		{"udp", "2001:db8::1", true},
+		{"tcp6", "example.org:443", true},
+		{"tcp4", "example.org:443", false},
+		{"udp6", "[fe80::1%eth0]:53", true},
+	} {
+		if got := outboundIPv6(tc.network, tc.address); got != tc.v6 {
+			t.Errorf("outboundIPv6(%q, %q) = %v", tc.network, tc.address, got)
+		}
+	}
+}
+
+func TestOutboundSourceIPs(t *testing.T) {
+	for _, input := range []string{"", "invalid", "127.0.0.1", "::1", " 192.0.2.1 ", "2001:db8::1", "::ffff:192.0.2.2"} {
+		t.Setenv(envOutboundSrcIP, input)
+		v4, v6 := outboundSourceIPs()
+		want := net.ParseIP(input)
+		if input == " 192.0.2.1 " {
+			want = net.ParseIP("192.0.2.1")
+		}
+		if want == nil || want.IsLoopback() {
+			if v4 != nil || v6 != nil {
+				t.Errorf("invalid/loopback source %q enabled binding", input)
+			}
+			continue
+		}
+		var got net.IP
+		if v4 != nil {
+			got = net.IP(v4[:])
+		} else if v6 != nil {
+			got = net.IP(v6[:])
+		}
+		if !got.Equal(want) || (v4 != nil && v6 != nil) {
+			t.Errorf("source %q parsed as %v", input, got)
+		}
+	}
+}
 
 func TestShouldApplyOutboundControl(t *testing.T) {
 	tests := []struct {

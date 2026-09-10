@@ -22,7 +22,6 @@ with this application without prior consent.
 package dnsutil
 
 import (
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -30,9 +29,6 @@ import (
 
 	"golang.org/x/sys/unix"
 )
-
-const envOutboundMark = "SUDOKU_OUTBOUND_MARK"
-const envOutboundSrcIP = "SUDOKU_OUTBOUND_SRC_IP"
 
 func platformOutboundControl() func(network, address string, c syscall.RawConn) error {
 	raw := strings.TrimSpace(os.Getenv(envOutboundMark))
@@ -43,22 +39,7 @@ func platformOutboundControl() func(network, address string, c syscall.RawConn) 
 		}
 	}
 
-	src := strings.TrimSpace(os.Getenv(envOutboundSrcIP))
-	var src4 *[4]byte
-	var src6 *[16]byte
-	if src != "" {
-		if ip := net.ParseIP(src); ip != nil && !ip.IsLoopback() {
-			if ip4 := ip.To4(); ip4 != nil {
-				var b [4]byte
-				copy(b[:], ip4)
-				src4 = &b
-			} else if ip16 := ip.To16(); ip16 != nil {
-				var b [16]byte
-				copy(b[:], ip16)
-				src6 = &b
-			}
-		}
-	}
+	src4, src6 := outboundSourceIPs()
 
 	if mark <= 0 && src4 == nil && src6 == nil {
 		return nil
@@ -68,12 +49,13 @@ func platformOutboundControl() func(network, address string, c syscall.RawConn) 
 		var inner error
 		if err := c.Control(func(fd uintptr) {
 			fdInt := int(fd)
-			if src4 != nil && !strings.HasSuffix(network, "6") {
+			isV6 := outboundIPv6(network, address)
+			if src4 != nil && !isV6 {
 				if berr := unix.Bind(fdInt, &unix.SockaddrInet4{Addr: *src4}); berr != nil {
 					inner = berr
 					return
 				}
-			} else if src6 != nil {
+			} else if src6 != nil && isV6 {
 				if berr := unix.Bind(fdInt, &unix.SockaddrInet6{Addr: *src6}); berr != nil {
 					inner = berr
 					return

@@ -23,7 +23,6 @@ import (
 	"bufio"
 	"bytes"
 	crand "crypto/rand"
-	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -34,15 +33,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-)
-
-var (
-	userAgents      = splitLines(userAgentsData)
-	accepts         = splitLines(acceptsData)
-	acceptLanguages = splitLines(acceptLanguagesData)
-	acceptEncodings = splitLines(acceptEncodingsData)
-	paths           = splitLines(pathsData)
-	contentTypes    = splitLines(contentTypesData)
 )
 
 var (
@@ -58,44 +48,6 @@ var (
 		},
 	}
 )
-
-//go:embed masker_user_agents.txt
-var userAgentsData string
-
-//go:embed masker_accepts.txt
-var acceptsData string
-
-//go:embed masker_accept_languages.txt
-var acceptLanguagesData string
-
-//go:embed masker_accept_encodings.txt
-var acceptEncodingsData string
-
-//go:embed masker_paths.txt
-var pathsData string
-
-//go:embed masker_content_types.txt
-var contentTypesData string
-
-func splitLines(s string) []string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-	out := strings.Split(s, "\n")
-	for i := range out {
-		out[i] = strings.TrimSpace(out[i])
-	}
-	j := 0
-	for _, v := range out {
-		if v == "" {
-			continue
-		}
-		out[j] = v
-		j++
-	}
-	return out[:j]
-}
 
 func newSeed() int64 {
 	seed := time.Now().UnixNano()
@@ -157,8 +109,8 @@ func appendCommonHeaders(buf []byte, host string, r *rand.Rand) []byte {
 	return buf
 }
 
-// WriteRandomRequestHeaderWithPathRoot is like WriteRandomRequestHeader but prefixes all paths with pathRoot
-// (a single segment such as "aabbcc" => "/aabbcc/...").
+// WriteRandomRequestHeaderWithPathRoot writes the legacy HTTP camouflage prelude.
+// pathRoot prefixes the selected path ("aabbcc" becomes "/aabbcc/...").
 func WriteRandomRequestHeaderWithPathRoot(w io.Writer, host string, pathRoot string) error {
 	// Get RNG from pool
 	r := rngPool.Get().(*rand.Rand)

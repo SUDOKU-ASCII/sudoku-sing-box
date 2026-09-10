@@ -38,6 +38,8 @@ const (
 	muxFrameData  byte = 0x02
 	muxFrameClose byte = 0x03
 	muxFrameReset byte = 0x04
+	muxFramePing  byte = 0x05
+	muxFramePong  byte = 0x06
 )
 
 const (
@@ -57,7 +59,9 @@ var errMuxReceiveQueueFull = errors.New("mux receive queue full")
 type muxSession struct {
 	conn net.Conn
 
-	writeMu sync.Mutex
+	writeMu      sync.Mutex
+	writeHeader  [muxHeaderSize]byte
+	writeBuffers [2][]byte
 
 	streamsMu sync.Mutex
 	streams   map[uint32]*muxStream
@@ -69,19 +73,22 @@ type muxSession struct {
 
 	lastWrite     atomic.Int64
 	keepaliveOnce sync.Once
+	pongRequests  chan struct{}
 
 	onOpen func(stream *muxStream, payload []byte)
 }
 
 func newMuxSession(conn net.Conn, onOpen func(stream *muxStream, payload []byte)) *muxSession {
 	s := &muxSession{
-		conn:    conn,
-		streams: make(map[uint32]*muxStream),
-		closed:  make(chan struct{}),
-		onOpen:  onOpen,
+		conn:         conn,
+		streams:      make(map[uint32]*muxStream),
+		closed:       make(chan struct{}),
+		onOpen:       onOpen,
+		pongRequests: make(chan struct{}, 1),
 	}
 	s.lastWrite.Store(time.Now().UnixNano())
 	go s.readLoop()
+	go s.controlLoop()
 	return s
 }
 
@@ -168,23 +175,22 @@ func (s *muxSession) sendFrame(frameType byte, streamID uint32, payload []byte) 
 		return fmt.Errorf("mux payload too large: %d", len(payload))
 	}
 
-	var header [muxHeaderSize]byte
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	header := s.writeHeader[:]
 	header[0] = frameType
 	binary.BigEndian.PutUint32(header[1:5], streamID)
 	binary.BigEndian.PutUint32(header[5:9], uint32(len(payload)))
 
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if err := connutil.WriteFull(s.conn, header[:]); err != nil {
+	// AEAD can include the mux header in the payload record instead of
+	// encrypting and sending an extra tiny record for every frame.
+	s.writeBuffers[0], s.writeBuffers[1] = header, payload
+	_, err := connutil.WriteBuffers(s.conn, s.writeBuffers[:])
+	s.writeBuffers[0], s.writeBuffers[1] = nil, nil
+	if err != nil {
 		s.closeWithError(err)
 		return err
-	}
-	if len(payload) > 0 {
-		if err := connutil.WriteFull(s.conn, payload); err != nil {
-			s.closeWithError(err)
-			return err
-		}
 	}
 	s.lastWrite.Store(time.Now().UnixNano())
 	return nil
@@ -201,12 +207,11 @@ func (s *muxSession) startKeepalive(interval time.Duration) {
 			for {
 				select {
 				case <-ticker.C:
-					lastWrite := time.Unix(0, s.lastWrite.Load())
-					if time.Since(lastWrite) < interval {
+					// Empty DATA is understood by older peers. Accept and answer
+					// PING from newer peers without requiring it from older ones.
+					if time.Since(time.Unix(0, s.lastWrite.Load())) < interval {
 						continue
 					}
-					// Stream 0 is never allocated. Existing peers, including
-					// v0.4.7, ignore DATA for unknown streams.
 					if err := s.sendFrame(muxFrameData, 0, nil); err != nil {
 						return
 					}
@@ -216,6 +221,26 @@ func (s *muxSession) startKeepalive(interval time.Duration) {
 			}
 		}()
 	})
+}
+
+func (s *muxSession) requestPong() {
+	select {
+	case s.pongRequests <- struct{}{}:
+	case <-s.closed:
+	default:
+	}
+}
+
+func (s *muxSession) controlLoop() {
+	// A blocked PONG write must not prevent the read loop draining peer data.
+	for {
+		select {
+		case <-s.pongRequests:
+			_ = s.sendFrame(muxFramePong, 0, nil)
+		case <-s.closed:
+			return
+		}
+	}
 }
 
 func (s *muxSession) sendReset(streamID uint32, msg string) {
@@ -242,6 +267,29 @@ func (s *muxSession) readLoop() {
 			return
 		}
 		n := int(payloadLen)
+		if frameType == muxFrameData {
+			if n == 0 {
+				continue
+			}
+			chunk := acquireMuxChunk(n)
+			if _, err := io.ReadFull(s.conn, chunk.data); err != nil {
+				chunk.release()
+				s.closeWithError(err)
+				return
+			}
+			st := s.getStream(streamID)
+			if st == nil {
+				chunk.release()
+				continue
+			}
+			if err := st.enqueue(chunk); err != nil {
+				st.closeNoSend(err)
+				s.removeStream(streamID)
+				// Sending a reset must not hold up unrelated streams.
+				go s.sendReset(streamID, err.Error())
+			}
+			continue
+		}
 
 		var payload []byte
 		if n > 0 {
@@ -253,6 +301,19 @@ func (s *muxSession) readLoop() {
 		}
 
 		switch frameType {
+		case muxFramePing:
+			if streamID != 0 || len(payload) != 0 {
+				s.closeWithError(errors.New("invalid mux ping frame"))
+				return
+			}
+			s.requestPong()
+
+		case muxFramePong:
+			if streamID != 0 || len(payload) != 0 {
+				s.closeWithError(errors.New("invalid mux pong frame"))
+				return
+			}
+
 		case muxFrameOpen:
 			if s.onOpen == nil {
 				s.sendReset(streamID, "unexpected open")
@@ -270,22 +331,6 @@ func (s *muxSession) readLoop() {
 			s.registerStream(st)
 			// Avoid blocking the demux loop on dial/IO.
 			go s.onOpen(st, payload)
-
-		case muxFrameData:
-			st := s.getStream(streamID)
-			if st == nil {
-				// Unknown stream; ignore to avoid killing the whole session.
-				continue
-			}
-			if len(payload) == 0 {
-				continue
-			}
-			if err := st.enqueue(payload); err != nil {
-				st.closeNoSend(err)
-				s.removeStream(streamID)
-				// Sending a reset must not hold up unrelated streams.
-				go s.sendReset(streamID, err.Error())
-			}
 
 		case muxFrameClose:
 			st := s.getStream(streamID)
@@ -320,6 +365,7 @@ type muxStream struct {
 	id      uint32
 
 	writeMu sync.Mutex
+	readMu  sync.Mutex // Serializes Read and WriteTo without blocking enqueue/close.
 
 	mu                sync.Mutex
 	cond              *sync.Cond
@@ -328,9 +374,9 @@ type muxStream struct {
 	localWriteClosed  bool
 	remoteWriteClosed bool
 	closeErr          error
-	readBuf           []byte
-	queue             [][]byte
-	// queuedBytes includes unread bytes in readBuf and queue.
+	head              *muxChunk
+	tail              *muxChunk
+	// queuedBytes includes the chunk temporarily owned by WriteTo, if any.
 	queuedBytes int
 
 	localAddr  net.Addr
@@ -396,42 +442,41 @@ func (c *muxStream) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for len(c.readBuf) == 0 && len(c.queue) == 0 && !c.closed && !c.localReadClosed && !c.remoteWriteClosed {
+	if err := c.waitReadableLocked(); err != nil {
+		return 0, err
+	}
+
+	chunk := c.head
+	n := copy(p, chunk.data[chunk.off:])
+	chunk.off += n
+	if chunk.off == len(chunk.data) {
+		c.popChunkLocked().release()
+	}
+	c.queuedBytes -= n
+	return n, nil
+}
+
+func (c *muxStream) waitReadableLocked() error {
+	for c.head == nil && !c.closed && !c.localReadClosed && !c.remoteWriteClosed {
 		c.cond.Wait()
 	}
-	if len(c.readBuf) == 0 && len(c.queue) > 0 {
-		c.readBuf = c.queue[0]
-		c.queue[0] = nil
-		c.queue = c.queue[1:]
-		if len(c.queue) == 0 {
-			c.queue = nil
-		}
-	}
-	if len(c.readBuf) == 0 {
+	if c.head == nil {
 		switch {
 		case c.closed:
-			return 0, c.closedErrLocked()
+			return c.closedErrLocked()
 		case c.localReadClosed:
-			return 0, io.ErrClosedPipe
+			return io.ErrClosedPipe
 		case c.remoteWriteClosed:
-			return 0, io.EOF
+			return io.EOF
 		}
 	}
 
-	n := copy(p, c.readBuf)
-	c.readBuf = c.readBuf[n:]
-	if len(c.readBuf) == 0 {
-		c.readBuf = nil
-	}
-	c.queuedBytes -= n
-	if c.queuedBytes < 0 {
-		c.queuedBytes = 0
-	}
-	c.cond.Broadcast()
-	return n, nil
+	return nil
 }
 
 func (c *muxStream) Write(p []byte) (int, error) {
@@ -476,6 +521,8 @@ func (c *muxStream) Close() error {
 
 	c.mu.Lock()
 	if c.closed {
+		c.localReadClosed = true
+		c.discardQueueLocked()
 		c.mu.Unlock()
 		return nil
 	}
@@ -486,9 +533,7 @@ func (c *muxStream) Close() error {
 	if c.closeErr == nil {
 		c.closeErr = io.ErrClosedPipe
 	}
-	c.readBuf = nil
-	c.queue = nil
-	c.queuedBytes = 0
+	c.discardQueueLocked()
 	c.cond.Broadcast()
 	c.mu.Unlock()
 
@@ -526,14 +571,12 @@ func (c *muxStream) CloseWrite() error {
 
 func (c *muxStream) CloseRead() error {
 	c.mu.Lock()
-	if c.closed || c.localReadClosed {
+	if c.localReadClosed {
 		c.mu.Unlock()
 		return nil
 	}
 	c.localReadClosed = true
-	c.readBuf = nil
-	c.queue = nil
-	c.queuedBytes = 0
+	c.discardQueueLocked()
 	remove := c.localWriteClosed
 	c.cond.Broadcast()
 	c.mu.Unlock()
@@ -555,22 +598,26 @@ func (c *muxStream) SetDeadline(t time.Time) error {
 func (c *muxStream) SetReadDeadline(time.Time) error  { return nil }
 func (c *muxStream) SetWriteDeadline(time.Time) error { return nil }
 
-func (c *muxStream) enqueue(payload []byte) error {
+// enqueue takes ownership of chunk, including when the stream rejects it.
+func (c *muxStream) enqueue(chunk *muxChunk) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.closed || c.localReadClosed || c.remoteWriteClosed {
+	if c.closed || c.localReadClosed || c.remoteWriteClosed || len(chunk.data) == 0 {
+		chunk.release()
 		return nil
 	}
-	if c.queuedBytes+len(payload) > muxMaxQueuedBytesPerStream {
+	if c.queuedBytes+len(chunk.data) > muxMaxQueuedBytesPerStream {
+		chunk.release()
 		return errMuxReceiveQueueFull
 	}
-	c.queuedBytes += len(payload)
-	if len(c.readBuf) == 0 && len(c.queue) == 0 {
-		c.readBuf = payload
+	c.queuedBytes += len(chunk.data)
+	if c.tail == nil {
+		c.head = chunk
 	} else {
-		c.queue = append(c.queue, payload)
+		c.tail.next = chunk
 	}
-	c.cond.Broadcast()
+	c.tail = chunk
+	c.cond.Signal()
 	return nil
 }
