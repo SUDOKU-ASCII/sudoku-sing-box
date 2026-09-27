@@ -4,12 +4,16 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"strconv"
 	"sync"
 	"time"
 
 	internaltunnel "github.com/sagernet/sing-box/transport/sudoku/internal/tunnel"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
+
+var _ N.PacketConn = (*UoTPacketConn)(nil)
 
 func WritePreface(w net.Conn) error {
 	return internaltunnel.WriteKIPMessage(w, internaltunnel.KIPTypeStartUoT, nil)
@@ -41,22 +45,37 @@ func (c *UoTPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if len(payload) > len(p) {
 			return 0, nil, net.ErrWriteToConnected
 		}
-		host, port, err := net.SplitHostPort(addrStr)
-		if err != nil {
+		target := M.ParseSocksaddr(addrStr)
+		if !target.IsValid() || target.Port == 0 {
 			continue
 		}
-		portInt, err := strconv.ParseUint(port, 10, 16)
-		if err != nil {
-			continue
-		}
-		ip, err := netip.ParseAddr(host)
-		if err != nil {
-			continue
-		}
-		udpAddr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip.Unmap(), uint16(portInt)))
 		copy(p, payload)
-		return len(payload), udpAddr, nil
+		if target.IsIP() {
+			return len(payload), net.UDPAddrFromAddrPort(netip.AddrPortFrom(target.Addr.Unmap(), target.Port)), nil
+		}
+		return len(payload), target, nil
 	}
+}
+
+func (c *UoTPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	for {
+		addr, payload, err := internaltunnel.ReadUoTDatagram(c.conn)
+		if err != nil {
+			return M.Socksaddr{}, err
+		}
+		target := M.ParseSocksaddr(addr)
+		if !target.IsValid() || target.Port == 0 {
+			continue
+		}
+		_, err = buffer.Write(payload)
+		return target.Unwrap(), err
+	}
+}
+
+func (c *UoTPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	defer buffer.Release()
+	_, err := c.WriteTo(buffer.Bytes(), destination)
+	return err
 }
 
 func (c *UoTPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {

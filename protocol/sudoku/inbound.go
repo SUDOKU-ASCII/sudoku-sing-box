@@ -18,12 +18,12 @@ import (
 	sudokut "github.com/sagernet/sing-box/transport/sudoku"
 	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-
-	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/udpnat"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -154,9 +154,7 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	switch session {
 	case sudokut.SessionUoT:
 		h.logger.InfoContext(ctx, "inbound Sudoku UoT session from ", metadata.Source)
-		metadata.Destination = M.Socksaddr{}
-		packetConn := bufio.NewPacketConn(sudokut.NewUoTPacketConn(sessionConn))
-		h.router.RoutePacketConnectionEx(ctx, packetConn, metadata, onClose)
+		h.serveUoT(ctx, sudokut.NewUoTPacketConn(sessionConn), metadata, onClose)
 	case sudokut.SessionMux:
 		h.logger.InfoContext(ctx, "inbound Sudoku mux session from ", metadata.Source)
 		err = sudokut.HandleMuxServer(sessionConn, func(stream net.Conn, target string) {
@@ -198,6 +196,56 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		_ = sessionConn.Close()
 		h.logger.WarnContext(ctx, "unsupported Sudoku session from ", metadata.Source, ", payload=", len(payload))
 	}
+}
+
+func (h *Inbound) serveUoT(ctx context.Context, conn *sudokut.UoTPacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		cancel()
+		_ = conn.Close()
+		if onClose != nil {
+			onClose(nil)
+		}
+	}()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
+
+	handler := &uotPacketHandler{router: h.router, metadata: metadata}
+	nat := udpnat.NewEx[M.Socksaddr](int64(C.UDPTimeout.Seconds()), handler)
+	for {
+		buffer := buf.NewPacket()
+		destination, err := conn.ReadPacket(buffer)
+		if err != nil {
+			buffer.Release()
+			if !errors.Is(err, io.EOF) && !E.IsClosedOrCanceled(err) {
+				h.logger.ErrorContext(ctx, E.Cause(err, "read Sudoku UoT packet"))
+			}
+			return
+		}
+		nat.NewPacketEx(ctx, destination, buffer, metadata.Source, destination, func(N.PacketConn) N.PacketWriter {
+			return uotPacketWriter{conn}
+		})
+	}
+}
+
+type uotPacketHandler struct {
+	router   adapter.ConnectionRouterEx
+	metadata adapter.InboundContext
+}
+
+func (h *uotPacketHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	metadata := h.metadata
+	metadata.Source = source
+	metadata.Destination = destination
+	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
+}
+
+type uotPacketWriter struct {
+	conn *sudokut.UoTPacketConn
+}
+
+func (w uotPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	return w.conn.WritePacket(buffer, destination)
 }
 
 func (h *Inbound) handleSuspicious(ctx context.Context, suspErr *sudokut.SuspiciousError, cfg *sudokut.ProtocolConfig, source M.Socksaddr, onClose N.CloseHandlerFunc) {
