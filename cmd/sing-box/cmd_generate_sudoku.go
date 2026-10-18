@@ -9,7 +9,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var sudokuKeyPairMore string
+
 func init() {
+	commandGenerateSudokuKeyPair.Flags().StringVar(&sudokuKeyPairMore, "more", "", "Derive another private key for the public key of the given private key")
 	commandGenerate.AddCommand(commandGenerateSudokuKeyPair)
 }
 
@@ -26,7 +29,15 @@ var commandGenerateSudokuKeyPair = &cobra.Command{
 }
 
 func generateSudokuKeyPair() error {
-	privateKey, publicKey, err := sudoku.GenKeyPair()
+	var (
+		privateKey, publicKey string
+		err                   error
+	)
+	if sudokuKeyPairMore != "" {
+		privateKey, publicKey, err = sudoku.GenMorePrivateKey(sudokuKeyPairMore)
+	} else {
+		privateKey, publicKey, err = sudoku.GenKeyPair()
+	}
 	if err != nil {
 		return err
 	}
@@ -34,4 +45,3 @@ func generateSudokuKeyPair() error {
 	os.Stdout.WriteString("PublicKey: " + publicKey + "\n")
 	return nil
 }
-

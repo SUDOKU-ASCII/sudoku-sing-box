@@ -26,7 +26,16 @@
   },
   "reverse": {
     "listen": "127.0.0.1:8081"
-  }
+  },
+  "users": [
+    {
+      "alias": "alice",
+      "key": "<client private key or 8-16 hex chars of its user hash>",
+      "bandwidth": [100, 20],
+      "data": 50,
+      "blocked": false
+    }
+  ]
 }
 ```
 
@@ -154,3 +163,17 @@ Must match the client when `httpmask.mode` is `stream`/`poll`/`auto`.
 Server-side reverse proxy entry address.
 
 When set, reverse clients can register routes through the Sudoku tunnel and this address serves the public reverse entry. HTTP path routes and one raw TCP route are supported, matching the official Sudoku reverse behavior.
+
+#### users
+
+User whitelist. When non-empty, only clients whose handshake user hash matches an entry may open sessions; a client that completes the handshake but is not listed is dropped. Leave it empty to accept every client holding the key.
+
+The user hash is `sha256(private key)[:8]` in hex, which the client sends in the handshake. It is not derived from the server `key`, so each client needs its own entry: derive more private keys for the same public key with `sing-box generate sudoku-keypair --more <PrivateKey>` and list them here.
+
+Entries, in the same format as the official Sudoku server:
+
+* `key`: ==Required== the client private key (64 or 128 hex characters), or a prefix of its user hash (8–16 hex characters). The two are told apart by length. Prefer a hash prefix so the private key does not have to be stored on the server.
+* `alias`: Name shown in logs. Defaults to the user hash, never the key.
+* `bandwidth`: `[server to client, client to server]` payload rate limit in Mbps. `0` means unlimited.
+* `data`: Total wire traffic quota (both directions) in GB. Connections are closed when it is used up and new ones are refused until the inbound restarts. `0` means unlimited.
+* `blocked`: Refuse this user without removing the entry.
