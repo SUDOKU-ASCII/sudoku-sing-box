@@ -20,6 +20,7 @@ with this application without prior consent.
 package reverse
 
 import (
+	"iter"
 	"net/http"
 	"strings"
 
@@ -30,11 +31,6 @@ import (
 const sudokuTCPSubprotocol = "sudoku-tcp-v1"
 
 func serveSudokuTCPTunnel(w http.ResponseWriter, r *http.Request, mux *tunnel.MuxClient, target string) {
-	if w == nil || r == nil || mux == nil || strings.TrimSpace(target) == "" {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:    []string{sudokuTCPSubprotocol},
 		CompressionMode: websocket.CompressionDisabled,
@@ -59,43 +55,35 @@ func serveSudokuTCPTunnel(w http.ResponseWriter, r *http.Request, mux *tunnel.Mu
 }
 
 func websocketClientOffersSubprotocol(r *http.Request, want string) bool {
-	if r == nil {
-		return false
-	}
-	for _, v := range r.Header.Values("Sec-WebSocket-Protocol") {
-		for _, part := range strings.Split(v, ",") {
-			if strings.TrimSpace(part) == want {
-				return true
-			}
+	for token := range headerTokens(r.Header, "Sec-WebSocket-Protocol") {
+		if token == want {
+			return true
 		}
 	}
 	return false
 }
 
 func isWebSocketUpgrade(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
 	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
 		return false
 	}
-	return headerHasToken(r.Header, "Connection", "upgrade")
-}
-
-func headerHasToken(h http.Header, key, token string) bool {
-	if h == nil {
-		return false
-	}
-	token = strings.ToLower(strings.TrimSpace(token))
-	if token == "" {
-		return false
-	}
-	for _, v := range h.Values(key) {
-		for _, part := range strings.Split(v, ",") {
-			if strings.ToLower(strings.TrimSpace(part)) == token {
-				return true
-			}
+	for token := range headerTokens(r.Header, "Connection") {
+		if strings.EqualFold(token, "upgrade") {
+			return true
 		}
 	}
 	return false
+}
+
+// headerTokens yields the trimmed comma-separated tokens of every line of the key header.
+func headerTokens(h http.Header, key string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for _, line := range h.Values(key) {
+			for part := range strings.SplitSeq(line, ",") {
+				if !yield(strings.TrimSpace(part)) {
+					return
+				}
+			}
+		}
+	}
 }

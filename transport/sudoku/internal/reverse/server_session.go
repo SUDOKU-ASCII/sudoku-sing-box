@@ -41,13 +41,7 @@ type helloMessage struct {
 
 // HandleServerSession handles a reverse client registration connection.
 // helloPayload is the JSON payload from the control plane.
-func HandleServerSession(conn net.Conn, userHash string, mgr *Manager, helloPayload []byte) error {
-	if conn == nil {
-		return fmt.Errorf("nil conn")
-	}
-	if mgr == nil {
-		return fmt.Errorf("reverse manager not configured")
-	}
+func HandleServerSession(conn net.Conn, mgr *Manager, helloPayload []byte) error {
 	if packed, ok := tunnel.ConnUplinkPacked(conn); ok && !packed {
 		return fmt.Errorf("reverse sessions require packed uplink")
 	}
@@ -59,14 +53,6 @@ func HandleServerSession(conn net.Conn, userHash string, mgr *Manager, helloPayl
 	var hello helloMessage
 	if err := json.Unmarshal(helloPayload, &hello); err != nil {
 		return fmt.Errorf("invalid reverse hello: %w", err)
-	}
-
-	clientID := strings.TrimSpace(hello.ClientID)
-	if clientID == "" {
-		clientID = strings.TrimSpace(userHash)
-	}
-	if clientID == "" {
-		clientID = "unknown"
 	}
 
 	if len(hello.Routes) == 0 {
@@ -128,7 +114,7 @@ func HandleServerSession(conn net.Conn, userHash string, mgr *Manager, helloPayl
 		return fmt.Errorf("start reverse mux session failed: %w", err)
 	}
 
-	if err := mgr.RegisterSession(clientID, mux, hello.Routes); err != nil {
+	if err := mgr.RegisterSession(mux, hello.Routes); err != nil {
 		_ = mux.Close()
 		return err
 	}

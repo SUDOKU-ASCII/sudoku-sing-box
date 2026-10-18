@@ -33,6 +33,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -214,7 +215,7 @@ func TestTunnelServer_Stream_SplitSession_PushPull(t *testing.T) {
 
 	token, stream := authorize()
 	t.Cleanup(func() {
-		srv.sessionClose(token)
+		srv.sessions.close(token)
 		_ = stream.Close()
 	})
 
@@ -316,8 +317,7 @@ func TestTunnelServer_UploadSequenceIsIdempotent(t *testing.T) {
 		_ = sessionConn.Close()
 	})
 
-	sess := &tunnelSession{conn: sessionConn, lastActive: time.Now(), nextUploadSeq: 1}
-	srv.sessions["session"] = sess
+	sess := srv.sessions.add("session", sessionConn)
 
 	firstRead := make(chan []byte, 1)
 	go func() {
@@ -347,6 +347,64 @@ func TestTunnelServer_UploadSequenceIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestTunnelServer_PullLeaseHandoffIsExclusive(t *testing.T) {
+	srv := NewTunnelServer(TunnelServerOptions{Mode: "stream"})
+	peer, sessionConn := newHalfPipe()
+	t.Cleanup(func() {
+		_ = peer.Close()
+		_ = sessionConn.Close()
+	})
+
+	const token = "session"
+	sess := srv.sessions.add(token, sessionConn)
+
+	var holders, maxHolders atomic.Int32
+	var wg sync.WaitGroup
+	pull := func(holdUntilCancel bool) *sessionPullLease {
+		lease, ok := srv.sessions.beginPull(token, sess, nil)
+		if !ok {
+			t.Error("beginSessionPull refused a live session")
+			return nil
+		}
+		n := holders.Add(1)
+		for m := maxHolders.Load(); n > m && !maxHolders.CompareAndSwap(m, n); m = maxHolders.Load() {
+		}
+		if holdUntilCancel {
+			select {
+			case <-lease.cancel:
+			case <-time.After(time.Second):
+				t.Error("pull was never taken over")
+			}
+			holders.Add(-1)
+			sess.endPull(lease)
+		}
+		return lease
+	}
+
+	first := pull(false)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pull(true)
+		}()
+	}
+	// Both newcomers are now parked waiting for the first pull to finish.
+	time.Sleep(50 * time.Millisecond)
+	holders.Add(-1)
+	sess.endPull(first)
+
+	time.Sleep(50 * time.Millisecond)
+	sess.pullMu.Lock()
+	last := sess.pull
+	sess.pullMu.Unlock()
+	last.stop()
+	wg.Wait()
+	if got := maxHolders.Load(); got != 1 {
+		t.Fatalf("%d pulls held the session at once, want 1", got)
+	}
+}
+
 func TestTunnelServer_NewPullTakesOverWithoutLosingDownlink(t *testing.T) {
 	srv := NewTunnelServer(TunnelServerOptions{
 		Mode:            "stream",
@@ -360,12 +418,12 @@ func TestTunnelServer_NewPullTakesOverWithoutLosingDownlink(t *testing.T) {
 	})
 
 	const token = "session"
-	srv.sessions[token] = &tunnelSession{conn: sessionConn, lastActive: time.Now(), nextUploadSeq: 1}
+	srv.sessions.add(token, sessionConn)
 
 	firstClient, firstServer := net.Pipe()
 	firstDone := make(chan struct{})
 	go func() {
-		_, _, _ = srv.streamPull(firstServer, token)
+		_, _, _ = srv.pull(firstServer, token, streamCodec)
 		close(firstDone)
 	}()
 	firstReader := bufio.NewReader(firstClient)
@@ -378,7 +436,7 @@ func TestTunnelServer_NewPullTakesOverWithoutLosingDownlink(t *testing.T) {
 	secondClient, secondServer := net.Pipe()
 	secondDone := make(chan struct{})
 	go func() {
-		_, _, _ = srv.streamPull(secondServer, token)
+		_, _, _ = srv.pull(secondServer, token, streamCodec)
 		close(secondDone)
 	}()
 	secondReader := bufio.NewReader(secondClient)
@@ -433,7 +491,7 @@ func TestTunnelServer_SessionTTL_ReapsAfterIdle(t *testing.T) {
 	)
 	done := make(chan struct{})
 	go func() {
-		res, c, err = srv.sessionAuthorize(server, nil, nil, nil)
+		res, c, err = srv.sessionAuthorize(&tunnelRequest{conn: server}, nil)
 		close(done)
 	}()
 
@@ -463,52 +521,53 @@ func TestTunnelServer_SessionTTL_ReapsAfterIdle(t *testing.T) {
 
 	// Ensure the session is considered active right before the first TTL check, then becomes idle.
 	time.Sleep(ttl / 2)
-	if _, ok := srv.sessionGet(token); !ok {
+	if _, ok := srv.sessions.get(token); !ok {
 		t.Fatalf("session missing before reaping: %q", token)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if !srv.sessionHas(token) {
+		if !srv.sessions.has(token) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	srv.sessionClose(token)
+	srv.sessions.close(token)
 	t.Fatalf("session not reaped: %q", token)
 }
 
-func TestPollConn_CloseWrite_NoPanic(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	const n = 1000
-	c := &pollConn{
-		ctx:    ctx,
-		cancel: cancel,
-		queuedConn: queuedConn{
-			rxc:         make(chan []byte, 1),
-			closed:      make(chan struct{}),
-			writeCh:     make(chan []byte, n),
-			writeClosed: make(chan struct{}),
-			localAddr:   &net.TCPAddr{},
-			remoteAddr:  &net.TCPAddr{},
-		},
-	}
+func TestChanConn_ConcurrentWriteCloseWrite_NoPanic(t *testing.T) {
+	const writers = 1000
+	c := newChanConn()
+	go func() {
+		for {
+			select {
+			case <-c.writeCh:
+			case <-c.closed:
+				return
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
-	wg.Add(n)
-	for i := 0; i < n; i++ {
+	wg.Add(writers)
+	for i := 0; i < writers; i++ {
 		go func() {
 			defer wg.Done()
 			_, _ = c.Write([]byte("x"))
 		}()
 	}
 
-	_ = c.CloseWrite()
-	_ = c.Close()
+	closeWriteDone := make(chan struct{})
+	go func() {
+		defer close(closeWriteDone)
+		_ = c.CloseWrite()
+	}()
 	wg.Wait()
+	c.completeWrite(nil)
+	<-closeWriteDone
+	_ = c.closeWithError(nil)
 }
 
 func startRawTunnelServer(t testing.TB, srv *TunnelServer) (addr string, stop func(), tunnelCh <-chan net.Conn) {
@@ -558,131 +617,77 @@ func startRawTunnelServer(t testing.TB, srv *TunnelServer) (addr string, stop fu
 	return ln.Addr().String(), stop, tch
 }
 
-func TestDialStreamSplit_CloseWrite_SendsFIN(t *testing.T) {
-	srv := NewTunnelServer(TunnelServerOptions{
-		Mode:            "auto",
-		PullReadTimeout: 50 * time.Millisecond,
-		SessionTTL:      2 * time.Second,
-	})
-
-	addr, stop, tunnelCh := startRawTunnelServer(t, srv)
-	defer stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	conn, err := dialStreamSplit(ctx, addr, TunnelDialOptions{})
-	if err != nil {
-		t.Fatalf("dialStreamSplit: %v", err)
+func TestDial_CloseWrite_SendsFIN(t *testing.T) {
+	dials := map[string]func(context.Context, string, TunnelDialOptions) (net.Conn, error){
+		"stream": dialStream,
+		"poll":   dialPoll,
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	for name, dial := range dials {
+		t.Run(name, func(t *testing.T) {
+			srv := NewTunnelServer(TunnelServerOptions{
+				Mode:            "auto",
+				PullReadTimeout: 50 * time.Millisecond,
+				SessionTTL:      2 * time.Second,
+			})
 
-	var tunnel net.Conn
-	select {
-	case tunnel = <-tunnelCh:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for server tunnel conn")
-	}
-	t.Cleanup(func() { _ = tunnel.Close() })
+			addr, stop, tunnelCh := startRawTunnelServer(t, srv)
+			defer stop()
 
-	payload := []byte("hello")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-	readDone := make(chan struct{})
-	var (
-		got  []byte
-		rerr error
-	)
-	go func() {
-		_ = tunnel.SetReadDeadline(time.Now().Add(3 * time.Second))
-		got, rerr = io.ReadAll(tunnel)
-		close(readDone)
-	}()
+			conn, err := dial(ctx, addr, TunnelDialOptions{})
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
 
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatalf("client write: %v", err)
-	}
-	cw, ok := conn.(interface{ CloseWrite() error })
-	if !ok {
-		t.Fatalf("client conn missing CloseWrite")
-	}
-	_ = cw.CloseWrite()
+			var tunnel net.Conn
+			select {
+			case tunnel = <-tunnelCh:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timeout waiting for server tunnel conn")
+			}
+			t.Cleanup(func() { _ = tunnel.Close() })
 
-	select {
-	case <-readDone:
-	case <-time.After(4 * time.Second):
-		t.Fatalf("server read timeout (FIN not delivered)")
-	}
-	if rerr != nil {
-		t.Fatalf("server read error: %v", rerr)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("server payload mismatch: got=%q want=%q", string(got), string(payload))
-	}
-}
+			payload := []byte("hello")
 
-func TestDialPoll_CloseWrite_SendsFIN(t *testing.T) {
-	srv := NewTunnelServer(TunnelServerOptions{
-		Mode:            "auto",
-		PullReadTimeout: 50 * time.Millisecond,
-		SessionTTL:      2 * time.Second,
-	})
+			readDone := make(chan struct{})
+			var (
+				got  []byte
+				rerr error
+			)
+			go func() {
+				_ = tunnel.SetReadDeadline(time.Now().Add(3 * time.Second))
+				got, rerr = io.ReadAll(tunnel)
+				close(readDone)
+			}()
 
-	addr, stop, tunnelCh := startRawTunnelServer(t, srv)
-	defer stop()
+			if _, err := conn.Write(payload); err != nil {
+				t.Fatalf("client write: %v", err)
+			}
+			cw, ok := conn.(interface{ CloseWrite() error })
+			if !ok {
+				t.Fatalf("client conn missing CloseWrite")
+			}
+			_ = cw.CloseWrite()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	conn, err := dialPoll(ctx, addr, TunnelDialOptions{})
-	if err != nil {
-		t.Fatalf("dialPoll: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-
-	var tunnel net.Conn
-	select {
-	case tunnel = <-tunnelCh:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for server tunnel conn")
-	}
-	t.Cleanup(func() { _ = tunnel.Close() })
-
-	payload := []byte("hello")
-
-	readDone := make(chan struct{})
-	var (
-		got  []byte
-		rerr error
-	)
-	go func() {
-		_ = tunnel.SetReadDeadline(time.Now().Add(3 * time.Second))
-		got, rerr = io.ReadAll(tunnel)
-		close(readDone)
-	}()
-
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatalf("client write: %v", err)
-	}
-	cw, ok := conn.(interface{ CloseWrite() error })
-	if !ok {
-		t.Fatalf("client conn missing CloseWrite")
-	}
-	_ = cw.CloseWrite()
-
-	select {
-	case <-readDone:
-	case <-time.After(4 * time.Second):
-		t.Fatalf("server read timeout (FIN not delivered)")
-	}
-	if rerr != nil {
-		t.Fatalf("server read error: %v", rerr)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("server payload mismatch: got=%q want=%q", string(got), string(payload))
+			select {
+			case <-readDone:
+			case <-time.After(4 * time.Second):
+				t.Fatalf("server read timeout (FIN not delivered)")
+			}
+			if rerr != nil {
+				t.Fatalf("server read error: %v", rerr)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("server payload mismatch: got=%q want=%q", string(got), string(payload))
+			}
+		})
 	}
 }
 
-func TestDialStreamSplit_HonorsContextCancel(t *testing.T) {
+func TestDialStream_HonorsContextCancel(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -703,13 +708,13 @@ func TestDialStreamSplit_HonorsContextCancel(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err = dialStreamSplit(ctx, ln.Addr().String(), TunnelDialOptions{TLSEnabled: false})
+	_, err = dialStream(ctx, ln.Addr().String(), TunnelDialOptions{TLSEnabled: false})
 	close(holdConn)
 
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context deadline exceeded, got %v", err)
 	}
 	if took := time.Since(start); took > 2*time.Second {
-		t.Fatalf("dialStreamSplit took too long: %s", took)
+		t.Fatalf("dialStream took too long: %s", took)
 	}
 }

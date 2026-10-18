@@ -1,38 +1,59 @@
 package sudoku
 
-// decode stops at the caller's capacity, leaving unconsumed wire bytes buffered.
+// decode writes only as much plaintext as fits; consumed wire bytes can then be discarded.
 func (pc *PackedConn) decode(p, chunk []byte) (outN, consumed int, err error) {
-	plainLen, wireLen := len(p), len(chunk)
-	rBuf, rBits := pc.readBitBuf, pc.readBits
+	// Cache frequently accessed variables
+	rBuf := pc.readBitBuf
+	rBits := pc.readBits
 	padMarker := pc.padMarker
-	groups := &pc.table.layout.decodeGroup
-	for len(chunk) > 0 && len(p) > 0 {
-		if rBits == 0 && len(p) >= 3 && len(chunk) >= 4 {
-			g0, g1, g2, g3 := groups[chunk[0]], groups[chunk[1]], groups[chunk[2]], groups[chunk[3]]
-			if (g0 | g1 | g2 | g3) < 64 {
-				p[0], p[1], p[2] = g0<<2|g1>>4, g1<<4|g2>>2, g2<<6|g3
-				p, chunk = p[3:], chunk[4:]
+	layout := pc.table.layout
+
+	for consumed < len(chunk) && outN < len(p) {
+		i := consumed
+		if rBits == 0 && outN+3 <= len(p) && i+3 < len(chunk) {
+			g1 := layout.decodeGroup[chunk[i]]
+			g2 := layout.decodeGroup[chunk[i+1]]
+			g3 := layout.decodeGroup[chunk[i+2]]
+			g4 := layout.decodeGroup[chunk[i+3]]
+			// The invalid sentinel combines validation and decoding in one lookup.
+			if (g1 | g2 | g3 | g4) < 64 {
+				p[outN] = (g1 << 2) | (g2 >> 4)
+				p[outN+1] = (g2 << 4) | (g3 >> 2)
+				p[outN+2] = (g3 << 6) | g4
+				outN += 3
+				consumed += 4
 				continue
 			}
 		}
-		b := chunk[0]
-		chunk = chunk[1:]
-		group := groups[b]
+
+		b := chunk[i]
+		consumed++
+		group := layout.decodeGroup[b]
 		if group >= 64 {
 			if b == padMarker {
-				rBuf, rBits = 0, 0
+				rBuf = 0
+				rBits = 0
 			}
 			continue
 		}
-		rBuf = rBuf<<6 | uint64(group)
+
+		rBuf = (rBuf << 6) | uint64(group)
 		rBits += 6
+
 		if rBits >= 8 {
 			rBits -= 8
-			p[0] = byte(rBuf >> rBits)
-			p = p[1:]
-			rBuf &= (uint64(1) << rBits) - 1
+			val := byte(rBuf >> rBits)
+			p[outN] = val
+			outN++
+			if rBits == 0 {
+				rBuf = 0
+			} else {
+				rBuf &= (uint64(1) << rBits) - 1
+			}
 		}
 	}
-	pc.readBitBuf, pc.readBits = rBuf, rBits
-	return plainLen - len(p), wireLen - len(chunk), nil
+
+	pc.readBitBuf = rBuf
+	pc.readBits = rBits
+	return outN, consumed, nil
 }

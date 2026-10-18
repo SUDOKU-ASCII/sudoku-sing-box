@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/transport/sudoku/connutil"
+	"github.com/sagernet/sing-box/transport/sudoku/internal/protocol"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
@@ -78,6 +79,28 @@ type KIPMessage struct {
 	Payload []byte
 }
 
+// kipHeaderSize is magic | type | u16 payload length.
+const kipHeaderSize = len(kipMagic) + 1 + 2
+
+func appendKIPHeader(dst []byte, typ byte, payloadLen int) []byte {
+	dst = append(dst, kipMagic...)
+	dst = append(dst, typ)
+	return binary.BigEndian.AppendUint16(dst, uint16(payloadLen))
+}
+
+// writeKIPOpenTCP sends an OpenTCP request for addr (host:port) as one write.
+func writeKIPOpenTCP(w io.Writer, addr string) error {
+	buf := appendKIPHeader(make([]byte, 0, kipHeaderSize+protocol.MaxEncodedAddrLen), KIPTypeOpenTCP, 0)
+	buf, err := protocol.AppendAddress(buf, addr)
+	if err != nil {
+		return fmt.Errorf("encode address failed: %w", err)
+	}
+	binary.BigEndian.PutUint16(buf[kipHeaderSize-2:], uint16(len(buf)-kipHeaderSize))
+	return connutil.WriteFull(w, buf)
+}
+
+// WriteKIPMessage sends header and payload with a single write, so the transport frames
+// them as one record.
 func WriteKIPMessage(w io.Writer, typ byte, payload []byte) error {
 	if w == nil {
 		return fmt.Errorf("%w: nil writer", errKIP)
@@ -85,26 +108,15 @@ func WriteKIPMessage(w io.Writer, typ byte, payload []byte) error {
 	if len(payload) > kipMaxPayload {
 		return fmt.Errorf("%w: payload too large: %d", errKIP, len(payload))
 	}
-
-	var hdr [3 + 1 + 2]byte
-	copy(hdr[:3], []byte(kipMagic))
-	hdr[3] = typ
-	binary.BigEndian.PutUint16(hdr[4:], uint16(len(payload)))
-
-	if err := connutil.WriteFull(w, hdr[:]); err != nil {
-		return err
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	return connutil.WriteFull(w, payload)
+	buf := appendKIPHeader(make([]byte, 0, kipHeaderSize+len(payload)), typ, len(payload))
+	return connutil.WriteFull(w, append(buf, payload...))
 }
 
 func ReadKIPMessage(r io.Reader) (*KIPMessage, error) {
 	if r == nil {
 		return nil, fmt.Errorf("%w: nil reader", errKIP)
 	}
-	var hdr [3 + 1 + 2]byte
+	var hdr [kipHeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}

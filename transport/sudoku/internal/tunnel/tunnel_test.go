@@ -73,7 +73,7 @@ func TestSudokuTunnel_Standard(t *testing.T) {
 			go func(c net.Conn) {
 				defer c.Close()
 				// Handshake
-				sConn, meta, err := HandshakeAndUpgradeWithTablesMeta(c, cfg, []*sudoku.Table{table})
+				sConn, meta, err := ServerHandshake(c, cfg, []*sudoku.Table{table})
 				if err != nil {
 					t.Errorf("Server handshake failed: %v", err)
 					return

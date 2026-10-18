@@ -68,7 +68,7 @@ func (c *DirectionalConn) CloseRead() error {
 }
 
 func (c *DirectionalConn) CloseWrite() error {
-	firstErr := connutil.RunClosers(c.closers...)
+	firstErr := runClosers(c.closers)
 	if err := connutil.TryCloseWrite(c.writer); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -79,9 +79,23 @@ func (c *DirectionalConn) CloseWrite() error {
 }
 
 func (c *DirectionalConn) Close() error {
-	firstErr := connutil.RunClosers(c.closers...)
+	firstErr := runClosers(c.closers)
 	if err := c.Conn.Close(); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	return firstErr
+}
+
+// runClosers runs every closer in order and returns the first error.
+func runClosers(closers []func() error) error {
+	var firstErr error
+	for _, fn := range closers {
+		if fn == nil {
+			continue
+		}
+		if err := fn(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	return firstErr
 }

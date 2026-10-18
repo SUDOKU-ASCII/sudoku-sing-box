@@ -28,16 +28,16 @@ import (
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
-type HandshakeObfsProbeFunc func(probe []byte, table *sudoku.Table, uplinkMode ObfsUplinkMode) error
+type HandshakeObfsProbeFunc func(probe []byte, table *sudoku.Table, uplinkMode obfsUplinkMode) error
 
 type HandshakeObfsSelection struct {
 	Table      *sudoku.Table
-	UplinkMode ObfsUplinkMode
+	UplinkMode obfsUplinkMode
 }
 
 type handshakeObfsCandidate struct {
 	table      *sudoku.Table
-	uplinkMode ObfsUplinkMode
+	uplinkMode obfsUplinkMode
 }
 
 func drainBuffered(r *bufio.Reader) ([]byte, error) {
@@ -68,8 +68,8 @@ func SelectHandshakeObfsByProbe(r *bufio.Reader, tables []*sudoku.Table, probe H
 			continue
 		}
 		expanded = append(expanded,
-			handshakeObfsCandidate{table: table, uplinkMode: ObfsUplinkPure},
-			handshakeObfsCandidate{table: table, uplinkMode: ObfsUplinkPacked},
+			handshakeObfsCandidate{table: table, uplinkMode: obfsUplinkPure},
+			handshakeObfsCandidate{table: table, uplinkMode: obfsUplinkPacked},
 		)
 	}
 	if len(expanded) == 0 {
@@ -107,7 +107,9 @@ func selectProbeCandidates[T any](r *bufio.Reader, candidates []T, probe func([]
 		return zero, nil, fmt.Errorf("drain buffered bytes failed: %w", err)
 	}
 
-	tmp := make([]byte, readChunk)
+	// Most handshakes are decided by the bytes bufio has already buffered, so the read
+	// chunk is only allocated once another read is actually needed.
+	var chunk []byte
 	for {
 		if len(candidates) == 1 {
 			tail, err := drainBuffered(r)
@@ -144,9 +146,12 @@ func selectProbeCandidates[T any](r *bufio.Reader, candidates []T, probe func([]
 			return zero, probeBytes, fmt.Errorf("handshake probe exceeded %d bytes", maxProbeBytes)
 		}
 
-		n, err := r.Read(tmp)
+		if chunk == nil {
+			chunk = make([]byte, readChunk)
+		}
+		n, err := r.Read(chunk)
 		if n > 0 {
-			probeBytes = append(probeBytes, tmp[:n]...)
+			probeBytes = append(probeBytes, chunk[:n]...)
 		}
 		if err != nil {
 			return zero, probeBytes, fmt.Errorf("handshake probe read failed: %w", err)

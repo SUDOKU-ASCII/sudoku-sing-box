@@ -28,14 +28,14 @@ import (
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
-type ObfsUplinkMode byte
+type obfsUplinkMode byte
 
 const (
-	ObfsUplinkPure ObfsUplinkMode = iota
-	ObfsUplinkPacked
+	obfsUplinkPure obfsUplinkMode = iota
+	obfsUplinkPacked
 )
 
-type RecordingObfsConn interface {
+type recordingConn interface {
 	net.Conn
 	StopRecording()
 	GetBufferedAndRecorded() []byte
@@ -85,15 +85,11 @@ func (c *connWithObfsMeta) CloseRead() error {
 	return connutil.TryCloseRead(c.Conn)
 }
 
-func WrapConnWithObfsMeta(conn net.Conn, uplinkMode ObfsUplinkMode) net.Conn {
+func wrapConnWithObfsMeta(conn net.Conn, uplinkMode obfsUplinkMode) net.Conn {
 	if conn == nil {
 		return nil
 	}
-	return &connWithObfsMeta{Conn: conn, uplinkPacked: uplinkMode == ObfsUplinkPacked}
-}
-
-func wrapConnWithObfsMeta(conn net.Conn, uplinkMode ObfsUplinkMode) net.Conn {
-	return WrapConnWithObfsMeta(conn, uplinkMode)
+	return &connWithObfsMeta{Conn: conn, uplinkPacked: uplinkMode == obfsUplinkPacked}
 }
 
 type downlinkWriterSwitcher interface {
@@ -111,7 +107,7 @@ func ConnUplinkPacked(conn net.Conn) (bool, bool) {
 	return v.SudokuUplinkPacked(), true
 }
 
-func SwitchConnDownlinkWriter(conn net.Conn, writer io.Writer, closers ...func() error) bool {
+func switchConnDownlinkWriter(conn net.Conn, writer io.Writer, closers ...func() error) bool {
 	switch v := conn.(type) {
 	case downlinkWriterSwitcher:
 		v.ReplaceWriter(writer, closers...)
@@ -125,7 +121,7 @@ func SwitchConnDownlinkWriter(conn net.Conn, writer io.Writer, closers ...func()
 	return false
 }
 
-func buildClientObfsConnForMode(raw net.Conn, table *sudoku.Table, paddingMin, paddingMax int, pureDownlink bool, uplinkMode ObfsUplinkMode) net.Conn {
+func buildClientObfsConnForMode(raw net.Conn, table *sudoku.Table, paddingMin, paddingMax int, pureDownlink bool, uplinkMode obfsUplinkMode) net.Conn {
 	uplinkTable := table
 	downlinkTable := table.OppositeDirection()
 
@@ -139,7 +135,7 @@ func buildClientObfsConnForMode(raw net.Conn, table *sudoku.Table, paddingMin, p
 	var writer io.Writer
 	var closers []func() error
 	switch uplinkMode {
-	case ObfsUplinkPacked:
+	case obfsUplinkPacked:
 		packed := sudoku.NewPackedConn(raw, uplinkTable, paddingMin, paddingMax)
 		writer = packed
 		closers = append(closers, packed.Flush)
@@ -150,10 +146,10 @@ func buildClientObfsConnForMode(raw net.Conn, table *sudoku.Table, paddingMin, p
 	return wrapConnWithObfsMeta(sudoku.NewDirectionalConn(raw, reader, writer, closers...), uplinkMode)
 }
 
-func buildServerObfsConnForMode(raw net.Conn, table *sudoku.Table, paddingMin, paddingMax int, pureDownlink bool, uplinkMode ObfsUplinkMode, record bool) (RecordingObfsConn, net.Conn) {
-	var uplink RecordingObfsConn
+func buildServerObfsConnForMode(raw net.Conn, table *sudoku.Table, paddingMin, paddingMax int, pureDownlink bool, uplinkMode obfsUplinkMode, record bool) (recordingConn, net.Conn) {
+	var uplink recordingConn
 	switch uplinkMode {
-	case ObfsUplinkPacked:
+	case obfsUplinkPacked:
 		uplink = sudoku.NewPackedConnWithRecord(raw, table, paddingMin, paddingMax, record)
 	default:
 		uplink = sudoku.NewConn(raw, table, paddingMin, paddingMax, record)
@@ -164,15 +160,15 @@ func buildServerObfsConnForMode(raw net.Conn, table *sudoku.Table, paddingMin, p
 
 // buildObfsConnForClient builds the obfuscation layer for client side, keeping Sudoku on uplink.
 func buildObfsConnForClient(raw net.Conn, table *sudoku.Table, cfg *config.Config) net.Conn {
-	return buildClientObfsConnForMode(raw, table, cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink, ObfsUplinkPure)
+	return buildClientObfsConnForMode(raw, table, cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink, obfsUplinkPure)
 }
 
 func buildReverseObfsConnForClient(raw net.Conn, table *sudoku.Table, cfg *config.Config) net.Conn {
-	return buildClientObfsConnForMode(raw, table, cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink, ObfsUplinkPacked)
+	return buildClientObfsConnForMode(raw, table, cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink, obfsUplinkPacked)
 }
 
 // buildObfsConnForServer builds the obfuscation layer for server side, keeping Sudoku on uplink.
 // It returns the reader Sudoku connection (for fallback recording) and the composed net.Conn.
-func buildObfsConnForServer(raw net.Conn, table *sudoku.Table, cfg *config.Config, uplinkMode ObfsUplinkMode, record bool) (RecordingObfsConn, net.Conn) {
+func buildObfsConnForServer(raw net.Conn, table *sudoku.Table, cfg *config.Config, uplinkMode obfsUplinkMode, record bool) (recordingConn, net.Conn) {
 	return buildServerObfsConnForMode(raw, table, cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink, uplinkMode, record)
 }

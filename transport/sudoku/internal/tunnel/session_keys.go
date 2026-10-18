@@ -33,10 +33,6 @@ func derivePSKDirectionalBases(psk string) (c2s, s2c []byte) {
 	return c2sKey, s2cKey
 }
 
-func DerivePSKDirectionalBases(psk string) (c2s, s2c []byte) {
-	return derivePSKDirectionalBases(psk)
-}
-
 func deriveSessionDirectionalBases(psk string, shared []byte, nonce [kipHelloNonceSize]byte) (c2s, s2c []byte, err error) {
 	sum := sha256.Sum256([]byte(psk))
 	ikm := make([]byte, 0, len(shared)+len(nonce))
@@ -59,10 +55,6 @@ func deriveSessionDirectionalBases(psk string, shared []byte, nonce [kipHelloNon
 	return c2sKey, s2cKey, nil
 }
 
-func DeriveSessionDirectionalBases(psk string, shared []byte, nonce [16]byte) (c2s, s2c []byte, err error) {
-	return deriveSessionDirectionalBases(psk, shared, nonce)
-}
-
 func x25519SharedSecret(priv *ecdh.PrivateKey, peerPub []byte) ([]byte, error) {
 	if priv == nil {
 		return nil, fmt.Errorf("nil priv")
@@ -77,8 +69,4 @@ func x25519SharedSecret(priv *ecdh.PrivateKey, peerPub []byte) ([]byte, error) {
 		return nil, fmt.Errorf("ecdh: %w", err)
 	}
 	return secret, nil
-}
-
-func X25519SharedSecret(priv *ecdh.PrivateKey, peerPub []byte) ([]byte, error) {
-	return x25519SharedSecret(priv, peerPub)
 }

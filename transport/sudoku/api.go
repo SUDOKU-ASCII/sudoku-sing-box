@@ -274,11 +274,11 @@ func (m *ReverseManager) Close() error {
 	return err
 }
 
-func (m *ReverseManager) HandleServerSession(conn net.Conn, userHash string, helloPayload []byte) error {
+func (m *ReverseManager) HandleServerSession(conn net.Conn, helloPayload []byte) error {
 	if m == nil || m.mgr == nil {
 		return fmt.Errorf("reverse manager is not configured")
 	}
-	return internalreverse.HandleServerSession(conn, userHash, m.mgr, helloPayload)
+	return internalreverse.HandleServerSession(conn, m.mgr, helloPayload)
 }
 
 type reverseConnChanListener struct {

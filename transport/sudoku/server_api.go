@@ -8,21 +8,91 @@ import (
 	"strings"
 
 	"github.com/sagernet/sing-box/transport/sudoku/connutil"
+	internalconfig "github.com/sagernet/sing-box/transport/sudoku/internal/config"
 	internalprotocol "github.com/sagernet/sing-box/transport/sudoku/internal/protocol"
 	internaltunnel "github.com/sagernet/sing-box/transport/sudoku/internal/tunnel"
+	internalusers "github.com/sagernet/sing-box/transport/sudoku/internal/users"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/httpmask"
 )
 
 type HTTPMaskTunnelServer struct {
-	cfg *ProtocolConfig
-	ts  *httpmask.TunnelServer
+	cfg   *ProtocolConfig
+	ts    *httpmask.TunnelServer
+	users *internalusers.Registry
 }
 
 func (s *HTTPMaskTunnelServer) Close() error { return nil }
 
-func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) *HTTPMaskTunnelServer {
+// UserRejectedError reports a handshaked client that the users whitelist turned away.
+type UserRejectedError struct {
+	// User is the alias of a whitelisted user, or the handshake hash for an unknown one;
+	// a private key never ends up here.
+	User   string
+	Reason string
+}
+
+func (e *UserRejectedError) Error() string {
+	return fmt.Sprintf("[User:%s] rejected: %s", e.User, e.Reason)
+}
+
+// newUserRegistry validates and normalizes the whitelist; nil means no whitelist.
+func newUserRegistry(users []UserConfig) (*internalusers.Registry, error) {
+	if len(users) == 0 {
+		return nil, nil
+	}
+	cfg := &internalconfig.Config{Users: append([]UserConfig(nil), users...)}
+	if err := cfg.Finalize(); err != nil {
+		return nil, err
+	}
+	return internalusers.NewRegistry(cfg.Users)
+}
+
+// userWireWrap counts the wire bytes of whitelisted users inside the early HTTPMask handshake,
+// where the raw stream is not visible to the caller.
+func userWireWrap(reg *internalusers.Registry) func(string, net.Conn) net.Conn {
+	if reg == nil {
+		return nil
+	}
+	return func(userHash string, raw net.Conn) net.Conn {
+		if u := reg.Lookup(userHash); u != nil && !u.Blocked {
+			return u.WrapWire(raw)
+		}
+		return raw
+	}
+}
+
+func userRejectReason(user *internalusers.User) string {
+	switch {
+	case user == nil:
+		return "not in users whitelist"
+	case user.Blocked:
+		return "blocked"
+	case user.Exceeded():
+		return "data quota exceeded"
+	}
+	return ""
+}
+
+// HasUsers reports whether a users whitelist is enforced.
+func (s *HTTPMaskTunnelServer) HasUsers() bool { return s != nil && s.users != nil }
+
+// UserLabel returns the alias of the whitelisted user behind a handshake hash, or the hash itself.
+func (s *HTTPMaskTunnelServer) UserLabel(userHash string) string {
+	if s != nil {
+		if u := s.users.Lookup(userHash); u != nil {
+			return u.Alias
+		}
+	}
+	return userHash
+}
+
+func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) (*HTTPMaskTunnelServer, error) {
 	if cfg == nil {
-		return &HTTPMaskTunnelServer{}
+		return &HTTPMaskTunnelServer{}, nil
+	}
+	reg, err := newUserRegistry(cfg.Users)
+	if err != nil {
+		return nil, fmt.Errorf("users: %w", err)
 	}
 
 	var ts *httpmask.TunnelServer
@@ -40,12 +110,13 @@ func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) *HTTPMaskTunnelServer {
 					EnablePureDownlink: cfg.EnablePureDownlink,
 					PaddingMin:         cfg.PaddingMin,
 					PaddingMax:         cfg.PaddingMax,
+					WireWrap:           userWireWrap(reg),
 				}, cfg.tableCandidates(), nil),
 			})
 		}
 	}
 
-	return &HTTPMaskTunnelServer{cfg: cfg, ts: ts}
+	return &HTTPMaskTunnelServer{cfg: cfg, ts: ts, users: reg}, nil
 }
 
 func shouldPassThroughRejectedHTTPMask(cfg *ProtocolConfig) bool {
@@ -80,17 +151,52 @@ func ServerHandshakeSessionAutoWithUserHash(rawConn net.Conn, cfg *ProtocolConfi
 	if cfg == nil {
 		return nil, SessionForward, "", "", nil, fmt.Errorf("config is required")
 	}
+	// A registry built here lives for this one handshake, so data quotas are not shared across
+	// calls; HTTPMaskTunnelServer keeps one registry for the lifetime of the listener.
+	reg, err := newUserRegistry(cfg.Users)
+	if err != nil {
+		return nil, SessionForward, "", "", nil, fmt.Errorf("users: %w", err)
+	}
+	return serverHandshake(rawConn, cfg, reg)
+}
+
+func serverHandshake(rawConn net.Conn, cfg *ProtocolConfig, reg *internalusers.Registry) (net.Conn, SessionKind, string, string, []byte, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, SessionForward, "", "", nil, err
 	}
 
-	conn, meta, err := internaltunnel.HandshakeAndUpgradeWithTablesMeta(rawConn, toInternalConfig(cfg), cfg.tableCandidates())
+	// Early-handshake conns are already wire-wrapped inside WireWrap; everything else is counted here.
+	handshakeConn := rawConn
+	var wire *internalusers.WireConn
+	if reg != nil {
+		if _, early := httpmask.EarlyHandshakeUserHash(rawConn); !early {
+			wire = internalusers.NewWireConn(rawConn)
+			handshakeConn = wire
+		}
+	}
+
+	conn, meta, err := internaltunnel.ServerHandshake(handshakeConn, toInternalConfig(cfg), cfg.tableCandidates())
 	if err != nil {
 		return nil, SessionForward, "", "", nil, err
 	}
 	userHash := ""
 	if meta != nil {
 		userHash = meta.UserHash
+	}
+	if reg != nil {
+		user := reg.Lookup(userHash)
+		if reason := userRejectReason(user); reason != "" {
+			who := userHash
+			if user != nil {
+				who = user.Alias
+			}
+			_ = conn.Close()
+			return nil, SessionForward, "", "", nil, &UserRejectedError{User: who, Reason: reason}
+		}
+		if wire != nil {
+			wire.Bind(user)
+		}
+		conn = user.WrapPayload(conn)
 	}
 
 	session, targetAddr, payload, err := readServerSession(conn)
@@ -106,7 +212,7 @@ func (s *HTTPMaskTunnelServer) HandleConnSessionAutoWithUserHash(rawConn net.Con
 		return nil, SessionForward, "", "", nil, false, nil
 	}
 	if s.ts == nil {
-		return handledServerHandshake(rawConn, s.cfg)
+		return handledServerHandshake(rawConn, s.cfg, s.users)
 	}
 
 	res, c, err := s.ts.HandleConn(rawConn)
@@ -124,22 +230,22 @@ func (s *HTTPMaskTunnelServer) HandleConnSessionAutoWithUserHash(rawConn net.Con
 				Conn: newFallbackReplayConn(c, rawConn),
 			}
 		}
-		return handledServerHandshakeWithFallbackConn(c, s.cfg, c, true)
+		return handledServerHandshakeWithFallbackConn(c, s.cfg, s.users, c, true)
 	case httpmask.HandleStartTunnel:
 		inner := *s.cfg
 		inner.DisableHTTPMask = true
-		return handledServerHandshakeWithFallbackConn(c, &inner, nil, false)
+		return handledServerHandshakeWithFallbackConn(c, &inner, s.users, nil, false)
 	default:
 		return nil, SessionForward, "", "", nil, true, nil
 	}
 }
 
-func handledServerHandshake(rawConn net.Conn, cfg *ProtocolConfig) (net.Conn, SessionKind, string, string, []byte, bool, error) {
-	return handledServerHandshakeWithFallbackConn(rawConn, cfg, rawConn, true)
+func handledServerHandshake(rawConn net.Conn, cfg *ProtocolConfig, reg *internalusers.Registry) (net.Conn, SessionKind, string, string, []byte, bool, error) {
+	return handledServerHandshakeWithFallbackConn(rawConn, cfg, reg, rawConn, true)
 }
 
-func handledServerHandshakeWithFallbackConn(rawConn net.Conn, cfg *ProtocolConfig, fallbackStream net.Conn, allowFallback bool) (net.Conn, SessionKind, string, string, []byte, bool, error) {
-	conn, session, target, userHash, payload, err := ServerHandshakeSessionAutoWithUserHash(rawConn, cfg)
+func handledServerHandshakeWithFallbackConn(rawConn net.Conn, cfg *ProtocolConfig, reg *internalusers.Registry, fallbackStream net.Conn, allowFallback bool) (net.Conn, SessionKind, string, string, []byte, bool, error) {
+	conn, session, target, userHash, payload, err := serverHandshake(rawConn, cfg, reg)
 	if err != nil {
 		if !allowFallback && rawConn != nil {
 			_ = rawConn.Close()

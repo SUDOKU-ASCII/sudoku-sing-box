@@ -45,3 +45,27 @@ type HTTPMaskConfig struct {
 	//   - "on": enable session mux over raw TCP or HTTPMask
 	Multiplex string `json:"multiplex"`
 }
+
+func (c *Config) HTTPMaskTunnelEnabled() bool {
+	if c == nil || c.HTTPMask.Disable {
+		return false
+	}
+	switch c.HTTPMask.Mode {
+	case "stream", "poll", "auto", "ws":
+		return true
+	default:
+		return false
+	}
+}
+
+// MultiplexMode prefers httpmask.multiplex over the top-level multiplex, matching older configs.
+func (c *Config) MultiplexMode() string {
+	if c == nil {
+		return "off"
+	}
+	return firstMultiplexMode(c.HTTPMask.Multiplex, c.Multiplex)
+}
+
+func (c *Config) SessionMuxEnabled() bool {
+	return c.MultiplexMode() == "on"
+}

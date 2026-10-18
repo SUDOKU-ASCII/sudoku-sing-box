@@ -27,12 +27,7 @@ import (
 
 // Save writes the config to disk with indentation.
 func Save(path string, cfg *Config) error {
-	if cfg == nil {
-		return nil
-	}
-
-	dir := filepath.Dir(path)
-	if dir != "." {
+	if dir := filepath.Dir(path); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -42,9 +37,11 @@ func Save(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
-	return enc.Encode(cfg)
+	if err := enc.Encode(cfg); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

@@ -19,13 +19,22 @@ with this application without prior consent.
 */
 package sudoku
 
-// Grid represents a 4x4 sudoku grid
-type Grid [16]uint8
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"math/rand"
+	"slices"
+	"sync"
+)
 
-// GenerateAllGrids generates all valid 4x4 Sudoku grids
-func GenerateAllGrids() []Grid {
-	var grids []Grid
-	var g Grid
+// grid is one filled 4x4 sudoku grid, row-major, values 1..4.
+type grid [16]uint8
+
+// generateAllGrids enumerates every valid 4x4 sudoku grid in a fixed order;
+// the order is part of the table-seeding contract.
+func generateAllGrids() []grid {
+	var grids []grid
+	var g grid
 	var backtrack func(int)
 
 	backtrack = func(idx int) {
@@ -61,5 +70,20 @@ func GenerateAllGrids() []Grid {
 		}
 	}
 	backtrack(0)
+	return grids
+}
+
+var allGrids = sync.OnceValue(generateAllGrids)
+
+// shuffledGrids orders every grid by a key-seeded shuffle: position k in the
+// result is the grid of plaintext byte k, and the 32 trailing grids encode
+// nothing. The math/rand v1 stream is part of the wire contract.
+func shuffledGrids(key string) []grid {
+	sum := sha256.Sum256([]byte(key))
+	rng := rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(sum[:8]))))
+	grids := slices.Clone(allGrids())
+	rng.Shuffle(len(grids), func(i, j int) {
+		grids[i], grids[j] = grids[j], grids[i]
+	})
 	return grids
 }

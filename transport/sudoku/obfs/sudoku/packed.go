@@ -20,12 +20,9 @@ with this application without prior consent.
 package sudoku
 
 import (
-	"bufio"
-	"bytes"
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 
 	"github.com/sagernet/sing-box/transport/sudoku/connutil"
 )
@@ -43,11 +40,8 @@ const (
 type PackedConn struct {
 	net.Conn
 	table  *Table
-	reader *bufio.Reader
-
-	recorder   *bytes.Buffer
-	recording  atomic.Bool
-	recordLock sync.Mutex
+	reader *wireReader
+	rec    handshakeRecorder
 
 	// Write buffer and state
 	writeMu  sync.Mutex
@@ -96,8 +90,8 @@ func NewPackedConnWithRecord(c net.Conn, table *Table, pMin, pMax int, record bo
 
 	if table != nil && table.layout != nil {
 		pc.padMarker = table.layout.padMarker
-		pc.padPool = make([]byte, 0, len(table.PaddingPool))
-		for _, b := range table.PaddingPool {
+		pc.padPool = make([]byte, 0, len(table.layout.paddingPool))
+		for _, b := range table.layout.paddingPool {
 			if b != pc.padMarker {
 				pc.padPool = append(pc.padPool, b)
 			}
@@ -107,55 +101,44 @@ func NewPackedConnWithRecord(c net.Conn, table *Table, pMin, pMax int, record bo
 		pc.padPool = append(pc.padPool, pc.padMarker)
 	}
 	if record {
-		pc.recorder = new(bytes.Buffer)
-		pc.recording.Store(true)
+		pc.rec.start()
 	}
 	return pc
 }
 
+// StopRecording ends handshake recording and drops what was recorded.
 func (pc *PackedConn) StopRecording() {
-	if pc == nil {
-		return
+	if pc != nil {
+		pc.rec.stop()
 	}
-	pc.recordLock.Lock()
-	pc.recording.Store(false)
-	pc.recorder = nil
-	pc.recordLock.Unlock()
 }
 
+// GetBufferedAndRecorded returns every wire byte read so far that has not been
+// stopped from recording, plus bytes buffered but not yet decoded.
 func (pc *PackedConn) GetBufferedAndRecorded() []byte {
 	if pc == nil {
 		return nil
 	}
-
-	pc.recordLock.Lock()
-	defer pc.recordLock.Unlock()
-
-	var recorded []byte
-	if pc.recorder != nil {
-		recorded = pc.recorder.Bytes()
-	}
-	if pc.reader == nil {
-		return recorded
-	}
-
-	buffered := pc.reader.Buffered()
-	if buffered > 0 {
-		peeked, _ := pc.reader.Peek(buffered)
-		full := make([]byte, len(recorded)+len(peeked))
-		copy(full, recorded)
-		copy(full[len(recorded):], peeked)
-		return full
-	}
-	return recorded
+	return pc.rec.recordedWithBuffered(pc.reader.pending())
 }
 
+// appendByte feeds one plaintext byte into the 6-bit accumulator and emits every
+// group it completes.
+func (pc *PackedConn) appendByte(out []byte, b byte) []byte {
+	pc.bitBuf = pc.bitBuf<<8 | uint64(b)
+	pc.bitCount += 8
+	for pc.bitCount >= 6 {
+		pc.bitCount -= 6
+		group := byte(pc.bitBuf >> pc.bitCount)
+		pc.bitBuf &= 1<<pc.bitCount - 1
+		out = appendPackedGroup(out, pc.table.layout, pc.rng, pc.paddingThreshold, pc.padPool, group)
+	}
+	return out
+}
+
+// appendForcedPadding adds one padding byte unconditionally.
 func (pc *PackedConn) appendForcedPadding(out []byte) []byte {
-	return append(out, pc.getPaddingByte())
-}
-
-func (pc *PackedConn) nextProtectedPrefixGap() int {
-	return 1 + pc.rng.Intn(2)
+	return append(out, pc.padPool[pc.rng.Intn(len(pc.padPool))])
 }
 
 func (pc *PackedConn) writeProtectedPrefix(out []byte, p []byte) ([]byte, int) {
@@ -172,27 +155,16 @@ func (pc *PackedConn) writeProtectedPrefix(out []byte, p []byte) ([]byte, int) {
 		out = pc.appendForcedPadding(out)
 	}
 
-	gap := pc.nextProtectedPrefixGap()
+	gap := 1 + pc.rng.Intn(2)
 	effective := 0
 	for i := 0; i < limit; i++ {
-		pc.bitBuf = (pc.bitBuf << 8) | uint64(p[i])
-		pc.bitCount += 8
-		for pc.bitCount >= 6 {
-			pc.bitCount -= 6
-			group := byte(pc.bitBuf >> pc.bitCount)
-			if pc.bitCount == 0 {
-				pc.bitBuf = 0
-			} else {
-				pc.bitBuf &= (1 << pc.bitCount) - 1
-			}
-			out = appendPackedGroup(out, pc.table.layout, pc.rng, pc.paddingThreshold, pc.padPool, group)
-		}
+		out = pc.appendByte(out, p[i])
 
 		effective++
 		if effective >= gap {
 			out = pc.appendForcedPadding(out)
 			effective = 0
-			gap = pc.nextProtectedPrefixGap()
+			gap = 1 + pc.rng.Intn(2)
 		}
 	}
 
@@ -200,15 +172,12 @@ func (pc *PackedConn) writeProtectedPrefix(out []byte, p []byte) ([]byte, int) {
 }
 
 func appendPackedGroup(out []byte, layout *byteLayout, rng *sudokuRand, paddingThreshold uint64, padPool []byte, group byte) []byte {
-	if paddingThreshold != 0 {
-		u := rng.Uint32()
-		if uint64(u) < paddingThreshold {
-			out = append(out, padPool[fastIntnFromUint32(rng.Uint32(), len(padPool))])
-		}
-	}
+	out = maybeAppendPackedPadding(out, rng, paddingThreshold, padPool)
 	return append(out, layout.encodeGroup[group&0x3F])
 }
 
+// maybeAppendPackedPadding appends one random padding byte with the
+// connection's padding probability.
 func maybeAppendPackedPadding(out []byte, rng *sudokuRand, paddingThreshold uint64, padPool []byte) []byte {
 	if paddingThreshold != 0 {
 		u := rng.Uint32()
@@ -233,11 +202,8 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 
 	// Bound storage independently of the caller's Write size, including padding.
 	needed := min(min(len(p), maxEncodedWriteSize)*3+64, maxEncodedWriteSize)
-	if cap(pc.writeBuf) < needed {
-		pc.writeBuf = make([]byte, 0, needed)
-	}
-	out := pc.writeBuf[:0]
-	defer func() { pc.writeBuf = out[:0] }()
+	out := growWriteBuf(pc.writeBuf, needed)
+	defer func() { pc.writeBuf = releaseWriteBuf(out) }()
 	layout := pc.table.layout
 	rng := pc.rng
 	paddingThreshold := pc.paddingThreshold
@@ -249,20 +215,8 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 	// Align the protected prefix to a complete group boundary.
 	for pc.bitCount > 0 && i < n {
 		out = maybeAppendPackedPadding(out, rng, paddingThreshold, padPool)
-		b := p[i]
+		out = pc.appendByte(out, p[i])
 		i++
-		pc.bitBuf = (pc.bitBuf << 8) | uint64(b)
-		pc.bitCount += 8
-		for pc.bitCount >= 6 {
-			pc.bitCount -= 6
-			group := byte(pc.bitBuf >> pc.bitCount)
-			if pc.bitCount == 0 {
-				pc.bitBuf = 0
-			} else {
-				pc.bitBuf &= (1 << pc.bitCount) - 1
-			}
-			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, group)
-		}
 	}
 
 	// Encode complete blocks in one batch. Prefix and tail handling retain the
@@ -290,19 +244,7 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 
 	// Handle the remaining 1 or 2 bytes.
 	for ; i < n; i++ {
-		b := p[i]
-		pc.bitBuf = (pc.bitBuf << 8) | uint64(b)
-		pc.bitCount += 8
-		for pc.bitCount >= 6 {
-			pc.bitCount -= 6
-			group := byte(pc.bitBuf >> pc.bitCount)
-			if pc.bitCount == 0 {
-				pc.bitBuf = 0
-			} else {
-				pc.bitBuf &= (1 << pc.bitCount) - 1
-			}
-			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, group)
-		}
+		out = pc.appendByte(out, p[i])
 	}
 
 	// Flush residual bits.
@@ -338,7 +280,7 @@ func (pc *PackedConn) Flush() error {
 		pc.bitBuf = 0
 		pc.bitCount = 0
 
-		out = append(out, pc.table.layout.groupByte(group&0x3F))
+		out = append(out, pc.table.layout.encodeGroup[group])
 		out = append(out, pc.padMarker)
 	}
 
@@ -362,23 +304,17 @@ func (pc *PackedConn) Read(p []byte) (int, error) {
 	}
 
 	if pc.reader == nil {
-		pc.reader = bufio.NewReaderSize(pc.Conn, PackedIOBufferSize)
+		pc.reader = &wireReader{src: pc.Conn}
 	}
 
 	outN := 0
 	for {
-		chunk, rErr := peekBufferedChunk(pc.reader)
+		chunk, rErr := pc.reader.peek()
 		if len(chunk) > 0 {
 			var consumed int
 			outN, consumed, rErr = pc.decode(p, chunk)
-			if pc.recording.Load() {
-				pc.recordLock.Lock()
-				if pc.recording.Load() && pc.recorder != nil {
-					pc.recorder.Write(chunk[:consumed])
-				}
-				pc.recordLock.Unlock()
-			}
-			_, _ = pc.reader.Discard(consumed)
+			pc.rec.add(chunk[:consumed])
+			pc.reader.discard(consumed)
 		}
 
 		if rErr != nil {
@@ -393,9 +329,4 @@ func (pc *PackedConn) Read(p []byte) (int, error) {
 			return outN, nil
 		}
 	}
-}
-
-// getPaddingByte picks a random padding byte from the pool.
-func (pc *PackedConn) getPaddingByte() byte {
-	return pc.padPool[pc.rng.Intn(len(pc.padPool))]
 }

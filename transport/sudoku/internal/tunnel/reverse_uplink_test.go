@@ -44,7 +44,7 @@ func testBaseDialerUplinkMode(t *testing.T, reverse bool) {
 			errCh <- err
 			return
 		}
-		conn, meta, err := HandshakeAndUpgradeWithTablesMeta(raw, serverCfg, []*sudoku.Table{table})
+		conn, meta, err := ServerHandshake(raw, serverCfg, []*sudoku.Table{table})
 		if err == nil && conn != nil {
 			_ = conn.Close()
 		}

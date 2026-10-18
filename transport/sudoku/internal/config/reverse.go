@@ -19,6 +19,13 @@ with this application without prior consent.
 */
 package config
 
+import (
+	"fmt"
+	"net"
+	"path"
+	"strings"
+)
+
 // ReverseConfig enables "reverse proxy over Sudoku tunnel": a client behind NAT keeps a tunnel to the server,
 // and the server exposes client services via HTTP path prefixes (e.g. /gitea -> gitea.intra.example.com:3000 on client).
 //
@@ -56,4 +63,70 @@ type ReverseRoute struct {
 	// HostHeader optionally overrides the HTTP Host header when proxying.
 	// When empty and Target uses a domain host, the proxy forwards that target host by default.
 	HostHeader string `json:"host_header,omitempty"`
+}
+
+func (r *ReverseConfig) isEmpty() bool {
+	return r.Listen == "" && r.ClientID == "" && len(r.Routes) == 0
+}
+
+// finalize trims fields, canonicalizes route paths and rejects invalid or duplicate routes.
+// An empty Path is the single raw-TCP route served on reverse.listen.
+func (r *ReverseConfig) finalize() error {
+	r.Listen = strings.TrimSpace(r.Listen)
+	r.ClientID = strings.TrimSpace(r.ClientID)
+
+	seenPaths := make(map[string]struct{}, len(r.Routes))
+	hasTCPRoute := false
+	kept := r.Routes[:0]
+	for _, route := range r.Routes {
+		route = route.normalized()
+		if route.Path == "" && route.Target == "" {
+			continue
+		}
+		if err := route.validateTarget(); err != nil {
+			return err
+		}
+
+		if route.Path == "" {
+			if hasTCPRoute {
+				return fmt.Errorf("reverse route duplicate tcp mapping")
+			}
+			hasTCPRoute = true
+		} else {
+			if _, dup := seenPaths[route.Path]; dup {
+				return fmt.Errorf("reverse route duplicate path: %q", route.Path)
+			}
+			seenPaths[route.Path] = struct{}{}
+		}
+		kept = append(kept, route)
+	}
+	r.Routes = kept
+	return nil
+}
+
+func (rt ReverseRoute) normalized() ReverseRoute {
+	rt.Path = strings.TrimSpace(rt.Path)
+	rt.Target = strings.TrimSpace(rt.Target)
+	rt.HostHeader = strings.TrimSpace(rt.HostHeader)
+	if rt.Path != "" {
+		if !strings.HasPrefix(rt.Path, "/") {
+			rt.Path = "/" + rt.Path
+		}
+		rt.Path = path.Clean(rt.Path)
+	}
+	return rt
+}
+
+func (rt ReverseRoute) validateTarget() error {
+	label := "reverse tcp route"
+	if rt.Path != "" {
+		label = fmt.Sprintf("reverse route %q", rt.Path)
+	}
+	if rt.Target == "" {
+		return fmt.Errorf("%s: missing target", label)
+	}
+	if _, _, err := net.SplitHostPort(rt.Target); err != nil {
+		return fmt.Errorf("%s: invalid target %q: %w", label, rt.Target, err)
+	}
+	return nil
 }

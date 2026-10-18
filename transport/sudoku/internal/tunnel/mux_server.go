@@ -20,7 +20,6 @@ with this application without prior consent.
 package tunnel
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +40,8 @@ func HandleMuxServer(conn net.Conn, onConnect func(targetAddr string)) error {
 	return HandleMuxWithDialer(conn, onConnect, dial)
 }
 
+// HandleMuxWithStreamHandler hands each opened mux stream and its decoded target to handler,
+// leaving dialing and relaying to the embedding server.
 func HandleMuxWithStreamHandler(conn net.Conn, handler func(stream net.Conn, targetAddr string)) error {
 	if conn == nil {
 		return fmt.Errorf("nil conn")
@@ -53,13 +54,13 @@ func HandleMuxWithStreamHandler(conn net.Conn, handler func(stream net.Conn, tar
 		addr, err := decodeMuxOpenTarget(payload)
 		if err != nil {
 			stream.session.sendReset(stream.id, "bad address")
-			stream.closeNoSend(err)
+			stream.abort(err)
 			stream.session.removeStream(stream.id)
 			return
 		}
 		go handler(stream, addr)
 	})
-	sess.startKeepalive(muxKeepaliveInterval)
+	sess.startKeepalive(muxKeepaliveInterval, muxKeepaliveIdle)
 
 	<-sess.closed
 	err := sess.closedErr()
@@ -86,7 +87,7 @@ func HandleMuxWithDialer(conn net.Conn, onConnect func(targetAddr string), dialT
 		addr, err := decodeMuxOpenTarget(payload)
 		if err != nil {
 			sess.sendReset(stream.id, "bad address")
-			stream.closeNoSend(err)
+			stream.abort(err)
 			sess.removeStream(stream.id)
 			return
 		}
@@ -97,14 +98,14 @@ func HandleMuxWithDialer(conn net.Conn, onConnect func(targetAddr string), dialT
 		target, err := dialTarget(addr)
 		if err != nil {
 			sess.sendReset(stream.id, err.Error())
-			stream.closeNoSend(err)
+			stream.abort(err)
 			sess.removeStream(stream.id)
 			return
 		}
 
 		connutil.PipeConn(stream, target)
 	})
-	sess.startKeepalive(muxKeepaliveInterval)
+	sess.startKeepalive(muxKeepaliveInterval, muxKeepaliveIdle)
 
 	<-sess.closed
 	err := sess.closedErr()
@@ -125,13 +126,14 @@ func isExpectedMuxSessionClose(err error) bool {
 	return strings.Contains(msg, "connection reset by peer") || strings.Contains(msg, "forcibly closed by the remote host")
 }
 
-func decodeMuxOpenTarget(payload []byte) (string, error) {
-	addr, _, _, err := protocol.ReadAddress(bytes.NewReader(payload))
+func encodeMuxOpenTarget(addr string) ([]byte, error) {
+	payload, err := protocol.AppendAddress(make([]byte, 0, len(addr)+20), addr)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("encode address failed: %w", err)
 	}
-	if addr == "" {
-		return "", fmt.Errorf("empty address")
-	}
-	return addr, nil
+	return payload, nil
+}
+
+func decodeMuxOpenTarget(payload []byte) (string, error) {
+	return protocol.DecodeAddress(payload)
 }

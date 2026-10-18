@@ -51,23 +51,15 @@ type BaseDialer struct {
 // DialBase establishes a Sudoku tunnel connection to the configured server,
 // performing the handshake but not requesting any target address.
 func (d *BaseDialer) DialBase() (net.Conn, error) {
-	return d.dialBaseWithUplinkMode(ObfsUplinkPure)
+	return d.dial(d.Context, obfsUplinkPure)
 }
 
 // DialReverseBase establishes a reverse-session tunnel using packed uplink on the client side.
 func (d *BaseDialer) DialReverseBase() (net.Conn, error) {
-	return d.dialBaseWithUplinkMode(ObfsUplinkPacked)
+	return d.dial(d.Context, obfsUplinkPacked)
 }
 
-func (d *BaseDialer) dialBase() (net.Conn, error) {
-	return d.dialBaseContext(d.Context)
-}
-
-func (d *BaseDialer) dialBaseContext(ctx context.Context) (net.Conn, error) {
-	return d.dialBaseWithUplinkModeContext(ctx, ObfsUplinkPure)
-}
-
-func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.Table, tableHint uint32, hasTableHint bool, uplinkMode ObfsUplinkMode, upgrade func(net.Conn) (net.Conn, error)) (net.Conn, error) {
+func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.Table, tableHint uint32, hasTableHint bool, uplinkMode obfsUplinkMode, upgrade func(net.Conn) (net.Conn, error)) (net.Conn, error) {
 	if d.Config == nil {
 		return nil, fmt.Errorf("missing config")
 	}
@@ -77,7 +69,7 @@ func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.T
 		EnablePureDownlink: d.Config.EnablePureDownlink,
 		PaddingMin:         d.Config.PaddingMin,
 		PaddingMax:         d.Config.PaddingMax,
-		PackedUplink:       uplinkMode == ObfsUplinkPacked,
+		PackedUplink:       uplinkMode == obfsUplinkPacked,
 	}, table, tableHint, hasTableHint, kipUserHashFromPrivateKey(d.PrivateKey, d.Config.Key), KIPFeatAll)
 	if err != nil {
 		return nil, err
@@ -115,11 +107,7 @@ func (d *BaseDialer) pickTable() (*sudoku.Table, uint32, bool, error) {
 	return d.Tables[idx], d.Tables[idx].Hint(), true, nil
 }
 
-func (d *BaseDialer) dialBaseWithUplinkMode(uplinkMode ObfsUplinkMode) (net.Conn, error) {
-	return d.dialBaseWithUplinkModeContext(d.Context, uplinkMode)
-}
-
-func (d *BaseDialer) dialBaseWithUplinkModeContext(ctx context.Context, uplinkMode ObfsUplinkMode) (net.Conn, error) {
+func (d *BaseDialer) dial(ctx context.Context, uplinkMode obfsUplinkMode) (net.Conn, error) {
 	if d.Config == nil {
 		return nil, fmt.Errorf("missing config")
 	}
@@ -156,13 +144,13 @@ func (d *BaseDialer) dialBaseWithUplinkModeContext(ctx context.Context, uplinkMo
 		} else {
 			// Resolve server address with DNS concurrency and optimistic cache.
 			resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-
-			serverAddr, resolveErr := dnsutil.ResolveWithCache(resolveCtx, d.Config.ServerAddress)
+			serverAddr, resolveErr := dnsutil.Resolve(resolveCtx, d.Config.ServerAddress)
 			cancel()
 			if resolveErr != nil {
 				return nil, fmt.Errorf("resolve server address failed: %w", resolveErr)
 			}
 
+			// 1. Establish base TCP connection
 			connectCtx, connectCancel := context.WithTimeout(ctx, 5*time.Second)
 			rawRemote, err = dnsutil.OutboundDialer(0).DialContext(connectCtx, "tcp", serverAddr)
 			connectCancel()
@@ -210,7 +198,7 @@ func (d *BaseDialer) dialTarget(destAddrStr string) (net.Conn, error) {
 	if strings.TrimSpace(destAddrStr) == "" {
 		return nil, fmt.Errorf("empty target address")
 	}
-	cConn, err := d.dialBase()
+	cConn, err := d.DialBase()
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +210,7 @@ func (d *BaseDialer) dialTarget(destAddrStr string) (net.Conn, error) {
 }
 
 func (d *BaseDialer) dialUoT() (net.Conn, error) {
-	conn, err := d.dialBase()
+	conn, err := d.DialBase()
 	if err != nil {
 		return nil, err
 	}

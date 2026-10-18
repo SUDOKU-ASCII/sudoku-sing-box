@@ -26,21 +26,16 @@ import (
 	"testing"
 )
 
-func TestDownlinkWriter_DoesNotInjectInterPacketPadding(t *testing.T) {
-	table := NewTable("downlink-no-interpacket", "prefer_ascii")
+func TestPureWriter_NoPaddingIsExactlyFourXAllHints(t *testing.T) {
+	table := mustTable(t, "downlink-no-interpacket", "prefer_ascii")
 
 	var raw bytes.Buffer
-	writer := newDownlinkWriter(newSudokuDataWriter(&raw, table, newSudokuRand(1), 0, 0))
+	writer := newPureWriter(&raw, table, newSudokuRand(1), 0, 0)
 	payload := bytes.Repeat([]byte("a"), 256)
 
-	n, err := writer.Write(payload)
-	if err != nil {
-		t.Fatalf("write failed: %v", err)
+	if n, err := writer.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("write = (%d, %v), want (%d, nil)", n, err, len(payload))
 	}
-	if n != len(payload) {
-		t.Fatalf("write len mismatch: got %d want %d", n, len(payload))
-	}
-
 	if got, want := raw.Len(), len(payload)*4; got != want {
 		t.Fatalf("wire len = %d, want %d", got, want)
 	}
@@ -49,86 +44,73 @@ func TestDownlinkWriter_DoesNotInjectInterPacketPadding(t *testing.T) {
 	}
 }
 
-func TestDownlinkWriter_RoundTripCompatibility(t *testing.T) {
-	table := NewTable("downlink-roundtrip", "prefer_entropy")
-
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	writer := NewDownlinkWriter(c1, table, 0, 0)
-	reader := NewConn(c2, table, 0, 0, false)
-	payload := bytes.Repeat([]byte("compat-downlink-"), 8)
-
-	writeErr := make(chan error, 1)
-	go func() {
-		_, err := writer.Write(payload)
-		_ = c1.Close()
-		writeErr <- err
-	}()
-
-	got, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("read failed: %v", err)
+// The server's downlink writer must be readable by the matching client codec,
+// with the packed variant needing its Flush closer to deliver the tail bits.
+func TestServerDownlinkWriter_RoundTrip(t *testing.T) {
+	cases := []struct {
+		name    string
+		pure    bool
+		payload []byte
+		reader  func(net.Conn, *Table) io.Reader
+	}{
+		{"pure", true, bytes.Repeat([]byte("compat-downlink-"), 8), func(c net.Conn, tb *Table) io.Reader {
+			return NewConn(c, tb, 0, 0, false)
+		}},
+		{"packed", false, bytes.Repeat([]byte("packed-downlink-compat"), 96), func(c net.Conn, tb *Table) io.Reader {
+			return NewPackedConn(c, tb, 0, 0)
+		}},
 	}
-	if err := <-writeErr; err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("roundtrip mismatch")
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			table := mustTable(t, "downlink-roundtrip-"+tc.name, "prefer_entropy")
+			c1, c2 := net.Pipe()
+			defer c1.Close()
+			defer c2.Close()
 
-func TestPackedDownlinkWriter_RoundTripCompatibility(t *testing.T) {
-	table := NewTable("packed-downlink-roundtrip", "prefer_entropy")
+			writer, closers := NewServerDownlinkWriter(c1, table, 0, 0, tc.pure)
+			writeErr := make(chan error, 1)
+			go func() {
+				_, err := writer.Write(tc.payload)
+				for _, closeFn := range closers {
+					if cerr := closeFn(); err == nil {
+						err = cerr
+					}
+				}
+				_ = c1.Close()
+				writeErr <- err
+			}()
 
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	packed, writer := NewPackedDownlinkWriter(c1, table, 0, 0)
-	reader := NewPackedConn(c2, table, 0, 0)
-	payload := bytes.Repeat([]byte("packed-downlink-compat"), 96)
-
-	writeErr := make(chan error, 1)
-	go func() {
-		_, err := writer.Write(payload)
-		if err == nil {
-			err = packed.Flush()
-		}
-		_ = c1.Close()
-		writeErr <- err
-	}()
-
-	got, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("read failed: %v", err)
-	}
-	if err := <-writeErr; err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("packed roundtrip mismatch")
+			got, err := io.ReadAll(tc.reader(c2, table))
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if err := <-writeErr; err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if !bytes.Equal(got, tc.payload) {
+				t.Fatal("round trip mismatch")
+			}
+		})
 	}
 }
 
 func TestPackedConn_SmallReadDoesNotOverDecode(t *testing.T) {
-	table := NewTable("packed-small-read", "prefer_ascii")
+	table := mustTable(t, "packed-small-read", "prefer_ascii")
 
-	mock := &MockConn{}
+	mock := &memConn{}
 	writer := NewPackedConn(mock, table, 0, 0)
 	payload := bytes.Repeat([]byte("x"), 63*1024)
 	if _, err := writer.Write(payload); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	reader := NewPackedConn(&MockConn{readBuf: mock.writeBuf}, table, 0, 0)
+	reader := NewPackedConn(&memConn{readBuf: mock.writeBuf}, table, 0, 0)
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(reader, header); err != nil {
 		t.Fatalf("small read: %v", err)
 	}
 
-	if reader.reader.Buffered() == 0 {
+	if len(reader.reader.pending()) == 0 {
 		t.Fatal("small read consumed the entire wire buffer")
 	}
 }
@@ -136,7 +118,7 @@ func TestPackedConn_SmallReadDoesNotOverDecode(t *testing.T) {
 func countNonHintBytes(data []byte, table *Table) int {
 	count := 0
 	for _, b := range data {
-		if !table.layout.isHint(b) {
+		if !isHint(table.layout, b) {
 			count++
 		}
 	}

@@ -39,8 +39,8 @@ func TestCustomLayoutParsingAndPadding(t *testing.T) {
 		t.Fatalf("layout mask not initialized")
 	}
 
-	for _, b := range table.PaddingPool {
-		if table.layout.isHint(b) {
+	for _, b := range table.layout.paddingPool {
+		if isHint(table.layout, b) {
 			t.Fatalf("padding byte incorrectly recognized as hint: %08b", b)
 		}
 		if bits.OnesCount8(b) < 5 {

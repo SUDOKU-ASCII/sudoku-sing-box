@@ -20,12 +20,9 @@ with this application without prior consent.
 package tunnel
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net"
-
-	"github.com/sagernet/sing-box/transport/sudoku/internal/protocol"
 )
 
 // MuxClient opens multiple target streams over an already-upgraded Sudoku tunnel connection.
@@ -41,7 +38,7 @@ func NewMuxClient(conn net.Conn) (*MuxClient, error) {
 		return nil, fmt.Errorf("nil conn")
 	}
 	sess := newMuxSession(conn, nil)
-	sess.startKeepalive(muxKeepaliveInterval)
+	sess.startKeepalive(muxKeepaliveInterval, muxKeepaliveIdle)
 	return &MuxClient{sess: sess}, nil
 }
 
@@ -54,18 +51,12 @@ func (c *MuxClient) Dial(destAddrStr string) (net.Conn, error) {
 		return nil, c.sess.closedErr()
 	}
 
-	var addrBuf bytes.Buffer
-	if err := protocol.WriteAddress(&addrBuf, destAddrStr); err != nil {
-		return nil, fmt.Errorf("encode address failed: %w", err)
+	payload, err := encodeMuxOpenTarget(destAddrStr)
+	if err != nil {
+		return nil, err
 	}
-
-	streamID := c.sess.nextStreamID()
-	st := newMuxStream(c.sess, streamID)
-	c.sess.registerStream(st)
-
-	if err := c.sess.sendFrame(muxFrameOpen, streamID, addrBuf.Bytes()); err != nil {
-		st.closeNoSend(err)
-		c.sess.removeStream(streamID)
+	st, err := openMuxStream(c.sess, payload)
+	if err != nil {
 		return nil, fmt.Errorf("mux open failed: %w", err)
 	}
 	return st, nil

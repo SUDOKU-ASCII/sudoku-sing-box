@@ -3,8 +3,6 @@ package tunnel
 import (
 	"bytes"
 	"crypto/ecdh"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"time"
@@ -14,10 +12,6 @@ import (
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
 
-const (
-	earlyKIPHandshakeTTL = 60 * time.Second
-)
-
 type EarlyCodecConfig struct {
 	PSK                string
 	AEAD               string
@@ -25,9 +19,13 @@ type EarlyCodecConfig struct {
 	PaddingMin         int
 	PaddingMax         int
 	PackedUplink       bool
+
+	// WireWrap, server side only, wraps the raw stream below the sudoku/crypto layers
+	// so wire bytes can be accounted per user.
+	WireWrap func(userHash string, raw net.Conn) net.Conn
 }
 
-type EarlyClientState struct {
+type earlyClientState struct {
 	RequestPayload []byte
 
 	cfg         EarlyCodecConfig
@@ -39,18 +37,16 @@ type EarlyClientState struct {
 	responseSet bool
 }
 
-type EarlyServerState struct {
+type earlyServerState struct {
 	ResponsePayload []byte
 	UserHash        string
 
 	cfg        EarlyCodecConfig
 	table      *sudoku.Table
-	uplinkMode ObfsUplinkMode
+	uplinkMode obfsUplinkMode
 	sessionC2S []byte
 	sessionS2C []byte
 }
-
-type ReplayAllowFunc func(userHash string, nonce [kipHelloNonceSize]byte, now time.Time) bool
 
 type earlyMemoryConn struct {
 	reader *bytes.Reader
@@ -89,49 +85,31 @@ func (a earlyDummyAddr) Network() string { return string(a) }
 func (a earlyDummyAddr) String() string  { return string(a) }
 
 func buildEarlyClientObfsConn(raw net.Conn, cfg EarlyCodecConfig, table *sudoku.Table) net.Conn {
-	uplinkMode := ObfsUplinkPure
+	uplinkMode := obfsUplinkPure
 	if cfg.PackedUplink {
-		uplinkMode = ObfsUplinkPacked
+		uplinkMode = obfsUplinkPacked
 	}
 	return buildClientObfsConnForMode(raw, table, cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink, uplinkMode)
 }
 
-func buildEarlyServerObfsConn(raw net.Conn, cfg EarlyCodecConfig, table *sudoku.Table, uplinkMode ObfsUplinkMode) net.Conn {
+func buildEarlyServerObfsConn(raw net.Conn, cfg EarlyCodecConfig, table *sudoku.Table, uplinkMode obfsUplinkMode) net.Conn {
 	_, conn := buildServerObfsConnForMode(raw, table, cfg.PaddingMin, cfg.PaddingMax, cfg.EnablePureDownlink, uplinkMode, false)
 	return conn
 }
 
-func NewEarlyClientState(cfg EarlyCodecConfig, table *sudoku.Table, tableHint uint32, hasTableHint bool, userHash [kipHelloUserHashSize]byte, feats uint32) (*EarlyClientState, error) {
+func newEarlyClientState(cfg EarlyCodecConfig, table *sudoku.Table, tableHint uint32, hasTableHint bool, userHash [kipHelloUserHashSize]byte, feats uint32) (*earlyClientState, error) {
 	if table == nil {
 		return nil, fmt.Errorf("nil table")
 	}
 
-	curve := ecdh.X25519()
-	ephemeral, err := curve.GenerateKey(rand.Reader)
+	hello, ephemeral, err := newClientHello(userHash, feats, tableHint, hasTableHint)
 	if err != nil {
-		return nil, fmt.Errorf("ecdh generate failed: %w", err)
-	}
-
-	var nonce [kipHelloNonceSize]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, fmt.Errorf("nonce generate failed: %w", err)
-	}
-
-	var clientPub [kipHelloPubSize]byte
-	copy(clientPub[:], ephemeral.PublicKey().Bytes())
-	hello := &KIPClientHello{
-		Timestamp:    time.Now(),
-		UserHash:     userHash,
-		Nonce:        nonce,
-		ClientPub:    clientPub,
-		Features:     feats,
-		TableHint:    tableHint,
-		HasTableHint: hasTableHint,
+		return nil, err
 	}
 
 	mem := newEarlyMemoryConn(nil)
 	obfsConn := buildEarlyClientObfsConn(mem, cfg, table)
-	pskC2S, pskS2C := DerivePSKDirectionalBases(cfg.PSK)
+	pskC2S, pskS2C := derivePSKDirectionalBases(cfg.PSK)
 	rc, err := crypto.NewRecordConn(obfsConn, cfg.AEAD, pskC2S, pskS2C)
 	if err != nil {
 		return nil, fmt.Errorf("client early crypto setup failed: %w", err)
@@ -140,55 +118,40 @@ func NewEarlyClientState(cfg EarlyCodecConfig, table *sudoku.Table, tableHint ui
 		return nil, fmt.Errorf("write early client hello failed: %w", err)
 	}
 
-	return &EarlyClientState{
+	return &earlyClientState{
 		RequestPayload: mem.Written(),
 		cfg:            cfg,
 		table:          table,
-		nonce:          nonce,
+		nonce:          hello.Nonce,
 		ephemeral:      ephemeral,
 	}, nil
 }
 
-func (s *EarlyClientState) ProcessResponse(payload []byte) error {
+func (s *earlyClientState) ProcessResponse(payload []byte) error {
 	if s == nil {
 		return fmt.Errorf("nil client state")
 	}
 	mem := newEarlyMemoryConn(payload)
 	obfsConn := buildEarlyClientObfsConn(mem, s.cfg, s.table)
-	pskC2S, pskS2C := DerivePSKDirectionalBases(s.cfg.PSK)
+	pskC2S, pskS2C := derivePSKDirectionalBases(s.cfg.PSK)
 	rc, err := crypto.NewRecordConn(obfsConn, s.cfg.AEAD, pskC2S, pskS2C)
 	if err != nil {
 		return fmt.Errorf("client early crypto setup failed: %w", err)
 	}
 
-	msg, err := ReadKIPMessage(rc)
+	sh, err := readServerHello(rc)
 	if err != nil {
-		return fmt.Errorf("read early server hello failed: %w", err)
+		return err
 	}
-	if msg.Type != KIPTypeServerHello {
-		return fmt.Errorf("unexpected early handshake message: %d", msg.Type)
-	}
-	sh, err := DecodeKIPServerHelloPayload(msg.Payload)
+	s.sessionC2S, s.sessionS2C, err = deriveClientSession(s.cfg.PSK, s.ephemeral, s.nonce, sh)
 	if err != nil {
-		return fmt.Errorf("decode early server hello failed: %w", err)
-	}
-	if sh.Nonce != s.nonce {
-		return fmt.Errorf("early handshake nonce mismatch")
-	}
-
-	shared, err := X25519SharedSecret(s.ephemeral, sh.ServerPub[:])
-	if err != nil {
-		return fmt.Errorf("ecdh failed: %w", err)
-	}
-	s.sessionC2S, s.sessionS2C, err = DeriveSessionDirectionalBases(s.cfg.PSK, shared, s.nonce)
-	if err != nil {
-		return fmt.Errorf("derive session keys failed: %w", err)
+		return err
 	}
 	s.responseSet = true
 	return nil
 }
 
-func (s *EarlyClientState) WrapConn(raw net.Conn) (net.Conn, error) {
+func (s *earlyClientState) WrapConn(raw net.Conn) (net.Conn, error) {
 	if s == nil {
 		return nil, fmt.Errorf("nil client state")
 	}
@@ -203,12 +166,12 @@ func (s *EarlyClientState) WrapConn(raw net.Conn) (net.Conn, error) {
 	return rc, nil
 }
 
-func (s *EarlyClientState) Ready() bool {
+func (s *earlyClientState) Ready() bool {
 	return s != nil && s.responseSet
 }
 
 func NewHTTPMaskClientEarlyHandshake(cfg EarlyCodecConfig, table *sudoku.Table, tableHint uint32, hasTableHint bool, userHash [kipHelloUserHashSize]byte, feats uint32) (*httpmask.ClientEarlyHandshake, error) {
-	state, err := NewEarlyClientState(cfg, table, tableHint, hasTableHint, userHash, feats)
+	state, err := newEarlyClientState(cfg, table, tableHint, hasTableHint, userHash, feats)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +183,7 @@ func NewHTTPMaskClientEarlyHandshake(cfg EarlyCodecConfig, table *sudoku.Table, 
 	}, nil
 }
 
-func ProcessEarlyClientPayload(cfg EarlyCodecConfig, tables []*sudoku.Table, payload []byte, allowReplay ReplayAllowFunc) (*EarlyServerState, error) {
+func ProcessEarlyClientPayload(cfg EarlyCodecConfig, tables []*sudoku.Table, payload []byte, allowReplay ReplayAllowFunc) (*earlyServerState, error) {
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("empty early payload")
 	}
@@ -230,7 +193,7 @@ func ProcessEarlyClientPayload(cfg EarlyCodecConfig, tables []*sudoku.Table, pay
 
 	var firstErr error
 	for _, table := range tables {
-		for _, uplinkMode := range []ObfsUplinkMode{ObfsUplinkPure, ObfsUplinkPacked} {
+		for _, uplinkMode := range []obfsUplinkMode{obfsUplinkPure, obfsUplinkPacked} {
 			state, err := processEarlyClientPayloadForTable(cfg, tables, table, uplinkMode, payload, allowReplay)
 			if err == nil {
 				return state, nil
@@ -246,85 +209,51 @@ func ProcessEarlyClientPayload(cfg EarlyCodecConfig, tables []*sudoku.Table, pay
 	return nil, firstErr
 }
 
-func processEarlyClientPayloadForTable(cfg EarlyCodecConfig, tables []*sudoku.Table, table *sudoku.Table, uplinkMode ObfsUplinkMode, payload []byte, allowReplay ReplayAllowFunc) (*EarlyServerState, error) {
+func processEarlyClientPayloadForTable(cfg EarlyCodecConfig, tables []*sudoku.Table, table *sudoku.Table, uplinkMode obfsUplinkMode, payload []byte, allowReplay ReplayAllowFunc) (*earlyServerState, error) {
 	mem := newEarlyMemoryConn(payload)
 	obfsConn := buildEarlyServerObfsConn(mem, cfg, table, uplinkMode)
-	pskC2S, pskS2C := DerivePSKDirectionalBases(cfg.PSK)
+	pskC2S, pskS2C := derivePSKDirectionalBases(cfg.PSK)
 	rc, err := crypto.NewRecordConn(obfsConn, cfg.AEAD, pskS2C, pskC2S)
 	if err != nil {
 		return nil, err
 	}
 
-	msg, err := ReadKIPMessage(rc)
+	ch, err := readClientHello(rc)
 	if err != nil {
 		return nil, err
 	}
-	if msg.Type != KIPTypeClientHello {
-		return nil, fmt.Errorf("unexpected handshake message: %d", msg.Type)
-	}
-	ch, err := DecodeKIPClientHelloPayload(msg.Payload)
+	accepted, err := acceptClientHello(ch, cfg.PSK, table, tables, allowReplay)
 	if err != nil {
 		return nil, err
-	}
-	if absEarlyInt64(time.Now().Unix()-ch.Timestamp.Unix()) > int64(earlyKIPHandshakeTTL.Seconds()) {
-		return nil, fmt.Errorf("time skew/replay")
-	}
-
-	userHash := hex.EncodeToString(ch.UserHash[:])
-	if allowReplay != nil && !allowReplay(userHash, ch.Nonce, time.Now()) {
-		return nil, fmt.Errorf("replay detected")
-	}
-	resolvedTable, err := ResolveClientHelloTable(table, tables, ch)
-	if err != nil {
-		return nil, fmt.Errorf("resolve table hint failed: %w", err)
-	}
-
-	curve := ecdh.X25519()
-	serverEphemeral, err := curve.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("ecdh generate failed: %w", err)
-	}
-	shared, err := X25519SharedSecret(serverEphemeral, ch.ClientPub[:])
-	if err != nil {
-		return nil, fmt.Errorf("ecdh failed: %w", err)
-	}
-	sessionC2S, sessionS2C, err := DeriveSessionDirectionalBases(cfg.PSK, shared, ch.Nonce)
-	if err != nil {
-		return nil, fmt.Errorf("derive session keys failed: %w", err)
-	}
-
-	var serverPub [kipHelloPubSize]byte
-	copy(serverPub[:], serverEphemeral.PublicKey().Bytes())
-	serverHello := &KIPServerHello{
-		Nonce:         ch.Nonce,
-		ServerPub:     serverPub,
-		SelectedFeats: ch.Features,
 	}
 
 	respMem := newEarlyMemoryConn(nil)
-	respObfs := buildEarlyServerObfsConn(respMem, cfg, resolvedTable, uplinkMode)
+	respObfs := buildEarlyServerObfsConn(respMem, cfg, accepted.table, uplinkMode)
 	respConn, err := crypto.NewRecordConn(respObfs, cfg.AEAD, pskS2C, pskC2S)
 	if err != nil {
 		return nil, fmt.Errorf("server early crypto setup failed: %w", err)
 	}
-	if err := WriteKIPMessage(respConn, KIPTypeServerHello, serverHello.EncodePayload()); err != nil {
+	if err := WriteKIPMessage(respConn, KIPTypeServerHello, accepted.reply.EncodePayload()); err != nil {
 		return nil, fmt.Errorf("write early server hello failed: %w", err)
 	}
 
-	return &EarlyServerState{
+	return &earlyServerState{
 		ResponsePayload: respMem.Written(),
-		UserHash:        userHash,
+		UserHash:        accepted.userHash,
 		cfg:             cfg,
-		table:           resolvedTable,
+		table:           accepted.table,
 		uplinkMode:      uplinkMode,
-		sessionC2S:      sessionC2S,
-		sessionS2C:      sessionS2C,
+		sessionC2S:      accepted.c2s,
+		sessionS2C:      accepted.s2c,
 	}, nil
 }
 
-func (s *EarlyServerState) WrapConn(raw net.Conn) (net.Conn, error) {
+func (s *earlyServerState) WrapConn(raw net.Conn) (net.Conn, error) {
 	if s == nil {
 		return nil, fmt.Errorf("nil server state")
+	}
+	if s.cfg.WireWrap != nil {
+		raw = s.cfg.WireWrap(s.UserHash, raw)
 	}
 	obfsConn := buildEarlyServerObfsConn(raw, s.cfg, s.table, s.uplinkMode)
 	rc, err := crypto.NewRecordConn(obfsConn, s.cfg.AEAD, s.sessionS2C, s.sessionC2S)
@@ -348,11 +277,4 @@ func NewHTTPMaskServerEarlyHandshake(cfg EarlyCodecConfig, tables []*sudoku.Tabl
 			}, nil
 		},
 	}
-}
-
-func absEarlyInt64(v int64) int64 {
-	if v < 0 {
-		return -v
-	}
-	return v
 }

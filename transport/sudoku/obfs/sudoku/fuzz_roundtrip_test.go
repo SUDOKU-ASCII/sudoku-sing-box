@@ -27,7 +27,7 @@ import (
 )
 
 func FuzzConnRoundTrip(f *testing.F) {
-	table := NewTable("fuzz-key", "prefer_entropy")
+	table := mustTable(f, "fuzz-key", "prefer_entropy")
 	f.Add([]byte("hello"))
 	f.Add([]byte{})
 

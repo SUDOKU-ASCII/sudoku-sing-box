@@ -44,3 +44,21 @@ func GenKeyPair() (privateKey, publicKey string, err error) {
 	}
 	return privateKey, sudokuc.EncodePoint(keyPair.Public), nil
 }
+
+// GenMorePrivateKey derives another split private key for the same public key as privateKey,
+// so several clients can share one server key while keeping distinct user hashes.
+func GenMorePrivateKey(privateKey string) (morePrivateKey, publicKey string, err error) {
+	scalar, err := sudokuc.ParsePrivateScalar(privateKey)
+	if err != nil {
+		return "", "", err
+	}
+	morePrivateKey, err = sudokuc.SplitPrivateKey(scalar)
+	if err != nil {
+		return "", "", err
+	}
+	point, err := sudokuc.RecoverPublicKey(privateKey)
+	if err != nil {
+		return "", "", err
+	}
+	return morePrivateKey, sudokuc.EncodePoint(point), nil
+}

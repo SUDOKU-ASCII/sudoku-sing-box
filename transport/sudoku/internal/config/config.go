@@ -40,4 +40,8 @@ type Config struct {
 	HTTPMask           HTTPMaskConfig `json:"httpmask"`
 
 	Reverse *ReverseConfig `json:"reverse,omitempty"`
+
+	// Users is a server-side whitelist. When non-empty, only clients whose handshake
+	// user hash matches an entry are accepted.
+	Users []UserConfig `json:"users,omitempty"`
 }

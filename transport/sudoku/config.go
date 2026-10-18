@@ -6,9 +6,15 @@ import (
 	"net"
 	"strings"
 
+	internalconfig "github.com/sagernet/sing-box/transport/sudoku/internal/config"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/httpmask"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/sudoku"
 )
+
+// UserConfig is one entry of the server-side user whitelist: Key is a client private key or a
+// user hash prefix, Bandwidth is [server->client, client->server] in Mbps and Data is the total
+// wire traffic quota in GB.
+type UserConfig = internalconfig.UserConfig
 
 type ProtocolConfig struct {
 	ServerAddress string
@@ -32,6 +38,9 @@ type ProtocolConfig struct {
 
 	SuspiciousAction string
 	FallbackAddress  string
+
+	// Users is the server-side whitelist; empty means every client holding the key is accepted.
+	Users []UserConfig
 
 	DisableHTTPMask bool
 	HTTPMaskMode    string

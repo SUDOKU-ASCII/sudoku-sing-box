@@ -23,7 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"math/rand"
+	"math/bits"
 	"strings"
 	"time"
 
@@ -35,13 +35,21 @@ var (
 )
 
 type Table struct {
-	EncodeTable [256][][4]byte
-	DecodeMap   map[uint32]byte
-	PaddingPool []byte
-	IsASCII     bool // Marks the current encoding mode
-	layout      *byteLayout
-	opposite    *Table
-	hint        uint32
+	IsASCII bool // Marks the current encoding mode
+
+	layout   *byteLayout
+	opposite *Table
+	hint     uint32
+
+	// puzzles[puzzleStart[b]:puzzleStart[b+1]] are the puzzles of plaintext byte
+	// b, each its four hint bytes in grid-cell order, first hint lowest.
+	puzzleStart [257]uint32
+	puzzles     []uint32
+
+	// hintSets[pos<<2|val] holds bit k when the k-th shuffled grid has val at
+	// pos. Four hints identify a plaintext byte exactly when their sets share a
+	// single grid, and that grid's rank is the byte.
+	hintSets [128][5]uint64
 }
 
 // NewTable initializes the obfuscation tables with built-in layouts.
@@ -97,48 +105,73 @@ func newSingleDirectionTable(key string, mode string, customPattern string) (*Ta
 	}
 
 	t := &Table{
-		DecodeMap: make(map[uint32]byte),
-		IsASCII:   layout.name == "ascii",
-		layout:    layout,
+		IsASCII: layout.name == "ascii",
+		layout:  layout,
+		puzzles: make([]uint32, 0, 24<<10),
 	}
-	t.PaddingPool = append(t.PaddingPool, layout.paddingPool...)
 
-	// Generate Sudoku grids
-	grids := allGrids()
-	h := sha256.New()
-	h.Write([]byte(key))
-	seed := int64(binary.BigEndian.Uint64(h.Sum(nil)[:8]))
-	rng := rand.New(rand.NewSource(seed))
-
-	shuffledGrids := make([]Grid, len(grids))
-	copy(shuffledGrids, grids)
-	rng.Shuffle(len(shuffledGrids), func(i, j int) {
-		shuffledGrids[i], shuffledGrids[j] = shuffledGrids[j], shuffledGrids[i]
-	})
-
-	// Build encoding/decoding maps
-	for byteVal := 0; byteVal < 256; byteVal++ {
-		targetGrid := shuffledGrids[byteVal]
-		for _, positions := range hintPositions {
-			var rawParts [4]hintPart
-			for i, pos := range positions {
-				val := targetGrid[pos] // 1..4
-				rawParts[i] = hintPart{val: val, pos: pos}
-			}
-			if !hasUniqueMatch(grids, rawParts) {
-				continue
-			}
-			var currentHints [4]byte
-			for i, p := range rawParts {
-				currentHints[i] = t.layout.hintByte(p.val-1, p.pos)
-			}
-			t.EncodeTable[byteVal] = append(t.EncodeTable[byteVal], currentHints)
-			key := packHintsToKey(currentHints)
-			t.DecodeMap[key] = byte(byteVal)
+	grids := shuffledGrids(key)
+	for k, g := range grids {
+		for pos, val := range g {
+			t.hintSets[pos<<2|int(val-1)][k>>6] |= 1 << (k & 63)
 		}
 	}
+
+	for byteVal := 0; byteVal < 256; byteVal++ {
+		t.puzzleStart[byteVal] = uint32(len(t.puzzles))
+		g := &grids[byteVal]
+		for _, positions := range hintPositions {
+			var hints [4]uint8
+			for i, pos := range positions {
+				hints[i] = pos<<2 | (g[pos] - 1)
+			}
+			if got, ok := t.decodeHints(hints[0], hints[1], hints[2], hints[3]); !ok || got != byte(byteVal) {
+				continue
+			}
+			var puzzle uint32
+			for i, pos := range positions {
+				puzzle |= uint32(layout.hintByte(g[pos]-1, pos)) << (8 * i)
+			}
+			t.puzzles = append(t.puzzles, puzzle)
+		}
+	}
+	t.puzzleStart[256] = uint32(len(t.puzzles))
+
 	logx.Infof("Init", "Sudoku Tables initialized (%s) in %v", layout.name, time.Since(start))
 	return t, nil
+}
+
+// decodeHints returns the plaintext byte whose puzzle is exactly these four
+// hint indexes (pos<<2|val, or poisonHint).
+func (t *Table) decodeHints(a, b, c, d uint8) (byte, bool) {
+	sa, sb, sc, sd := &t.hintSets[a&127], &t.hintSets[b&127], &t.hintSets[c&127], &t.hintSets[d&127]
+	r0 := sa[0] & sb[0] & sc[0] & sd[0]
+	r1 := sa[1] & sb[1] & sc[1] & sd[1]
+	r2 := sa[2] & sb[2] & sc[2] & sd[2]
+	r3 := sa[3] & sb[3] & sc[3] & sd[3]
+	r4 := sa[4] & sb[4] & sc[4] & sd[4]
+
+	// Exactly one shared grid, and it must be one of the 256 that carry a byte.
+	multi := r0&(r0-1) | r1&(r1-1) | r2&(r2-1) | r3&(r3-1) | r4
+	var nonEmpty uint64
+	word := 0
+	if r1 != 0 {
+		nonEmpty++
+		word = 64
+	}
+	if r2 != 0 {
+		nonEmpty++
+		word = 128
+	}
+	if r3 != 0 {
+		nonEmpty++
+		word = 192
+	}
+	if r0 != 0 {
+		nonEmpty++
+	}
+	rank := word + bits.TrailingZeros64(r0|r1|r2|r3)
+	return byte(rank), multi|(nonEmpty^1) == 0
 }
 
 func customPatternForToken(token string, customPattern string) string {
@@ -171,20 +204,4 @@ func tableHintFingerprint(key string, mode string, uplinkPattern string, downlin
 		strings.ToLower(strings.TrimSpace(downlinkPattern)),
 	}, "\x00")))
 	return binary.BigEndian.Uint32(sum[:4])
-}
-
-func packHintsToKey(hints [4]byte) uint32 {
-	return packHintBytes(hints[0], hints[1], hints[2], hints[3])
-}
-
-func packHintBytes(h0, h1, h2, h3 byte) uint32 {
-	// Sort using word-sized min/max so the compiler can use conditional moves.
-	// Byte-sized comparisons otherwise need unpredictable branches on hint order.
-	a, b, c, d := uint32(h0), uint32(h1), uint32(h2), uint32(h3)
-	a, b = min(a, b), max(a, b)
-	c, d = min(c, d), max(c, d)
-	a, c = min(a, c), max(a, c)
-	b, d = min(b, d), max(b, d)
-	b, c = min(b, c), max(b, c)
-	return a<<24 | b<<16 | c<<8 | d
 }

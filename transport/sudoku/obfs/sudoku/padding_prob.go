@@ -22,9 +22,6 @@ package sudoku
 const probOne = uint64(1) << 32
 
 func pickPaddingThreshold(r *sudokuRand, pMin, pMax int) uint64 {
-	if r == nil {
-		return 0
-	}
 	if pMin < 0 {
 		pMin = 0
 	}

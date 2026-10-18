@@ -27,10 +27,6 @@ import (
 	"time"
 )
 
-type upstreamConn struct{ net.Conn }
-
-func (c upstreamConn) Upstream() any { return c.Conn }
-
 func TestPipeConn_HalfCloseDoesNotTruncate(t *testing.T) {
 	lnA, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -84,7 +80,7 @@ func TestPipeConn_HalfCloseDoesNotTruncate(t *testing.T) {
 	t.Cleanup(func() { _ = pipeA.Close() })
 	t.Cleanup(func() { _ = pipeB.Close() })
 
-	go PipeConn(upstreamConn{upstreamConn{pipeA}}, upstreamConn{pipeB})
+	go PipeConn(pipeA, pipeB)
 
 	deadline := time.Now().Add(2 * time.Second)
 	_ = clientConn.SetDeadline(deadline)
@@ -96,9 +92,8 @@ func TestPipeConn_HalfCloseDoesNotTruncate(t *testing.T) {
 	serverDone := make(chan error, 1)
 	go func() {
 		defer close(serverDone)
-		// The response must remain readable after the request reaches EOF.
-		buf, err := io.ReadAll(serverConn)
-		if err != nil {
+		buf := make([]byte, len(req))
+		if _, err := io.ReadFull(serverConn, buf); err != nil {
 			serverDone <- err
 			return
 		}

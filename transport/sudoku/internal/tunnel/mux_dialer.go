@@ -20,15 +20,14 @@ with this application without prior consent.
 package tunnel
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/sagernet/sing-box/transport/sudoku/internal/protocol"
 	"github.com/sagernet/sing-box/transport/sudoku/obfs/httpmask"
 )
 
@@ -52,11 +51,10 @@ func (d *MuxDialer) Dial(destAddrStr string) (net.Conn, error) {
 }
 
 func (d *MuxDialer) DialContext(ctx context.Context, destAddrStr string) (net.Conn, error) {
-	var addrBuf bytes.Buffer
-	if err := protocol.WriteAddress(&addrBuf, destAddrStr); err != nil {
-		return nil, fmt.Errorf("encode address failed: %w", err)
+	payload, err := encodeMuxOpenTarget(destAddrStr)
+	if err != nil {
+		return nil, err
 	}
-	payload := addrBuf.Bytes()
 
 	var lastErr error
 	for range 2 {
@@ -74,31 +72,33 @@ func (d *MuxDialer) DialContext(ctx context.Context, destAddrStr string) (net.Co
 	return nil, fmt.Errorf("mux open failed: %w", lastErr)
 }
 
+func (d *MuxDialer) DialUDPOverTCP() (net.Conn, error) {
+	// UoT uses a dedicated tunnel because it already multiplexes at the packet layer.
+	return d.dialUoT()
+}
+
 func openMuxStream(sess *muxSession, payload []byte) (net.Conn, error) {
 	streamID := sess.nextStreamID()
 	st := newMuxStream(sess, streamID)
 	sess.registerStream(st)
 	if err := sess.sendFrame(muxFrameOpen, streamID, payload); err != nil {
-		st.closeNoSend(err)
+		st.abort(err)
 		sess.removeStream(streamID)
 		return nil, err
 	}
 	return st, nil
 }
 
-func (d *MuxDialer) DialUDPOverTCP() (net.Conn, error) {
-	// UoT uses a dedicated tunnel because it already multiplexes at the packet layer.
-	return d.dialUoT()
-}
-
-// Warm establishes the native mux session. Split HTTPMask sessions also wait
-// for the downlink, mux preface upload, and one spare upload connection.
+// Warm establishes the native mux session. Split HTTPMask sessions wait for
+// the downlink and the first upload to be accepted before mux is exposed.
 func (d *MuxDialer) Warm(ctx context.Context) error {
 	_, err := d.getOrCreateSession(ctx)
 	return err
 }
 
 // Maintain keeps a warmed mux session available until ctx is canceled.
+// notify receives nil whenever a session becomes ready and an error when a
+// session fails or cannot be created.
 func (d *MuxDialer) Maintain(ctx context.Context, notify func(error)) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -256,7 +256,7 @@ func (d *MuxDialer) createSession(ctx context.Context) (*muxSession, error) {
 		return nil, fmt.Errorf("mux requires multiplex=on (got %q)", d.Config.MultiplexMode())
 	}
 
-	baseConn, err := d.dialBaseContext(ctx)
+	baseConn, err := d.dial(ctx, obfsUplinkPure)
 	if err != nil {
 		return nil, err
 	}
@@ -264,6 +264,7 @@ func (d *MuxDialer) createSession(ctx context.Context) (*muxSession, error) {
 		_ = baseConn.Close()
 	})
 	defer stop()
+
 	if err := WriteKIPMessage(baseConn, KIPTypeStartMux, nil); err != nil {
 		_ = baseConn.Close()
 		return nil, fmt.Errorf("mux start failed: %w", err)
@@ -280,7 +281,11 @@ func (d *MuxDialer) createSession(ctx context.Context) (*muxSession, error) {
 		return nil, net.ErrClosed
 	}
 	sess := newMuxSession(baseConn, nil)
-	sess.startKeepalive(muxKeepaliveInterval)
+	kind := muxKeepaliveIdle
+	if d.Config.HTTPMaskTunnelEnabled() && strings.ToLower(strings.TrimSpace(d.Config.HTTPMask.Mode)) != "ws" {
+		kind = muxKeepalivePing
+	}
+	sess.startKeepalive(muxKeepaliveInterval, kind)
 	return sess, nil
 }
 

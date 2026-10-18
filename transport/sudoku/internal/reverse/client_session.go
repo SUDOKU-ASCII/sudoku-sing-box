@@ -32,9 +32,6 @@ import (
 
 // ServeClientSession registers routes to the server and serves reverse mux streams until the session ends.
 func ServeClientSession(conn net.Conn, clientID string, routes []config.ReverseRoute) error {
-	if conn == nil {
-		return fmt.Errorf("nil conn")
-	}
 	if len(routes) == 0 {
 		return fmt.Errorf("no reverse routes")
 	}
@@ -43,13 +40,13 @@ func ServeClientSession(conn net.Conn, clientID string, routes []config.ReverseR
 
 	msg := helloMessage{
 		ClientID: clientID,
-		Routes:   append([]config.ReverseRoute(nil), routes...),
+		Routes:   routes,
 	}
 	raw, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-	if len(raw) == 0 || len(raw) > maxHelloBytes {
+	if len(raw) > maxHelloBytes {
 		return fmt.Errorf("reverse hello too large: %d", len(raw))
 	}
 	if err := tunnel.WriteKIPMessage(conn, tunnel.KIPTypeStartRev, raw); err != nil {

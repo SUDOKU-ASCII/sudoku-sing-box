@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-func TestMuxSession_KeepaliveUsesV047CompatibleFrame(t *testing.T) {
+func TestMuxSession_KeepaliveUsesPingAndAcceptsPong(t *testing.T) {
 	clientConn, peerConn := net.Pipe()
 	session := newMuxSession(clientConn, nil)
 	t.Cleanup(func() {
@@ -40,15 +40,15 @@ func TestMuxSession_KeepaliveUsesV047CompatibleFrame(t *testing.T) {
 		_ = peerConn.Close()
 	})
 
-	session.startKeepalive(10 * time.Millisecond)
+	session.startKeepalive(10*time.Millisecond, muxKeepalivePing)
 	_ = peerConn.SetReadDeadline(time.Now().Add(time.Second))
 
 	var header [muxHeaderSize]byte
 	if _, err := io.ReadFull(peerConn, header[:]); err != nil {
 		t.Fatalf("read keepalive: %v", err)
 	}
-	if header[0] != muxFrameData {
-		t.Fatalf("keepalive frame type = %d, want DATA", header[0])
+	if header[0] != muxFramePing {
+		t.Fatalf("keepalive frame type = %d, want PING", header[0])
 	}
 	if streamID := binary.BigEndian.Uint32(header[1:5]); streamID != 0 {
 		t.Fatalf("keepalive stream id = %d, want 0", streamID)
@@ -56,29 +56,7 @@ func TestMuxSession_KeepaliveUsesV047CompatibleFrame(t *testing.T) {
 	if payloadLen := binary.BigEndian.Uint32(header[5:9]); payloadLen != 0 {
 		t.Fatalf("keepalive payload length = %d, want 0", payloadLen)
 	}
-}
-
-func TestMuxSession_RespondsToPing(t *testing.T) {
-	clientConn, peerConn := net.Pipe()
-	session := newMuxSession(clientConn, nil)
-	t.Cleanup(func() {
-		session.closeWithError(net.ErrClosed)
-		_ = peerConn.Close()
-	})
-
-	var ping [muxHeaderSize]byte
-	ping[0] = muxFramePing
-	if _, err := peerConn.Write(ping[:]); err != nil {
-		t.Fatalf("write ping: %v", err)
-	}
-	_ = peerConn.SetReadDeadline(time.Now().Add(time.Second))
-	var pong [muxHeaderSize]byte
-	if _, err := io.ReadFull(peerConn, pong[:]); err != nil {
-		t.Fatalf("read pong: %v", err)
-	}
-	if pong[0] != muxFramePong || binary.BigEndian.Uint32(pong[1:]) != 0 || binary.BigEndian.Uint32(pong[5:]) != 0 {
-		t.Fatalf("unexpected pong frame: %x", pong)
-	}
+	_, _ = peerConn.Write(header[:])
 }
 
 func TestMuxSession_Echo(t *testing.T) {
@@ -176,7 +154,7 @@ func TestMuxStream_EnqueueAfterCloseDoesNotBlock(t *testing.T) {
 		}
 	}
 
-	st.closeNoSend(io.ErrClosedPipe)
+	st.abort(io.ErrClosedPipe)
 	if err := st.enqueue(&muxChunk{data: payload}); err != nil {
 		t.Fatalf("enqueue after close: %v", err)
 	}
@@ -306,6 +284,47 @@ func TestMuxStream_CloseWritePreservesResponse(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not finish half-closed exchange")
+	}
+}
+
+func TestMuxStream_RemoteCloseKeepsLocalWriteAfterCloseRead(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	serverDone := make(chan error, 1)
+	serverSession := newMuxSession(serverConn, func(stream *muxStream, _ []byte) {
+		serverDone <- stream.CloseWrite()
+	})
+	clientSession := newMuxSession(clientConn, nil)
+	t.Cleanup(func() {
+		clientSession.closeWithError(net.ErrClosed)
+		serverSession.closeWithError(net.ErrClosed)
+	})
+
+	clientStream := newMuxStream(clientSession, 1)
+	clientSession.registerStream(clientStream)
+	if err := clientSession.sendFrame(muxFrameOpen, clientStream.id, nil); err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server CloseWrite: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not close its write side")
+	}
+	if _, err := clientStream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("wait for remote close: %v", err)
+	}
+	// Closing reads must not make the stream disappear while its write side
+	// is still available for a request/response style exchange.
+	if err := clientStream.CloseRead(); err != nil {
+		t.Fatalf("CloseRead: %v", err)
+	}
+	if _, err := clientStream.Write([]byte("request")); err != nil {
+		t.Fatalf("write after remote close: %v", err)
+	}
+	if err := clientStream.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
 	}
 }
 

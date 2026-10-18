@@ -87,22 +87,14 @@ func BuildShortLinkFromConfig(cfg *Config, advertiseHost string) (string, error)
 	}
 
 	payload.DisableHTTPMask = cfg.HTTPMask.Disable
-	mode := strings.ToLower(strings.TrimSpace(cfg.HTTPMask.Mode))
-	if mode != "" && mode != "legacy" {
+	if mode := normalizeLower(cfg.HTTPMask.Mode); mode != "" && mode != "legacy" {
 		payload.HTTPMaskMode = mode
 	}
-	if cfg.HTTPMask.TLS {
-		payload.HTTPMaskTLS = true
-	}
-	if strings.TrimSpace(cfg.HTTPMask.Host) != "" {
-		payload.HTTPMaskHost = strings.TrimSpace(cfg.HTTPMask.Host)
-	}
-	if strings.TrimSpace(cfg.HTTPMask.PathRoot) != "" {
-		payload.HTTPMaskPath = strings.TrimSpace(cfg.HTTPMask.PathRoot)
-	}
-	muxMode := cfg.MultiplexMode()
-	if muxMode != "" && muxMode != "off" {
-		payload.HTTPMaskMux = muxMode
+	payload.HTTPMaskTLS = cfg.HTTPMask.TLS
+	payload.HTTPMaskHost = strings.TrimSpace(cfg.HTTPMask.Host)
+	payload.HTTPMaskPath = strings.TrimSpace(cfg.HTTPMask.PathRoot)
+	if mux := cfg.MultiplexMode(); mux != "off" {
+		payload.HTTPMaskMux = mux
 	}
 
 	payload.ASCII = encodeASCII(cfg.ASCII)
@@ -180,31 +172,25 @@ func BuildConfigFromShortLink(link string) (*Config, error) {
 }
 
 func encodeASCII(mode string) string {
-	normalized, err := sudoku.NormalizeASCIIMode(mode)
+	canonical, err := sudoku.NormalizeASCIIMode(mode)
 	if err != nil {
-		normalized = strings.ToLower(strings.TrimSpace(mode))
+		return normalizeLower(mode)
 	}
-	switch normalized {
-	case "prefer_ascii", "ascii":
+	switch canonical {
+	case "prefer_ascii":
 		return "ascii"
-	case "", "prefer_entropy", "entropy":
+	case "prefer_entropy":
 		return "entropy"
 	default:
-		return normalized
+		return canonical
 	}
 }
 
 func decodeASCII(val string) string {
-	normalized, err := sudoku.NormalizeASCIIMode(val)
-	if err == nil {
-		return normalized
+	if canonical, err := sudoku.NormalizeASCIIMode(val); err == nil {
+		return canonical
 	}
-	switch strings.ToLower(strings.TrimSpace(val)) {
-	case "ascii", "prefer_ascii":
-		return "prefer_ascii"
-	default:
-		return "prefer_entropy"
-	}
+	return "prefer_entropy"
 }
 
 func deriveAdvertiseAddress(cfg *Config, advertiseHost string) (string, int, error) {
