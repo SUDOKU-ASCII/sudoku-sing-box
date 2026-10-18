@@ -67,6 +67,15 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		HTTPMaskMultiplex:       options.HTTPMaskMultiplex,
 		HTTPMaskPathRoot:        options.HTTPMaskPathRoot,
 	}
+	for _, user := range options.Users {
+		protoConf.Users = append(protoConf.Users, sudokut.UserConfig{
+			Alias:     user.Alias,
+			Key:       user.Key,
+			Bandwidth: user.Bandwidth,
+			Data:      user.Data,
+			Blocked:   user.Blocked,
+		})
+	}
 	if options.AEADMethod != "" {
 		protoConf.AEADMethod = options.AEADMethod
 	}
@@ -83,6 +92,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	applyProtocolTables(&protoConf, tables)
 
+	tunnelSrv, err := sudokut.NewHTTPMaskTunnelServer(&protoConf)
+	if err != nil {
+		return nil, E.Cause(err, "create tunnel server")
+	}
+
 	var reverseManager *sudokut.ReverseManager
 	if strings.TrimSpace(options.Reverse.Listen) != "" {
 		reverseManager, err = sudokut.NewReverseManager(options.Reverse.Listen)
@@ -97,7 +111,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		router:    router,
 		logger:    logger,
 		protoConf: protoConf,
-		tunnelSrv: sudokut.NewHTTPMaskTunnelServer(&protoConf),
+		tunnelSrv: tunnelSrv,
 		reverse:   reverseManager,
 	}
 	in.listener = listener.New(listener.Options{
@@ -110,22 +124,25 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return in, nil
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	// Scope cleanups run in reverse order: stop the listener first, then the tunnel server and the reverse entry.
 	if h.reverse != nil {
+		scope.Add(h.reverse.Close)
 		go func() {
 			if err := h.reverse.Serve(); err != nil {
 				h.logger.ErrorContext(h.ctx, E.Cause(err, "serve Sudoku reverse entry"))
 			}
 		}()
 	}
-	return h.listener.Start()
-}
-
-func (h *Inbound) Close() error {
-	return common.Close(h.listener, common.PtrOrNil(h.tunnelSrv), common.PtrOrNil(h.reverse))
+	scope.Add(h.tunnelSrv.Close)
+	if err := h.listener.Start(); err != nil {
+		return err
+	}
+	scope.Add(h.listener.Close)
+	return nil
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -134,6 +151,12 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		var suspErr *sudokut.SuspiciousError
 		if errors.As(err, &suspErr) {
 			h.handleSuspicious(ctx, suspErr, &h.protoConf, metadata.Source, onClose)
+			return
+		}
+		var rejectedErr *sudokut.UserRejectedError
+		if errors.As(err, &rejectedErr) {
+			N.CloseOnHandshakeFailure(conn, onClose, err)
+			h.logger.WarnContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
 			return
 		}
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -147,7 +170,9 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
 
-	if userHash != "" {
+	if h.tunnelSrv.HasUsers() {
+		h.logger.InfoContext(ctx, "inbound Sudoku user ", h.tunnelSrv.UserLabel(userHash), " from ", metadata.Source)
+	} else if userHash != "" {
 		h.logger.DebugContext(ctx, "sudoku user=", userHash)
 	}
 
@@ -179,7 +204,7 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			return
 		}
 		h.logger.InfoContext(ctx, "inbound Sudoku reverse session from ", metadata.Source)
-		err = h.reverse.HandleServerSession(sessionConn, userHash, payload)
+		err = h.reverse.HandleServerSession(sessionConn, payload)
 		if err != nil {
 			h.logger.ErrorContext(ctx, E.Cause(err, "process reverse session from ", metadata.Source))
 		}

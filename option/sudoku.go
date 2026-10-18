@@ -15,6 +15,14 @@ type SudokuHTTPMaskOptions struct {
 	Multiplex string `json:"multiplex,omitempty"`
 }
 
+type SudokuUserOptions struct {
+	Alias     string    `json:"alias,omitempty"`
+	Key       string    `json:"key"`
+	Bandwidth []float64 `json:"bandwidth,omitempty"`
+	Data      float64   `json:"data,omitempty"`
+	Blocked   bool      `json:"blocked,omitempty"`
+}
+
 type SudokuReverseOptions struct {
 	Listen   string               `json:"listen,omitempty"`
 	ClientID string               `json:"client_id,omitempty"`
@@ -60,6 +68,7 @@ type SudokuInboundOptions struct {
 	HTTPMaskPathRoot   string                `json:"http_mask_path_root,omitempty"`
 	HTTPMask           SudokuHTTPMaskOptions `json:"httpmask,omitempty"`
 	Reverse            SudokuReverseOptions  `json:"reverse,omitempty"`
+	Users              []SudokuUserOptions   `json:"users,omitempty"`
 }
 
 type SudokuOutboundOptions struct {

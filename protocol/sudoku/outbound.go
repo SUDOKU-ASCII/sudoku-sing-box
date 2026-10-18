@@ -26,6 +26,10 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.SudokuOutboundOptions](registry, C.TypeSudoku, NewOutbound)
 }
 
+// Outbound must stay a Lifecycle: the manager starts only components that implement it,
+// so a stale Start signature would silently skip the mux maintainer and the reverse client.
+var _ adapter.Lifecycle = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
 	ctx          context.Context
@@ -128,10 +132,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	return out, nil
 }
 
-func (h *Outbound) Start(stage adapter.StartStage) error {
+func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	scope.Add(h.Close)
 	if h.muxClient != nil {
 		muxCtx, cancel := context.WithCancel(h.ctx)
 		h.muxCancel = cancel
