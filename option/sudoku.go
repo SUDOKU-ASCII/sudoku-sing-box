@@ -69,6 +69,7 @@ type SudokuInboundOptions struct {
 	HTTPMask           SudokuHTTPMaskOptions `json:"httpmask,omitempty"`
 	Reverse            SudokuReverseOptions  `json:"reverse,omitempty"`
 	Users              []SudokuUserOptions   `json:"users,omitempty"`
+	UsageFile          string                `json:"usage_file,omitempty"`
 }
 
 type SudokuOutboundOptions struct {

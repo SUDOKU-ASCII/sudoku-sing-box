@@ -162,3 +162,28 @@ Clash 中的默认模式，默认使用 `Rule`。
 缓存 ID。
 
 如果不为空，配置特定的数据将使用由其键控的单独存储。
+
+### Sudoku 用户
+
+当启用了用户白名单的入站（目前为 [Sudoku](/zh/configuration/inbound/sudoku/)）运行时，
+`GET /users` 会返回每个用户的实时速率和当月用量：
+
+```json
+{
+  "count": 1,
+  "active": 1,
+  "up": 100,
+  "down": 300,
+  "users": [
+    {
+      "name": "alice", "blocked": false, "exceeded": false, "conns": 1,
+      "up": 100, "down": 300,
+      "upTotal": 1000, "downTotal": 3000,
+      "used": 13000, "limit": 100000000000
+    }
+  ]
+}
+```
+
+`up`/`down` 为最近一秒的字节速率，`upTotal`/`downTotal` 为启动以来的总量，
+`used`/`limit` 为当月的 wire 字节数与配额（`0` 表示不限）。通过 WebSocket 请求时每秒推送一次快照。

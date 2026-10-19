@@ -1,10 +1,15 @@
 package users
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,5 +152,108 @@ func TestPendingBytesChargedOnBind(t *testing.T) {
 	w.Write(make([]byte, 200))
 	if got := u.used.Load(); got != 500 {
 		t.Fatalf("used=%d", got)
+	}
+}
+
+func TestStatsSplitDirectionsInConfigOrder(t *testing.T) {
+	reg, err := NewRegistry([]config.UserConfig{
+		{Key: "0123456789abcdef", Alias: "full", Data: 1},
+		{Key: "aabbccddeeff", Alias: "prefix", Blocked: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := reg.Lookup("0123456789abcdef")
+	a, b := net.Pipe()
+	defer b.Close()
+	w := u.WrapWire(a)
+	go func() {
+		b.Write(make([]byte, 30)) // up 30
+		io.Copy(io.Discard, b)
+	}()
+	if _, err := io.ReadFull(w, make([]byte, 30)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(make([]byte, 70)); err != nil { // down 70
+		t.Fatal(err)
+	}
+
+	stats := reg.Stats()
+	want := []Stat{
+		{Name: "full", Conns: 1, Up: 30, Down: 70, Used: 100, Limit: 1e9},
+		{Name: "prefix", Blocked: true},
+	}
+	if !slices.Equal(stats, want) {
+		t.Fatalf("Stats() = %+v, want %+v", stats, want)
+	}
+	w.Close()
+	if got := reg.Stats()[0].Conns; got != 0 {
+		t.Fatalf("Conns after close = %d", got)
+	}
+	var nilReg *Registry
+	if nilReg.Stats() != nil {
+		t.Fatal("nil registry must have no stats")
+	}
+}
+
+func TestUsagePersistsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.usage.json")
+	cfgs := []config.UserConfig{
+		{Key: "0123456789abcdef", Data: 1e-5},
+		{Key: "aabbccddeeff"},
+	}
+	reg, _ := NewRegistry(cfgs)
+	stop, err := reg.TrackUsage(context.Background(), path)
+	if err != nil {
+		t.Fatalf("missing file must not fail: %v", err)
+	}
+	reg.Lookup("0123456789abcdef").addTraffic(upload, 10_000)
+	reg.Lookup("aabbccddeeff0000").addTraffic(upload, 42)
+	stop() // a clean shutdown saves even though the ticker never fired
+
+	// The restarted server restores this month and drops users removed from the config.
+	restarted, _ := NewRegistry(cfgs[:1])
+	stop, err = restarted.TrackUsage(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := restarted.Lookup("0123456789abcdef"); u.used.Load() != 10_000 || !u.Exceeded() {
+		t.Fatalf("restored used=%d exceeded=%v", u.used.Load(), u.Exceeded())
+	}
+	stop()
+	if b, _ := os.ReadFile(path); strings.Contains(string(b), "aabbccddeeff") {
+		t.Fatalf("removed user still saved: %s", b)
+	}
+
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.TrackUsage(context.Background(), path); err == nil {
+		t.Fatal("corrupt file must fail instead of silently resetting quotas")
+	}
+}
+
+func TestUsageResetsMonthly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.usage.json")
+	old := `{"month":"2000-01","used":{"0123456789abcdef":10000}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, _ := NewRegistry([]config.UserConfig{{Key: "0123456789abcdef", Data: 1e-5}})
+	stop, err := reg.TrackUsage(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	u := reg.Lookup("0123456789abcdef")
+	if u.used.Load() != 0 {
+		t.Fatalf("usage from an earlier month restored: %d", u.used.Load())
+	}
+
+	// Rolling over while running clears quotas, including the kicked state.
+	u.addTraffic(upload, 10_000)
+	reg.resetUsage()
+	if u.Exceeded() || u.kicked.Load() {
+		t.Fatalf("reset left used=%d kicked=%v", u.used.Load(), u.kicked.Load())
 	}
 }

@@ -2,8 +2,13 @@ package sudoku
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -40,12 +45,15 @@ func freeLoopbackPort(t *testing.T) uint16 {
 	return uint16(listener.Addr().(*net.TCPAddr).Port)
 }
 
-func startUsersInbound(t *testing.T, options option.SudokuInboundOptions) (*usersTestRouter, uint16) {
+func startUsersInbound(t *testing.T, options option.SudokuInboundOptions) (*usersTestRouter, uint16, *Inbound) {
 	t.Helper()
 	port := freeLoopbackPort(t)
 	options.ListenOptions = option.ListenOptions{
 		Listen:     common.Ptr(badoption.Addr(netip.MustParseAddr("127.0.0.1"))),
 		ListenPort: port,
+	}
+	if options.UsageFile == "" {
+		options.UsageFile = filepath.Join(t.TempDir(), "usage.json")
 	}
 	router := &usersTestRouter{routed: make(chan adapter.InboundContext, 4)}
 	ctx := context.Background()
@@ -55,7 +63,7 @@ func startUsersInbound(t *testing.T, options option.SudokuInboundOptions) (*user
 	scope := adapter.NewScope(ctx, logger)
 	t.Cleanup(func() { _ = scope.Close() })
 	require.NoError(t, in.(adapter.Lifecycle).Start(adapter.StartStateStart, scope))
-	return router, port
+	return router, port, in.(*Inbound)
 }
 
 func dialUsersInbound(t *testing.T, port uint16, publicKey, privateKey, target string) {
@@ -83,7 +91,7 @@ func TestInboundUsersWhitelist(t *testing.T) {
 	otherKey, _, err := sudokut.GenMorePrivateKey(privateKey)
 	require.NoError(t, err)
 
-	router, port := startUsersInbound(t, option.SudokuInboundOptions{
+	router, port, _ := startUsersInbound(t, option.SudokuInboundOptions{
 		Key:   publicKey,
 		Users: []option.SudokuUserOptions{{Alias: "alice", Key: privateKey}},
 	})
@@ -112,4 +120,32 @@ func TestInboundUsersInvalid(t *testing.T) {
 		Users: []option.SudokuUserOptions{{Key: "not-hex"}},
 	})
 	require.Error(t, err)
+}
+
+func TestInboundUserUsageRestored(t *testing.T) {
+	privateKey, publicKey, err := sudokut.GenKeyPair()
+	require.NoError(t, err)
+	raw, err := hex.DecodeString(privateKey)
+	require.NoError(t, err)
+	sum := sha256.Sum256(raw)
+	hash := hex.EncodeToString(sum[:8])
+
+	usagePath := filepath.Join(t.TempDir(), "usage.json")
+	usage := fmt.Sprintf(`{"month":%q,"used":{%q:12345}}`, time.Now().Format("2006-01"), hash)
+	require.NoError(t, os.WriteFile(usagePath, []byte(usage), 0o600))
+
+	_, _, in := startUsersInbound(t, option.SudokuInboundOptions{
+		Key:       publicKey,
+		Users:     []option.SudokuUserOptions{{Alias: "alice", Key: privateKey}},
+		UsageFile: usagePath,
+	})
+	stats := in.UserStats()
+	require.Len(t, stats, 1)
+	require.Equal(t, "alice", stats[0].Name)
+	require.Equal(t, uint64(12345), stats[0].Used)
+}
+
+func TestDefaultUsageFile(t *testing.T) {
+	require.Equal(t, "sudoku-sudoku-in.usage.json", defaultUsageFile("sudoku-in"))
+	require.Equal(t, "sudoku-a_b.usage.json", defaultUsageFile("a/b"))
 }

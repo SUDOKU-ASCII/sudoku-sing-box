@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -41,6 +42,7 @@ type Inbound struct {
 	protoConf sudokut.ProtocolConfig
 	tunnelSrv *sudokut.HTTPMaskTunnelServer
 	reverse   *sudokut.ReverseManager
+	usageFile string
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SudokuInboundOptions) (adapter.Inbound, error) {
@@ -105,6 +107,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 	}
 
+	usageFile := strings.TrimSpace(options.UsageFile)
+	if usageFile == "" {
+		usageFile = defaultUsageFile(tag)
+	}
+
 	in := &Inbound{
 		Adapter:   inbound.NewAdapter(C.TypeSudoku, tag),
 		ctx:       ctx,
@@ -113,6 +120,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		protoConf: protoConf,
 		tunnelSrv: tunnelSrv,
 		reverse:   reverseManager,
+		usageFile: usageFile,
 	}
 	in.listener = listener.New(listener.Options{
 		Context:           ctx,
@@ -124,10 +132,28 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return in, nil
 }
 
+// defaultUsageFile names the per-inbound usage file after the tag, so several Sudoku inbounds
+// keep separate counters. It is resolved relative to the file manager's base path.
+func defaultUsageFile(tag string) string {
+	name := strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '_'
+	}, tag)
+	return "sudoku-" + name + ".usage.json"
+}
+
 func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	// Load the month's usage before the listener accepts anything.
+	stopUsage, err := h.tunnelSrv.TrackUsage(h.ctx, h.usageFile)
+	if err != nil {
+		return E.Cause(err, "load user usage")
+	}
+	scope.Add(func() error { stopUsage(); return nil })
 	// Scope cleanups run in reverse order: stop the listener first, then the tunnel server and the reverse entry.
 	if h.reverse != nil {
 		scope.Add(h.reverse.Close)
@@ -138,11 +164,33 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}()
 	}
 	scope.Add(h.tunnelSrv.Close)
-	if err := h.listener.Start(); err != nil {
+	if err = h.listener.Start(); err != nil {
 		return err
 	}
 	scope.Add(h.listener.Close)
 	return nil
+}
+
+// UserStats implements adapter.UserStatsProvider for the external API.
+func (h *Inbound) UserStats() []adapter.UserStat {
+	stats := h.tunnelSrv.UserStats()
+	if len(stats) == 0 {
+		return nil
+	}
+	result := make([]adapter.UserStat, len(stats))
+	for i, stat := range stats {
+		result[i] = adapter.UserStat{
+			Name:     stat.Name,
+			Blocked:  stat.Blocked,
+			Exceeded: stat.Exceeded,
+			Conns:    stat.Conns,
+			Up:       stat.Up,
+			Down:     stat.Down,
+			Used:     stat.Used,
+			Limit:    stat.Limit,
+		}
+	}
+	return result
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

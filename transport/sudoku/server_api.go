@@ -2,6 +2,7 @@ package sudoku
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -84,6 +85,48 @@ func (s *HTTPMaskTunnelServer) UserLabel(userHash string) string {
 		}
 	}
 	return userHash
+}
+
+// UserStat is a point-in-time view of one whitelisted user, for monitoring.
+type UserStat struct {
+	Name     string
+	Blocked  bool
+	Exceeded bool
+	Conns    int    // open connections
+	Up, Down uint64 // wire bytes from and to the client since start
+	Used     uint64 // wire bytes this month, counted against Limit
+	Limit    uint64 // bytes, 0 = unlimited
+}
+
+// UserStats lists the whitelisted users in config order.
+func (s *HTTPMaskTunnelServer) UserStats() []UserStat {
+	if s == nil || s.users == nil {
+		return nil
+	}
+	stats := s.users.Stats()
+	result := make([]UserStat, len(stats))
+	for i, stat := range stats {
+		result[i] = UserStat{
+			Name:     stat.Name,
+			Blocked:  stat.Blocked,
+			Exceeded: stat.Exceeded,
+			Conns:    stat.Conns,
+			Up:       stat.Up,
+			Down:     stat.Down,
+			Used:     stat.Used,
+			Limit:    stat.Limit,
+		}
+	}
+	return result
+}
+
+// TrackUsage restores the users' monthly traffic, saves it periodically and resets it when a
+// new month begins. The returned stop function saves once more and must be called on shutdown.
+func (s *HTTPMaskTunnelServer) TrackUsage(ctx context.Context, path string) (func(), error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	return s.users.TrackUsage(ctx, path)
 }
 
 func NewHTTPMaskTunnelServer(cfg *ProtocolConfig) (*HTTPMaskTunnelServer, error) {

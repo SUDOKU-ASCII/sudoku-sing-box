@@ -50,6 +50,7 @@ type Server struct {
 	trafficManager *trafficcontrol.Manager
 	urlTestHistory *urltest.HistoryStorage
 	clashMode      *clashmode.Manager
+	usersSampler   *usersSampler
 	logDebug       bool
 
 	externalController       bool
@@ -87,6 +88,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		trafficManager:           trafficManager,
 		urlTestHistory:           urlTestHistory,
 		clashMode:                clashMode,
+		usersSampler:             newUsersSampler(service.FromContext[adapter.InboundManager](ctx)),
 		logDebug:                 logFactory.Level() >= log.LevelDebug,
 		externalController:       options.ExternalController != "",
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
@@ -114,6 +116,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Get("/", hello(options.ExternalUI != ""))
 		r.Get("/logs", getLogs(s.ctx, logFactory))
 		r.Get("/traffic", traffic(s.ctx, trafficManager))
+		r.Get("/users", s.getUsers)
 		r.Get("/version", version)
 		r.Mount("/configs", configRouter(s, logFactory))
 		r.Mount("/proxies", proxyRouter(s, s.router))
@@ -168,6 +171,14 @@ func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			return E.Cause(err, "external controller listen error")
 		}
 		scope.Add(s.httpServer.Close)
+		if s.usersSampler.hasUsers() {
+			samplerCtx, stopSampler := context.WithCancel(s.ctx)
+			scope.Add(func() error {
+				stopSampler()
+				return nil
+			})
+			go s.usersSampler.run(samplerCtx)
+		}
 		s.logger.Info("restful api listening at ", listener.Addr())
 		go func() {
 			err = s.httpServer.Serve(listener)

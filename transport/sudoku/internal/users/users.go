@@ -40,7 +40,14 @@ const bytesPerGB = 1e9
 type Registry struct {
 	exact    map[string]*User // full 16-char hashes
 	prefixed []*User          // shorter prefixes, in config order
+	all      []*User          // every user, in config order
 }
+
+// Directions index per-direction byte counters: bytes read from the client are uploads.
+const (
+	upload = iota
+	download
+)
 
 type User struct {
 	Alias   string
@@ -51,9 +58,10 @@ type User struct {
 	toClient   *bucket
 	fromClient *bucket
 
-	limit  uint64 // bytes, 0 = unlimited
-	used   atomic.Uint64
-	kicked atomic.Bool
+	limit   uint64           // bytes, 0 = unlimited
+	used    atomic.Uint64    // wire bytes this month, counted against limit
+	traffic [2]atomic.Uint64 // wire bytes since start, by direction
+	kicked  atomic.Bool
 
 	mu    sync.Mutex
 	conns map[*WireConn]struct{}
@@ -84,6 +92,7 @@ func NewRegistry(cfgs []config.UserConfig) (*Registry, error) {
 			u.toClient = newBucket(c.Bandwidth[0])
 			u.fromClient = newBucket(c.Bandwidth[1])
 		}
+		r.all = append(r.all, u)
 		if len(hash) == config.UserHashHexLen {
 			r.exact[hash] = u
 		} else {
@@ -114,10 +123,11 @@ func (u *User) Exceeded() bool {
 	return u.limit > 0 && u.used.Load() >= u.limit
 }
 
-func (u *User) addUsage(n uint64) {
+func (u *User) addTraffic(dir int, n uint64) {
 	if n == 0 {
 		return
 	}
+	u.traffic[dir].Add(n)
 	total := u.used.Add(n)
 	if u.limit == 0 || total < u.limit {
 		return
@@ -134,6 +144,41 @@ func (u *User) addUsage(n uint64) {
 	for _, c := range conns {
 		_ = c.Conn.Close()
 	}
+}
+
+// Stat is a point-in-time view of one user, for monitoring.
+type Stat struct {
+	Name     string
+	Blocked  bool
+	Exceeded bool
+	Conns    int    // open connections
+	Up, Down uint64 // wire bytes from and to the client since start
+	Used     uint64 // wire bytes this month, counted against Limit
+	Limit    uint64 // bytes, 0 = unlimited
+}
+
+// Stats lists every user in config order.
+func (r *Registry) Stats() []Stat {
+	if r == nil {
+		return nil
+	}
+	stats := make([]Stat, len(r.all))
+	for i, u := range r.all {
+		u.mu.Lock()
+		conns := len(u.conns)
+		u.mu.Unlock()
+		stats[i] = Stat{
+			Name:     u.Alias,
+			Blocked:  u.Blocked,
+			Exceeded: u.Exceeded(),
+			Conns:    conns,
+			Up:       u.traffic[upload].Load(),
+			Down:     u.traffic[download].Load(),
+			Used:     u.used.Load(),
+			Limit:    u.limit,
+		}
+	}
+	return stats
 }
 
 // WrapPayload throttles decoded payload to the user's bandwidth limits.
@@ -156,7 +201,7 @@ func (u *User) WrapWire(conn net.Conn) net.Conn {
 type WireConn struct {
 	net.Conn
 	user    atomic.Pointer[User]
-	pending atomic.Uint64
+	pending [2]atomic.Uint64 // by direction
 }
 
 func NewWireConn(conn net.Conn) *WireConn { return &WireConn{Conn: conn} }
@@ -166,29 +211,30 @@ func (w *WireConn) Bind(u *User) {
 	u.conns[w] = struct{}{}
 	u.mu.Unlock()
 	w.user.Store(u)
-	u.addUsage(w.pending.Swap(0))
+	u.addTraffic(upload, w.pending[upload].Swap(0))
+	u.addTraffic(download, w.pending[download].Swap(0))
 }
 
-func (w *WireConn) count(n int) {
+func (w *WireConn) count(dir int, n int) {
 	if n <= 0 {
 		return
 	}
 	if u := w.user.Load(); u != nil {
-		u.addUsage(uint64(n))
+		u.addTraffic(dir, uint64(n))
 		return
 	}
-	w.pending.Add(uint64(n))
+	w.pending[dir].Add(uint64(n))
 }
 
 func (w *WireConn) Read(p []byte) (int, error) {
 	n, err := w.Conn.Read(p)
-	w.count(n)
+	w.count(upload, n)
 	return n, err
 }
 
 func (w *WireConn) Write(p []byte) (int, error) {
 	n, err := w.Conn.Write(p)
-	w.count(n)
+	w.count(download, n)
 	return n, err
 }
 

@@ -164,3 +164,30 @@ Cache file path, `cache.db` will be used if empty.
 Identifier in cache file.
 
 If not empty, configuration specified data will use a separate store keyed by it.
+
+### Sudoku Users
+
+When an inbound with a user whitelist is running (currently
+[Sudoku](/configuration/inbound/sudoku/)), `GET /users` reports every user's live rates and
+this month's usage:
+
+```json
+{
+  "count": 1,
+  "active": 1,
+  "up": 100,
+  "down": 300,
+  "users": [
+    {
+      "name": "alice", "blocked": false, "exceeded": false, "conns": 1,
+      "up": 100, "down": 300,
+      "upTotal": 1000, "downTotal": 3000,
+      "used": 13000, "limit": 100000000000
+    }
+  ]
+}
+```
+
+`up`/`down` are bytes per second over the last second, `upTotal`/`downTotal` are since start,
+and `used`/`limit` are this month's wire bytes and quota (`0` means unlimited). Over a WebSocket
+the snapshot is pushed once per second.

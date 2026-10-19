@@ -35,7 +35,8 @@
       "data": 50,
       "blocked": false
     }
-  ]
+  ],
+  "usage_file": ""
 }
 ```
 
@@ -175,5 +176,18 @@ Entries, in the same format as the official Sudoku server:
 * `key`: ==Required== the client private key (64 or 128 hex characters), or a prefix of its user hash (8–16 hex characters). The two are told apart by length. Prefer a hash prefix so the private key does not have to be stored on the server.
 * `alias`: Name shown in logs. Defaults to the user hash, never the key.
 * `bandwidth`: `[server to client, client to server]` payload rate limit in Mbps. `0` means unlimited.
-* `data`: Total wire traffic quota (both directions) in GB. Connections are closed when it is used up and new ones are refused until the inbound restarts. `0` means unlimited.
+* `data`: Monthly wire traffic quota (both directions) in GB. Usage is counted per calendar month in server local time and resets automatically when a new month begins. Connections are closed when it is used up and new ones are refused until the next month. `0` means unlimited.
 * `blocked`: Refuse this user without removing the entry.
+
+Usage is saved every minute while it changes and once more on shutdown, and restored on start.
+It is exposed by the Clash API at `GET /users` (`users[].used` / `users[].limit`).
+
+#### usage_file
+
+Path of the file that persists users' monthly usage across restarts.
+
+`sudoku-{inbound tag}.usage.json` in the working directory will be used if empty, e.g.
+`sudoku-sudoku-in.usage.json` for the tag `sudoku-in`. A file from an earlier month is ignored;
+a corrupt file stops the start instead of silently resetting quotas.
+
+The file is written atomically (temp file + rename). Delete it to reset all usage.
